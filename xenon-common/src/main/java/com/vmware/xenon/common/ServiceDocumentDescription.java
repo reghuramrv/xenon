@@ -19,7 +19,7 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.net.URI;
-import java.net.URISyntaxException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
 import java.util.EnumSet;
@@ -29,10 +29,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import com.vmware.xenon.common.RequestRouter.Route;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceDocument.Documentation;
+import com.vmware.xenon.common.ServiceDocument.IndexingParameters;
+import com.vmware.xenon.common.ServiceDocument.PropertyOptions;
 import com.vmware.xenon.common.ServiceDocument.UsageOption;
 import com.vmware.xenon.common.ServiceDocument.UsageOptions;
 
@@ -138,6 +141,10 @@ public class ServiceDocumentDescription {
 
     public static class PropertyDescription {
         public ServiceDocumentDescription.TypeName typeName;
+        /**
+         * Set only for PODO-typed fields.
+         */
+        public String kind;
         public Object exampleValue;
         transient Field accessor;
 
@@ -154,6 +161,11 @@ public class ServiceDocumentDescription {
          * Description of element type if this property is of the ARRAY or COLLECTION type.
          */
         public PropertyDescription elementDescription;
+
+        /**
+         * Set only for enums, the set of possible values.
+         */
+        public String[] enumValues;
 
         public PropertyDescription() {
             this.indexingOptions = EnumSet.noneOf(PropertyIndexingOption.class);
@@ -194,7 +206,7 @@ public class ServiceDocumentDescription {
     }
 
     /**
-     * Rfc7519Builder is a parameterized factory for ServiceDocumentDescription instances.
+     * Builder is a parameterized factory for ServiceDocumentDescription instances.
      */
     public static class Builder {
 
@@ -209,8 +221,19 @@ public class ServiceDocumentDescription {
                 Class<? extends ServiceDocument> type) {
             PropertyDescription root = buildPodoPropertyDescription(type, new HashSet<>(), 0);
             ServiceDocumentDescription desc = new ServiceDocumentDescription();
+
+            IndexingParameters indexingParameters = type.getAnnotation(IndexingParameters.class);
+            if (indexingParameters != null) {
+                desc.serializedStateSizeLimit = indexingParameters.serializedStateSize();
+                desc.versionRetentionLimit = indexingParameters.versionRetention();
+            }
+
             desc.propertyDescriptions = root.fieldDescriptions;
             return desc;
+        }
+
+        public PropertyDescription buildPodoPropertyDescription(Class<?> type) {
+            return buildPodoPropertyDescription(type, new HashSet<>(), 0);
         }
 
         public ServiceDocumentDescription buildDescription(
@@ -257,8 +280,13 @@ public class ServiceDocumentDescription {
                 }
 
                 PropertyDescription fd = new PropertyDescription();
-                if (ServiceDocument.isBuiltInIndexedDocumentField(f.getName())) {
+                if (ServiceDocument.isBuiltInInfrastructureDocumentField(f.getName())) {
                     fd.usageOptions.add(PropertyUsageOption.INFRASTRUCTURE);
+                }
+                if (ServiceDocument.isAutoMergeEnabledByDefaultForField(f.getName())) {
+                    fd.usageOptions.add(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL);
+                }
+                if (ServiceDocument.isBuiltInSignatureExcludedDocumentField(f.getName())) {
                     fd.indexingOptions.add(PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE);
                 }
                 if (ServiceDocument.isLink(f.getName())) {
@@ -276,6 +304,10 @@ public class ServiceDocumentDescription {
 
                 fd.accessor = f;
                 pd.fieldDescriptions.put(f.getName(), fd);
+
+                if (fd.typeName == TypeName.PODO) {
+                    fd.kind = Utils.buildKind(f.getType());
+                }
             }
 
             visited.remove(typeName);
@@ -283,6 +315,7 @@ public class ServiceDocumentDescription {
             return pd;
         }
 
+        @SuppressWarnings("rawtypes")
         protected void buildPropertyDescription(
                 PropertyDescription pd,
                 Class<?> clazz,
@@ -298,13 +331,16 @@ public class ServiceDocumentDescription {
                 pd.exampleValue = false;
             } else if (Short.class.equals(clazz) || short.class.equals(clazz)) {
                 pd.typeName = TypeName.LONG;
-                pd.exampleValue = 0;
+                pd.exampleValue = (short) 0;
             } else if (Integer.class.equals(clazz) || int.class.equals(clazz)) {
                 pd.typeName = TypeName.LONG;
                 pd.exampleValue = 0;
             } else if (Long.class.equals(clazz) || long.class.equals(clazz)) {
                 pd.typeName = TypeName.LONG;
                 pd.exampleValue = 0L;
+            } else if (Byte.class.equals(clazz) || byte.class.equals(clazz)) {
+                pd.typeName = TypeName.LONG;
+                pd.exampleValue = (byte) 0;
             } else if (byte[].class.equals(clazz)) {
                 pd.typeName = TypeName.BYTES;
             } else if (Double.class.equals(clazz) || double.class.equals(clazz)) {
@@ -312,7 +348,11 @@ public class ServiceDocumentDescription {
                 pd.exampleValue = 0.0;
             } else if (Float.class.equals(clazz) || float.class.equals(clazz)) {
                 pd.typeName = TypeName.DOUBLE;
-                pd.exampleValue = 0.0;
+                pd.exampleValue = 0.0F;
+            } else if (Number.class.isAssignableFrom(clazz)) {
+                // coerce all Numbers to double, may lose precision with BigDecimal and BigInteger
+                pd.typeName = TypeName.DOUBLE;
+                pd.exampleValue = 0.0F;
             } else if (String.class.equals(clazz) || char.class.equals(clazz)) {
                 pd.typeName = TypeName.STRING;
                 pd.exampleValue = "example string";
@@ -320,10 +360,7 @@ public class ServiceDocumentDescription {
                 pd.exampleValue = new Date();
                 pd.typeName = TypeName.DATE;
             } else if (URI.class.equals(clazz)) {
-                try {
-                    pd.exampleValue = new URI("http://localhost:1234/some/service");
-                } catch (URISyntaxException ignored) {
-                }
+                pd.exampleValue = URI.create("http://localhost:1234/some/service");
                 pd.typeName = TypeName.URI;
             } else {
                 isSimpleType = false;
@@ -343,15 +380,17 @@ public class ServiceDocumentDescription {
                         }
                     } else if (UsageOptions.class.equals(a.annotationType())) {
                         UsageOptions usageOptions = (UsageOptions) a;
-                        if (usageOptions.value() != null) {
-                            for (UsageOption usageOption : usageOptions.value()) {
-                                pd.usageOptions.add(usageOption.option());
-                            }
+                        for (UsageOption usageOption : usageOptions.value()) {
+                            pd.usageOptions.add(usageOption.option());
                         }
                     } else if (UsageOption.class.equals(a.annotationType())) {
                         // Parse single @UsageOption annotation
                         UsageOption usageOption = (UsageOption) a;
                         pd.usageOptions.add(usageOption.option());
+                    } else if (PropertyOptions.class.equals(a.annotationType())) {
+                        PropertyOptions po = (PropertyOptions) a;
+                        pd.indexingOptions.addAll(Arrays.asList(po.indexing()));
+                        pd.usageOptions.addAll(Arrays.asList(po.usage()));
                     }
                 }
 
@@ -405,6 +444,11 @@ public class ServiceDocumentDescription {
                     pd.elementDescription = fd;
                 } else if (Enum.class.isAssignableFrom(clazz)) {
                     pd.typeName = TypeName.ENUM;
+                    pd.enumValues = Arrays
+                            .stream(clazz.getEnumConstants())
+                            .map( o -> ((Enum)o).name())
+                            .collect(Collectors.toList())
+                            .toArray(new String[0]);
                 } else if (clazz.isArray()) {
                     pd.typeName = TypeName.ARRAY;
 
@@ -444,6 +488,7 @@ public class ServiceDocumentDescription {
                     pd.elementDescription = fd;
                 } else {
                     pd.typeName = TypeName.PODO;
+                    pd.kind = Utils.buildKind(clazz);
                     if (depth > 0) {
                         // Force indexing of all nested complex PODO fields. If the service author
                         // instructed expand at the root level, we will index and expand everything

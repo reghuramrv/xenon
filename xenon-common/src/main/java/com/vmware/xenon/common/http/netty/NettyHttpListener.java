@@ -17,6 +17,7 @@ import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.logging.Level;
 
@@ -27,7 +28,7 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.ssl.SslContext;
-import io.netty.util.concurrent.ExecutorServiceFactory;
+import io.netty.handler.ssl.SslContextBuilder;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceHost;
@@ -44,19 +45,23 @@ public class NettyHttpListener implements ServiceRequestListener {
     private ServiceHost host;
     private Channel serverChannel;
     private NioEventLoopGroup eventLoopGroup;
+    private ExecutorService nettyExecutorService;
     private SslContext sslContext;
     private ChannelHandler childChannelHandler;
+    private boolean isListening = false;
 
     public NettyHttpListener(ServiceHost host) {
         this.host = host;
     }
 
+    @Override
     public long getActiveClientCount() {
         // TODO Add tracking of client connections by exposing a counter the
         // NettyHttpRequestHandler instance can increment/decrement
         return 0;
     }
 
+    @Override
     public int getPort() {
         return this.port;
     }
@@ -65,14 +70,13 @@ public class NettyHttpListener implements ServiceRequestListener {
         this.childChannelHandler = handler;
     }
 
+    @Override
     public void start(int port, String bindAddress) throws Throwable {
-        ExecutorServiceFactory f = (tc) -> {
-            return Executors.newFixedThreadPool(EVENT_LOOP_THREAD_COUNT,
-                    r -> new Thread(r, this.host.getUri().toString() + "/netty-listener/"
-                            + this.host.getId()));
-        };
+        this.nettyExecutorService = Executors.newFixedThreadPool(EVENT_LOOP_THREAD_COUNT,
+                r -> new Thread(r, this.host.getUri().toString() + "/netty-listener/"
+                        + this.host.getId()));
 
-        this.eventLoopGroup = new NioEventLoopGroup(EVENT_LOOP_THREAD_COUNT, f);
+        this.eventLoopGroup = new NioEventLoopGroup(EVENT_LOOP_THREAD_COUNT, this.nettyExecutorService);
         if (this.childChannelHandler == null) {
             this.childChannelHandler = new NettyHttpServerInitializer(this.host, this.sslContext);
         }
@@ -82,7 +86,7 @@ public class NettyHttpListener implements ServiceRequestListener {
                 .channel(NioServerSocketChannel.class)
                 .childHandler(this.childChannelHandler);
 
-        InetSocketAddress addr = null;
+        InetSocketAddress addr;
         if (bindAddress != null) {
             addr = new InetSocketAddress(bindAddress, port);
         } else {
@@ -93,6 +97,7 @@ public class NettyHttpListener implements ServiceRequestListener {
         this.serverChannel = b.bind(addr).sync().channel();
         this.serverChannel.config().setOption(ChannelOption.SO_LINGER, 0);
         this.port = ((InetSocketAddress) this.serverChannel.localAddress()).getPort();
+        this.isListening = true;
     }
 
     @Override
@@ -100,24 +105,51 @@ public class NettyHttpListener implements ServiceRequestListener {
         op.complete();
     }
 
+    @Override
     public void stop() throws IOException {
-        if (this.serverChannel == null) {
-            return;
+        this.isListening = false;
+        if (this.serverChannel != null) {
+            this.serverChannel.close();
+            this.serverChannel = null;
         }
+        if (this.eventLoopGroup != null) {
+            this.eventLoopGroup.shutdownGracefully();
+            this.eventLoopGroup = null;
+        }
+        if (this.nettyExecutorService != null) {
+            this.nettyExecutorService.shutdown();
+            this.nettyExecutorService = null;
+        }
+        this.host.setPublicUri(null);
+    }
 
-        this.serverChannel.close();
-        this.eventLoopGroup.shutdownGracefully();
-        this.serverChannel = null;
+    /**
+     * Sets a caller configured Netty SSL context
+     */
+    public void setSSLContext(SslContext context) {
+        if (isListening()) {
+            throw new IllegalStateException("listener already started");
+        }
+        this.sslContext = context;
+    }
+
+    public SslContext getSSLContext() {
+        return this.sslContext;
     }
 
     @Override
     public void setSSLContextFiles(URI certFile, URI keyFile) throws Throwable {
-        this.setSSLContextFiles(certFile, keyFile, null);
+        setSSLContextFiles(certFile, keyFile, null);
     }
 
     @Override
     public void setSSLContextFiles(URI certFile, URI keyFile, String keyPassphrase) throws Throwable {
-        this.sslContext = SslContext.newServerContext(new File(certFile), new File(keyFile), keyPassphrase);
+        if (isListening()) {
+            throw new IllegalStateException("listener already started");
+        }
+        this.sslContext = SslContextBuilder.forServer(
+                new File(certFile), new File(keyFile), keyPassphrase)
+                .build();
     }
 
     @Override
@@ -125,4 +157,8 @@ public class NettyHttpListener implements ServiceRequestListener {
         return this.sslContext != null;
     }
 
+    @Override
+    public boolean isListening() {
+        return this.isListening;
+    }
 }

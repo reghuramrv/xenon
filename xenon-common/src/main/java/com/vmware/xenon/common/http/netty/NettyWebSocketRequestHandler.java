@@ -63,6 +63,12 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
     private String servicePrefix;
     private String authToken;
 
+    /**
+     * {@code true} means that handshake is at least started and we can process any subsequent {@link WebSocketFrame}
+     * request objects. Otherwise if we see a {@link WebSocketFrame} object - it belongs to some other handler.
+     */
+    private volatile boolean handshakeAccepted;
+
     public NettyWebSocketRequestHandler(ServiceHost host, String socketHandshakePath,
             String servicePrefix) {
         this.host = host;
@@ -70,22 +76,24 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
         this.servicePrefix = servicePrefix;
     }
 
+    @Override
     public boolean acceptInboundMessage(Object msg) throws Exception {
         if (msg instanceof FullHttpRequest) {
             FullHttpRequest nettyRequest = (FullHttpRequest) msg;
             return nettyRequest.uri().contentEquals(this.handshakePath);
         }
         if (msg instanceof WebSocketFrame) {
-            return true;
+            return this.handshakeAccepted;
         }
         return false;
     }
 
     @Override
-    protected void messageReceived(ChannelHandlerContext ctx, Object msg)
+    protected void channelRead0(ChannelHandlerContext ctx, Object msg)
             throws Exception {
         if (msg instanceof FullHttpRequest) {
             FullHttpRequest nettyRequest = (FullHttpRequest) msg;
+            this.handshakeAccepted = true;
             performWebsocketHandshake(ctx, nettyRequest);
             return;
         }
@@ -108,14 +116,19 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
                                         .getName())));
                 return;
             }
-            if (this.authToken != null) {
-                Operation dummyOp = new Operation();
-                dummyOp.addRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER, this.authToken);
-                dummyOp.setUri(UriUtils.buildUri(this.host, ServiceUriPaths.CORE_WEB_SOCKET_ENDPOINT));
-                OperationContext.setAuthorizationContext(this.host, dummyOp);
-            }
+
             String frameText = ((TextWebSocketFrame) frame).text();
-            this.host.run(() -> processWebSocketFrame(ctx, frameText));
+            this.host.run(() -> {
+                if (this.authToken != null) {
+                    Operation dummyOp = new Operation();
+                    dummyOp.addRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER, this.authToken);
+                    dummyOp.setUri(
+                            UriUtils.buildUri(this.host, ServiceUriPaths.CORE_WEB_SOCKET_ENDPOINT));
+                    OperationContext.setAuthorizationContext(this.host, dummyOp);
+                }
+
+                processWebSocketFrame(ctx, frameText);
+            });
             return;
         }
     }
@@ -154,9 +167,9 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
             DefaultHttpHeaders responseHeaders = new DefaultHttpHeaders();
             CharSequence token = nettyRequest.headers().get(Operation.REQUEST_AUTH_TOKEN_HEADER, null);
             if (token == null) {
-                String cookie = responseHeaders .getAndRemoveAndConvert(HttpHeaderNames.COOKIE);
+                String cookie = nettyRequest.headers().get(HttpHeaderNames.COOKIE);
                 if (cookie != null) {
-                    token = CookieJar.decodeCookies(cookie).get(AuthenticationConstants.DCP_JWT_COOKIE);
+                    token = CookieJar.decodeCookies(cookie).get(AuthenticationConstants.XENON_JWT_COOKIE);
                 }
 
             }

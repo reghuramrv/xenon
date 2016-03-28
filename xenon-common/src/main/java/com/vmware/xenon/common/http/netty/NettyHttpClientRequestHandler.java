@@ -29,19 +29,20 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
-import io.netty.handler.codec.AsciiString;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
-import io.netty.handler.codec.http.HttpHeaderUtil;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
-import io.netty.handler.codec.http2.HttpUtil;
+import io.netty.handler.codec.http.QueryStringDecoder;
+import io.netty.handler.codec.http2.HttpConversionUtil;
 import io.netty.handler.ssl.SslHandler;
+import io.netty.util.AsciiString;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
@@ -78,24 +79,30 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
     }
 
     @Override
-    protected void messageReceived(ChannelHandlerContext ctx, Object msg) {
+    protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
         Operation request = null;
         Integer streamId = null;
         try {
             // Start of request processing, initialize in-bound operation
             FullHttpRequest nettyRequest = (FullHttpRequest) msg;
             long expMicros = Utils.getNowMicrosUtc() + this.host.getOperationTimeoutMicros();
-            URI targetUri = new URI(nettyRequest.uri());
+            URI targetUri = new URI(nettyRequest.uri()).normalize();
             request = Operation.createGet(null);
             request.setAction(Action.valueOf(nettyRequest.method().toString()))
                     .setExpiration(expMicros);
+
+            String query = targetUri.getQuery();
+            if (query != null && !query.isEmpty()) {
+                query = QueryStringDecoder.decodeComponent(targetUri.getQuery());
+            }
+
             URI uri = new URI(UriUtils.HTTP_SCHEME, null, ServiceHost.LOCAL_HOST,
-                    this.host.getPort(), targetUri.getPath(), targetUri.getQuery(), null);
+                    this.host.getPort(), targetUri.getPath(), query, null);
             request.setUri(uri);
 
             // The streamId will be null for HTTP/1.1 connections, and valid for HTTP/2 connections
             streamId = nettyRequest.headers().getInt(
-                    HttpUtil.ExtensionHeaderNames.STREAM_ID.text());
+                    HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text());
             if (streamId == null) {
                 ctx.channel().attr(NettyChannelContext.OPERATION_KEY).set(request);
             }
@@ -151,7 +158,7 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             HttpRequest nettyRequest) {
         HttpHeaders headers = nettyRequest.headers();
 
-        String referer = headers.getAndRemoveAndConvert(HttpHeaderNames.REFERER);
+        String referer = getAndRemove(headers, HttpHeaderNames.REFERER);
         if (referer != null) {
             try {
                 request.setReferer(new URI(referer));
@@ -166,24 +173,29 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             return;
         }
 
-        request.setKeepAlive(HttpHeaderUtil.isKeepAlive(nettyRequest));
-        if (HttpHeaderUtil.isContentLengthSet(nettyRequest)) {
-            request.setContentLength(HttpHeaderUtil.getContentLength(nettyRequest));
+        request.setKeepAlive(HttpUtil.isKeepAlive(nettyRequest));
+        if (HttpUtil.isContentLengthSet(nettyRequest)) {
+            request.setContentLength(HttpUtil.getContentLength(nettyRequest));
         }
 
-        request.setContextId(headers.getAndRemoveAndConvert(Operation.CONTEXT_ID_HEADER));
+        request.setContextId(getAndRemove(headers, Operation.CONTEXT_ID_HEADER));
 
-        String contentType = headers.getAndRemoveAndConvert(HttpHeaderNames.CONTENT_TYPE);
+        String transactionId = getAndRemove(headers, Operation.TRANSACTION_ID_HEADER);
+        if (transactionId != null) {
+            request.setTransactionId(transactionId);
+        }
+
+        String contentType = getAndRemove(headers, HttpHeaderNames.CONTENT_TYPE);
         if (contentType != null) {
             request.setContentType(contentType);
         }
 
-        String cookie = headers.getAndRemoveAndConvert(HttpHeaderNames.COOKIE);
+        String cookie = getAndRemove(headers, HttpHeaderNames.COOKIE);
         if (cookie != null) {
             request.setCookies(CookieJar.decodeCookies(cookie));
         }
 
-        for (Entry<String, String> h : headers.entriesConverted()) {
+        for (Entry<String, String> h : headers) {
             String key = h.getKey();
             String value = h.getValue();
             request.addRequestHeader(key, value);
@@ -202,6 +214,18 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         } catch (Exception e) {
             this.host.log(Level.FINE, "Failed to get peer principal " + Utils.toString(e));
         }
+    }
+
+    private String getAndRemove(HttpHeaders headers, AsciiString headerName) {
+        String headerValue = headers.get(headerName.toString());
+        headers.remove(headerName);
+        return headerValue;
+    }
+
+    private String getAndRemove(HttpHeaders headers, String headerName) {
+        String headerValue = headers.get(headerName);
+        headers.remove(headerName);
+        return headerValue;
     }
 
     private void submitRequest(ChannelHandlerContext ctx, Operation request, Integer streamId) {
@@ -301,7 +325,8 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                     HttpResponseStatus.INTERNAL_SERVER_ERROR,
                     Unpooled.wrappedBuffer(data), false, false);
             if (streamId != null) {
-                response.headers().setInt(HttpUtil.ExtensionHeaderNames.STREAM_ID.text(), streamId);
+                response.headers().setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(),
+                        streamId);
             }
             response.headers().set(HttpHeaderNames.CONTENT_TYPE, Operation.MEDIA_TYPE_TEXT_HTML);
             response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH,
@@ -322,7 +347,8 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             // This is the stream ID from the incoming request: we need to use it for our
             // response so the client knows this is the response. If we don't set the stream
             // ID, Netty assigns a new, unused stream, which would be bad.
-            response.headers().setInt(HttpUtil.ExtensionHeaderNames.STREAM_ID.text(), streamId);
+            response.headers().setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(),
+                    streamId);
         }
         response.headers().set(HttpHeaderNames.CONTENT_TYPE,
                 request.getContentType());
@@ -334,13 +360,19 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             response.headers().set(nameValue.getKey(), nameValue.getValue());
         }
 
-        // Add Set-Cookie header to response if authorization context is marked as internal.
+        // Add auth token to response if authorization context
         AuthorizationContext authorizationContext = request.getAuthorizationContext();
         if (authorizationContext != null && authorizationContext.shouldPropagateToClient()) {
+            String token = authorizationContext.getToken();
+
+            // The x-xenon-auth-token header is our preferred style
+            response.headers().add(Operation.REQUEST_AUTH_TOKEN_HEADER, token);
+
+            // Client can also use the cookie if they prefer
             StringBuilder buf = new StringBuilder()
-                    .append(AuthenticationConstants.DCP_JWT_COOKIE)
+                    .append(AuthenticationConstants.XENON_JWT_COOKIE)
                     .append('=')
-                    .append(authorizationContext.getToken());
+                    .append(token);
 
             // Add Path qualifier, cookie applies everywhere
             buf.append("; Path=/");
@@ -378,6 +410,7 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             InetSocketAddress remote = (InetSocketAddress) ctx.channel().remoteAddress();
             String path = NettyHttpListener.UNKNOWN_CLIENT_REFERER_PATH;
             request.setReferer(UriUtils.buildUri(
+                    this.sslHandler != null ? "https" : "http",
                     remote.getHostString(),
                     remote.getPort(),
                     path,

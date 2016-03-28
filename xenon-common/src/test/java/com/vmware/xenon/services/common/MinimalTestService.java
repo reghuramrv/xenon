@@ -13,32 +13,48 @@
 
 package com.vmware.xenon.services.common;
 
+import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceErrorResponse;
+import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.ServiceMaintenanceRequest;
 import com.vmware.xenon.common.ServiceMaintenanceRequest.MaintenanceReason;
 import com.vmware.xenon.common.StatefulService;
+import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 
 public class MinimalTestService extends StatefulService {
 
+    public static final AtomicInteger HANDLE_START_COUNT = new AtomicInteger();
+
+    public static final String CUSTOM_CONTENT_TYPE = "application/vnd.vmware.horizon.manager.error+json;charset=UTF-8";
+
+    public static final String STRING_MARKER_FAIL_REQUEST = "fail request";
+    public static final String STRING_MARKER_RETRY_REQUEST = "fail request with error that causes retry";
     public static final String STRING_MARKER_TIMEOUT_REQUEST = "do not complete this request";
     public static final String STRING_MARKER_HAS_CONTEXT_ID = "check context id";
     public static final String STRING_MARKER_USE_DIFFERENT_CONTENT_TYPE = "change content type on response";
     public static final String STRING_MARKER_DELAY_COMPLETION = "do a tight loop";
+    public static final String STRING_MARKER_FAIL_WITH_PLAIN_TEXT_RESPONSE = "fail with plain text content type";
+    public static final String STRING_MARKER_FAIL_WITH_CUSTOM_CONTENT_TYPE_RESPONSE = "fail with "
+            + CUSTOM_CONTENT_TYPE;
+
     public static final String TEST_HEADER_NAME = "TestServiceHeader";
+    public static final String QUERY_HEADERS = "headers";
+    public static final String QUERY_DELAY_COMPLETION = "delay";
 
     public static final String PLAIN_TEXT_RESPONSE = createPlainTextResponse();
     public static final String ERROR_MESSAGE_ID_IS_REQUIRED = "id is required";
 
     public static final String STAT_NAME_MAINTENANCE_SUCCESS_COUNT = "maintSuccessCount";
     public static final String STAT_NAME_MAINTENANCE_FAILURE_COUNT = "maintFailureCount";
-
 
     public static class MinimalTestServiceErrorResponse extends ServiceErrorResponse {
 
@@ -65,11 +81,22 @@ public class MinimalTestService extends StatefulService {
         Random r = new Random();
         byte[] b = new byte[1500];
         r.nextBytes(b);
-        return java.util.Base64.getMimeEncoder().encodeToString(b).intern();
+        return java.util.Base64.getMimeEncoder().encodeToString(b);
+    }
+
+    @Override
+    public void handleCreate(Operation post) {
+        if (!ServiceHost.isServiceCreate(post)) {
+            post.fail(new IllegalStateException("not marked as create"));
+        } else {
+            post.complete();
+        }
     }
 
     @Override
     public void handleStart(Operation post) {
+        HANDLE_START_COUNT.incrementAndGet();
+
         if (post.hasBody()) {
             MinimalTestServiceState s = post.getBody(MinimalTestServiceState.class);
             if (s.id == null) {
@@ -86,6 +113,31 @@ public class MinimalTestService extends StatefulService {
         post.complete();
     }
 
+    public boolean gotStopped;
+
+    public boolean gotDeleted;
+
+    @Override
+    public void handleStop(Operation delete) {
+        this.gotStopped = true;
+        delete.complete();
+    }
+
+    @Override
+    public void handleDelete(Operation delete) {
+        if (delete.hasBody()) {
+            MinimalTestServiceState s = delete.getBody(MinimalTestServiceState.class);
+            if (STRING_MARKER_FAIL_REQUEST.equals(s.id)) {
+                delete.fail(new IllegalStateException("failing intentionally"));
+                return;
+            }
+        }
+        this.gotDeleted = true;
+        delete.complete();
+    }
+
+    private String retryRequestContextId;
+
     @Override
     public void handlePatch(Operation patch) {
         MinimalTestServiceState patchBody = patch
@@ -98,9 +150,48 @@ public class MinimalTestService extends StatefulService {
             return;
         }
 
+        if (patchBody.id.equals(STRING_MARKER_FAIL_WITH_PLAIN_TEXT_RESPONSE)) {
+            patch.setBody("test induced failure in custom text")
+                    .setContentType(Operation.MEDIA_TYPE_TEXT_PLAIN)
+                    .fail(Operation.STATUS_CODE_BAD_REQUEST);
+            return;
+        }
+
+        if (patchBody.id.equals(STRING_MARKER_FAIL_WITH_CUSTOM_CONTENT_TYPE_RESPONSE)) {
+            patch.setBody("test induced failure in custom text")
+                    .setContentType(CUSTOM_CONTENT_TYPE)
+                    .fail(Operation.STATUS_CODE_BAD_REQUEST);
+            return;
+        }
+
+        if (patchBody.id.equals(STRING_MARKER_RETRY_REQUEST)) {
+            if (this.retryRequestContextId != null) {
+                if (this.retryRequestContextId.equals(patch.getContextId())) {
+                    // the request was retried, and the body is correct since the ID is still set to
+                    // retry marker
+                    this.retryRequestContextId = null;
+                    patch.complete();
+                    return;
+                } else {
+                    patch.fail(new IllegalStateException("Expected retry context id to match"));
+                    return;
+                }
+            }
+
+            this.retryRequestContextId = patch.getContextId();
+            // fail request with a status code that should induce a retry
+            patch.setStatusCode(Operation.STATUS_CODE_BAD_REQUEST)
+                    .fail(new IllegalStateException("failing intentionally"));
+            return;
+        }
+
         if (patchBody.id.equals(STRING_MARKER_DELAY_COMPLETION)) {
             try {
-                Thread.sleep(25);
+                if (patchBody.responseDelay != null) {
+                    Thread.sleep(patchBody.responseDelay);
+                } else {
+                    Thread.sleep(25);
+                }
             } catch (InterruptedException e) {
             }
             patch.complete();
@@ -153,7 +244,44 @@ public class MinimalTestService extends StatefulService {
             get.setBodyNoCloning(PLAIN_TEXT_RESPONSE).complete();
             return;
         }
-        MinimalTestServiceState state = getState(get);
+
+        Map<String, String> params = UriUtils.parseUriQueryParams(get.getUri());
+        if (params.containsKey(QUERY_HEADERS)) {
+            respondWithHeaders(get);
+            return;
+        }
+
+
+        final MinimalTestServiceState state = getState(get);
+        if (params.containsKey(MinimalTestService.QUERY_DELAY_COMPLETION)) {
+            long delay = Integer.parseInt(params.get(MinimalTestService.QUERY_DELAY_COMPLETION));
+            getHost().schedule(
+                    () -> {
+                        get.setBody(state).complete();
+                    } ,
+                    delay, TimeUnit.SECONDS);
+            return;
+        }
+
+        get.setBody(state).complete();
+    }
+
+    /**
+    * If we receive a get with the "headers" query, we serialize the incoming
+    * headers and return this. This allows us to test that the right headers
+    * were sent.
+    */
+    private void respondWithHeaders(Operation get) {
+        StringBuilder sb = new StringBuilder();
+        Map<String, String> headers = get.getRequestHeaders();
+        for (Map.Entry<String, String> header : headers.entrySet()) {
+            sb.append(header.getKey());
+            sb.append(":");
+            sb.append(header.getValue());
+            sb.append("\n");
+        }
+        MinimalTestServiceState state = new MinimalTestServiceState();
+        state.stringValue = sb.toString();
         get.setBody(state).complete();
     }
 
@@ -163,6 +291,13 @@ public class MinimalTestService extends StatefulService {
             // just echo back binary bodies, do not update state
             put.complete();
             return;
+        }
+
+        if (put.getRequestHeader(TEST_HEADER_NAME) == null) {
+            if (put.getUri().getQuery() != null) {
+                put.fail(new IllegalArgumentException("Query not expected"));
+                return;
+            }
         }
 
         MinimalTestServiceState replacementState = put.getBody(MinimalTestServiceState.class);
@@ -180,11 +315,6 @@ public class MinimalTestService extends StatefulService {
         put.setBody(replacementState).complete();
     }
 
-    @Override
-    public void handleOptions(Operation options) {
-        options.complete();
-    }
-
     private void addResponseHeader(Operation op) {
         // if the test client has added a request header, add a response header before completion
         if (op.getRequestHeader(TEST_HEADER_NAME) != null) {
@@ -193,6 +323,7 @@ public class MinimalTestService extends StatefulService {
         }
     }
 
+    @Override
     public void handleMaintenance(Operation op) {
         if (this.delayMaintenance) {
             try {

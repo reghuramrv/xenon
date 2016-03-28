@@ -38,8 +38,7 @@ import com.vmware.xenon.services.common.NodeState.NodeStatus;
  * are added to a group through POST
  */
 public class NodeGroupService extends StatefulService {
-
-    private static final String STAT_NAME_REFERER_SEGMENT = ".referer.";
+    public static final String STAT_NAME_JOIN_RETRY_COUNT = "joinRetryCount";
 
     private enum NodeGroupChange {
         PEER_ADDED, PEER_STATUS_CHANGE, SELF_CHANGE
@@ -67,10 +66,10 @@ public class NodeGroupService extends StatefulService {
     public static class JoinPeerRequest {
         public static final String KIND = Utils.buildKind(JoinPeerRequest.class);
 
-        public static JoinPeerRequest create(URI peerToJoin, Integer synchQuorum) {
+        public static JoinPeerRequest create(URI peerToJoin, Integer quorum) {
             JoinPeerRequest r = new JoinPeerRequest();
             r.memberGroupReference = peerToJoin;
-            r.synchQuorum = synchQuorum;
+            r.membershipQuorum = quorum;
             r.kind = KIND;
             return r;
         }
@@ -89,7 +88,7 @@ public class NodeGroupService extends StatefulService {
         /**
          * Minimum number of nodes to enumeration, after join, for synchronization to start
          */
-        public Integer synchQuorum;
+        public Integer membershipQuorum;
 
         public String kind;
     }
@@ -97,16 +96,20 @@ public class NodeGroupService extends StatefulService {
     public static class UpdateQuorumRequest {
         public static final String KIND = Utils.buildKind(UpdateQuorumRequest.class);
 
-        public static UpdateQuorumRequest create(boolean isGroupUpdate, int quorum) {
+        public static UpdateQuorumRequest create(boolean isGroupUpdate) {
             UpdateQuorumRequest r = new UpdateQuorumRequest();
             r.isGroupUpdate = isGroupUpdate;
-            r.membershipQuorum = quorum;
             r.kind = KIND;
             return r;
         }
 
+        public UpdateQuorumRequest setMembershipQuorum(int count) {
+            this.membershipQuorum = count;
+            return this;
+        }
+
         public boolean isGroupUpdate;
-        public int membershipQuorum;
+        public Integer membershipQuorum;
         public String kind;
     }
 
@@ -172,7 +175,7 @@ public class NodeGroupService extends StatefulService {
 
     @Override
     public void handlePatch(Operation patch) {
-        NodeGroupState body = getBody(patch);
+        NodeGroupState body = getStateFromBody(patch);
         if (body == null) {
             patch.fail(new IllegalArgumentException("body of type NodeGroupState is required"));
             return;
@@ -196,7 +199,6 @@ public class NodeGroupService extends StatefulService {
             return;
         }
 
-        adjustStat(patch.getAction() + STAT_NAME_REFERER_SEGMENT + body.documentOwner, 1);
         EnumSet<NodeGroupChange> changes = EnumSet.noneOf(NodeGroupChange.class);
         mergeRemoteAndLocalMembership(
                 localState,
@@ -210,14 +212,9 @@ public class NodeGroupService extends StatefulService {
 
         patch.setBody(localState).complete();
 
-        if (localState.nodes.size() < Math.max(localNodeState.membershipQuorum,
-                localNodeState.synchQuorum)) {
-            return;
-        }
-
-        if (!NodeGroupUtils.isMembershipSettled(getHost(), getHost().getMaintenanceIntervalMicros(),
-                localState)) {
-            return;
+        if (!isAvailable()) {
+            boolean isAvailable = NodeGroupUtils.isNodeGroupAvailable(getHost(), localState);
+            setAvailable(isAvailable);
         }
 
         if (localNodeState.status == NodeStatus.AVAILABLE) {
@@ -232,10 +229,11 @@ public class NodeGroupService extends StatefulService {
             NodeGroupState localState) {
         UpdateQuorumRequest bd = patch.getBody(UpdateQuorumRequest.class);
         NodeState self = localState.nodes.get(getHost().getId());
-        logInfo("Updating self quorum from %d to %d, isGroupUpdate:%s",
-                self.membershipQuorum, bd.membershipQuorum, bd.isGroupUpdate);
 
-        self.membershipQuorum = bd.membershipQuorum;
+        if (bd.membershipQuorum != null) {
+            self.membershipQuorum = Math.max(1, bd.membershipQuorum);
+        }
+
         self.documentVersion++;
         self.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
         localState.membershipUpdateTimeMicros = self.documentUpdateTimeMicros;
@@ -282,7 +280,10 @@ public class NodeGroupService extends StatefulService {
                 c.handle(null, null);
                 continue;
             }
-            node.membershipQuorum = bd.membershipQuorum;
+            if (bd.membershipQuorum != null) {
+                node.membershipQuorum = bd.membershipQuorum;
+            }
+
             node.documentVersion++;
             node.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
             Operation p = Operation
@@ -315,7 +316,8 @@ public class NodeGroupService extends StatefulService {
 
         JoinPeerRequest joinBody = post.getBody(JoinPeerRequest.class);
         if (joinBody != null && joinBody.memberGroupReference != null) {
-            handleJoinPost(joinBody, post, getState(post), null);
+            handleJoinPost(joinBody, post, post.getExpirationMicrosUtc(),
+                    getState(post), null);
             return;
         }
 
@@ -324,8 +326,6 @@ public class NodeGroupService extends StatefulService {
             post.fail(new IllegalArgumentException("id is required"));
             return;
         }
-
-        adjustStat(post.getAction() + STAT_NAME_REFERER_SEGMENT + body.id, 1);
 
         boolean isLocalNode = body.id.equals(getHost().getId());
 
@@ -352,11 +352,11 @@ public class NodeGroupService extends StatefulService {
         CheckConvergenceResponse rsp = new CheckConvergenceResponse();
         rsp.isConverged = localState.membershipUpdateTimeMicros == body.membershipUpdateTimeMicros;
         post.setBody(rsp).complete();
-        return;
     }
 
     private void handleJoinPost(JoinPeerRequest joinBody,
             Operation joinOp,
+            long expirationMicros,
             NodeGroupState localState,
             NodeGroupState remotePeerState) {
 
@@ -373,11 +373,8 @@ public class NodeGroupService extends StatefulService {
             self.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
             self.documentVersion++;
 
-            // at a minimum we need 2 nodes to synch: self plus the node we are joining
-            self.synchQuorum = 2;
-
-            if (joinBody.synchQuorum != null) {
-                self.synchQuorum = Math.max(self.synchQuorum, joinBody.synchQuorum);
+            if (joinBody.membershipQuorum != null) {
+                self.membershipQuorum = Math.max(self.membershipQuorum, joinBody.membershipQuorum);
             }
 
             if (joinBody.localNodeOptions != null) {
@@ -403,13 +400,14 @@ public class NodeGroupService extends StatefulService {
                     .setCompletion(
                             (o, e) -> {
                                 if (e != null) {
-                                    logWarning("Failure getting peer %s state:%s", o.getUri(),
-                                            e.toString());
+                                    handleJoinFailure(e, joinBody, localState,
+                                            expirationMicros);
                                     return;
                                 }
 
-                                NodeGroupState remoteState = getBody(o);
-                                handleJoinPost(joinBody, null, localState, remoteState);
+                                NodeGroupState remoteState = getStateFromBody(o);
+                                handleJoinPost(joinBody, null, expirationMicros,
+                                        localState, remoteState);
                             }));
             return;
         }
@@ -417,10 +415,8 @@ public class NodeGroupService extends StatefulService {
         // Pass 2, merge remote group state with ours, send self to peer
         sendRequest(Operation.createPatch(getUri()).setBody(remotePeerState));
 
-        logInfo("Synch quorum: %d. Sending POST to insert self (%s) to peer %s",
-                self.synchQuorum,
-                self.groupReference,
-                joinBody.memberGroupReference);
+        logInfo("Sending POST to %s to insert self: %s",
+                joinBody.memberGroupReference, Utils.toJson(self));
 
         Operation insertSelfToPeer = Operation
                 .createPost(joinBody.memberGroupReference)
@@ -429,12 +425,30 @@ public class NodeGroupService extends StatefulService {
                         (o, e) -> {
                             if (e != null) {
                                 logSevere("Insert POST to %s failed", o.getUri());
-                                return;
                             }
                             // we will restart services to synchronize with peers on the next
                             // maintenance interval with a stable group membership
                     });
         sendRequest(insertSelfToPeer);
+    }
+
+    private void handleJoinFailure(Throwable e, JoinPeerRequest joinBody,
+            NodeGroupState localState,
+            long expirationMicros) {
+        if (expirationMicros < Utils.getNowMicrosUtc()) {
+            logWarning("Failure joining peer %s, attempt expired, will not retry",
+                    joinBody.memberGroupReference);
+            return;
+        }
+
+        getHost().schedule(() -> {
+            logWarning("Retrying GET to %s, due to %s",
+                    joinBody.memberGroupReference,
+                    e.toString());
+            handleJoinPost(joinBody, null, expirationMicros, localState, null);
+            adjustStat(STAT_NAME_JOIN_RETRY_COUNT, 1);
+        } , getHost().getMaintenanceIntervalMicros(), TimeUnit.MICROSECONDS);
+
     }
 
     private boolean validateNodeOptions(Operation joinOp, EnumSet<NodeOption> options) {
@@ -458,8 +472,7 @@ public class NodeGroupService extends StatefulService {
         NodeGroupState body = new NodeGroupState();
         body.config = null;
         body.documentOwner = getHost().getId();
-        body.documentSelfLink = UriUtils.buildUriPath(
-                getSelfLink(), body.documentOwner);
+        body.documentSelfLink = UriUtils.buildUriPath(getSelfLink(), body.documentOwner);
         local.status = NodeStatus.AVAILABLE;
         body.nodes.put(local.id, local);
 
@@ -473,6 +486,15 @@ public class NodeGroupService extends StatefulService {
         }
         body.id = getHost().getId();
         body.status = NodeStatus.SYNCHRONIZING;
+        Integer q = Integer.getInteger(NodeState.PROPERTY_NAME_MEMBERSHIP_QUORUM);
+        if (q != null) {
+            body.membershipQuorum = q;
+        } else {
+            // Initialize default quorum based on service host peerHosts argument
+            int total = getHost().getInitialPeerHosts().size() + 1;
+            int quorum = (total / 2) + 1;
+            body.membershipQuorum = Math.max(1, quorum);
+        }
         body.groupReference = UriUtils.buildPublicUri(getHost(), getSelfLink());
         body.documentSelfLink = UriUtils.buildUriPath(getSelfLink(), body.id);
         body.documentKind = Utils.buildKind(NodeState.class);
@@ -508,7 +530,16 @@ public class NodeGroupService extends StatefulService {
         }
 
         if (localState.nodes.size() <= 1) {
-            maint.complete();
+            if (!isAvailable()) {
+                // self patch at least once, so we update availability
+                sendRequest(Operation.createPatch(getUri())
+                        .setBodyNoCloning(localState)
+                        .setCompletion((o, e) -> {
+                            maint.complete();
+                        }));
+            } else {
+                maint.complete();
+            }
             return;
         }
 
@@ -614,7 +645,7 @@ public class NodeGroupService extends StatefulService {
                 }
                 remotePeer.status = NodeStatus.UNAVAILABLE;
             } else {
-                NodeGroupState peerState = getBody(patch);
+                NodeGroupState peerState = getStateFromBody(patch);
                 if (peerState.documentOwner.equals(remotePeer.id)) {
                     NodeState remotePeerStateFromRsp = peerState.nodes.get(remotePeer.id);
                     if (remotePeerStateFromRsp.documentVersion > remotePeer.documentVersion) {
@@ -835,7 +866,7 @@ public class NodeGroupService extends StatefulService {
         return randomizedPeers;
     }
 
-    NodeGroupState getBody(Operation o) {
+    private NodeGroupState getStateFromBody(Operation o) {
         if (!o.hasBody()) {
             return new NodeGroupState();
         }

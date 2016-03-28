@@ -18,8 +18,6 @@ import java.math.BigInteger;
 import java.net.URI;
 import java.security.MessageDigest;
 import java.util.Collection;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.CancellationException;
@@ -49,9 +47,6 @@ import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
 public class ConsistentHashingNodeSelectorService extends StatelessService implements
         NodeSelectorService {
 
-    public static final String STAT_NAME_OP_DELAY_MEMBERSHIP_UNSTABLE_COUNT = "opDelayDueToMembershipUnstableCount";
-    public static final String STAT_NAME_SYNCHRONIZATION_COUNT = "synchronizationCount";
-
     private ConcurrentSkipListMap<String, byte[]> hashedNodeIds = new ConcurrentSkipListMap<>();
     private ConcurrentLinkedQueue<SelectAndForwardRequest> pendingRequests = new ConcurrentLinkedQueue<>();
 
@@ -67,6 +62,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
     private volatile boolean isSynchronizationRequired;
     private boolean isNodeGroupConverged;
+    private int synchQuorumWarningCount;
 
     public ConsistentHashingNodeSelectorService() {
         super(NodeSelectorState.class);
@@ -171,8 +167,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         }
 
         if (op.getAction() == Action.DELETE) {
-            op.nestCompletion(o -> handleDeleteCompletion(o));
-            handleDelete(op);
+            super.handleRequest(op);
             return;
         }
 
@@ -228,7 +223,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         response.key = keyValue;
         body.associatedOp = op;
 
-        if (queueRequestIfMembershipInFlux(localState, body)) {
+        if (queueRequestIfNodeGroupIsUnavailable(localState, body)) {
             return;
         }
 
@@ -243,16 +238,8 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return;
         }
 
-        int quorum = localState.nodes.get(getHost().getId()).membershipQuorum;
-        int availableNodes = localState.nodes.size();
-        SortedMap<BigInteger, NodeState> closestNodes =
-                selectNodes(op, keyValue, localState, digest, quorum, availableNodes);
-
-        NodeState closest = closestNodes.get(closestNodes.firstKey());
-        response.ownerNodeId = closest.id;
-        response.isLocalHostOwner = response.ownerNodeId.equals(getHost().getId());
-        response.ownerNodeReference = UriUtils.buildUri(closest.groupReference, "");
-        response.selectedNodes = closestNodes.values();
+        // select nodes and update response
+        selectNodes(op, response, localState, digest);
 
         if (body.targetPath == null) {
             op.setBodyNoCloning(response).complete();
@@ -269,9 +256,9 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         }
 
         // If targetPath != null, we need to forward the operation.
-        URI remoteService = UriUtils.buildUri(response.ownerNodeReference.getScheme(),
-                response.ownerNodeReference.getHost(),
-                response.ownerNodeReference.getPort(),
+        URI remoteService = UriUtils.buildUri(response.ownerNodeGroupReference.getScheme(),
+                response.ownerNodeGroupReference.getHost(),
+                response.ownerNodeGroupReference.getPort(),
                 body.targetPath, body.targetQuery);
 
         Operation fwdOp = op.clone().setCompletion(
@@ -287,11 +274,14 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         getHost().getClient().send(fwdOp.setUri(remoteService));
     }
 
-    private SortedMap<BigInteger, NodeState> selectNodes(Operation op, String keyValue,
-            NodeGroupState localState, MessageDigest digest, int quorum,
-            int availableNodes) {
+    private void selectNodes(Operation op,
+            SelectOwnerResponse response,
+            NodeGroupState localState, MessageDigest digest) {
+        int quorum = localState.nodes.get(getHost().getId()).membershipQuorum;
+        int availableNodes = localState.nodes.size();
+
         SortedMap<BigInteger, NodeState> closestNodes = new TreeMap<>();
-        Set<Integer> quorums = new HashSet<>();
+        int maxQuorum = 0;
         long neighbourCount = 1;
         if (this.cachedState.replicationFactor != null) {
             neighbourCount = this.cachedState.replicationFactor;
@@ -303,10 +293,11 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
         byte[] key;
         try {
-            key = digest.digest(keyValue.getBytes(Utils.CHARSET));
+            key = digest.digest(response.key.getBytes(Utils.CHARSET));
         } catch (UnsupportedEncodingException e) {
             op.fail(e);
-            return null;
+            response.selectedNodes = null;
+            return;
         }
 
         BigInteger keyInteger = new BigInteger(key);
@@ -316,8 +307,10 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                 continue;
             }
 
+            response.availableNodeCount++;
+
             quorum = Math.max(m.membershipQuorum, quorum);
-            quorums.add(quorum);
+            maxQuorum = Math.max(quorum, maxQuorum);
             byte[] hashedNodeId;
             try {
                 hashedNodeId = this.hashedNodeIds.get(m.id);
@@ -328,7 +321,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                 }
             } catch (UnsupportedEncodingException e) {
                 op.fail(e);
-                return closestNodes;
+                return;
             }
             BigInteger nodeIdInteger = new BigInteger(hashedNodeId);
             BigInteger distance = nodeIdInteger.subtract(keyInteger);
@@ -340,19 +333,22 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             }
         }
 
-        if (quorums.size() > 1) {
-            op.fail(new IllegalStateException("Available nodes: "
-                    + availableNodes + ", different quorums: " + quorums));
-            return closestNodes;
+        if (maxQuorum != quorum) {
+            logWarning("Self quorum: %d, max quorum: %d. Using max", quorum, maxQuorum);
+            quorum = maxQuorum;
         }
 
         if (availableNodes < quorum) {
             op.fail(new IllegalStateException("Available nodes: "
                     + availableNodes + ", quorum:" + quorum));
-            return closestNodes;
+            return;
         }
 
-        return closestNodes;
+        NodeState closest = closestNodes.get(closestNodes.firstKey());
+        response.ownerNodeId = closest.id;
+        response.isLocalHostOwner = response.ownerNodeId.equals(getHost().getId());
+        response.ownerNodeGroupReference = closest.groupReference;
+        response.selectedNodes = closestNodes.values();
     }
 
     private void broadcast(Operation op, SelectAndForwardRequest req,
@@ -371,6 +367,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
         AtomicInteger availableNodeCount = new AtomicInteger();
         CompletionHandler c = (o, e) -> {
+            // add failure or success response to the appropriate, concurrent map
             if (e != null) {
                 ServiceErrorResponse errorRsp = Utils.toServiceErrorResponse(e);
                 rsp.failures.put(o.getUri(), errorRsp);
@@ -431,10 +428,19 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         this.replicationUtility.replicateUpdate(this.cachedGroupState, op, body, response);
     }
 
-    private boolean queueRequestIfMembershipInFlux(NodeGroupState localState,
+    /**
+     * Returns a value indicating whether request was queued. True means request is queued
+     * and will be processed once the node group is available
+     */
+    private boolean queueRequestIfNodeGroupIsUnavailable(NodeGroupState localState,
             SelectAndForwardRequest body) {
 
         Operation op = body.associatedOp;
+        if (getHost().isStopping()) {
+            op.fail(new CancellationException("host is stopping"));
+            return true;
+        }
+
         if (op.getExpirationMicrosUtc() < Utils.getNowMicrosUtc()) {
             // operation has expired
             op.fail(new TimeoutException(String.format(
@@ -443,12 +449,11 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return true;
         }
 
-        if (NodeGroupUtils.isMembershipSettled(getHost(), getHost()
-                .getMaintenanceIntervalMicros(), localState)) {
+        if (NodeGroupUtils.isNodeGroupAvailable(getHost(), localState)) {
             return false;
         }
 
-        adjustStat(STAT_NAME_OP_DELAY_MEMBERSHIP_UNSTABLE_COUNT, 1);
+        adjustStat(STAT_NAME_QUEUED_REQUEST_COUNT, 1);
 
         this.pendingRequests.add(body);
         return true;
@@ -468,6 +473,12 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
     private void performPendingRequestMaintenance() {
         if (this.pendingRequests.isEmpty()) {
+            return;
+        }
+
+        if (!NodeGroupUtils.isNodeGroupAvailable(getHost(), this.cachedGroupState)) {
+            // Optimization: if the node group is not ready do not evaluate each
+            // request. We check for availability in the selectAndForward method as well.
             return;
         }
 
@@ -492,13 +503,9 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return;
         }
 
-        if (!getHost().isPeerSynchronizationEnabled()
-                || !this.isSynchronizationRequired) {
-            return;
-        }
-
         if (!NodeGroupUtils.isMembershipSettled(getHost(), getHost().getMaintenanceIntervalMicros(),
                 this.cachedGroupState)) {
+            checkConvergence();
             return;
         }
 
@@ -507,35 +514,61 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return;
         }
 
+        if (!getHost().isPeerSynchronizationEnabled()
+                || !this.isSynchronizationRequired) {
+            return;
+        }
+
         this.isSynchronizationRequired = false;
-        logInfo("Scheduling synchronization of replicated services due to node group change");
+        logInfo("Scheduling synchronization (%d nodes)", this.cachedGroupState.nodes.size());
         adjustStat(STAT_NAME_SYNCHRONIZATION_COUNT, 1);
         getHost().scheduleNodeGroupChangeMaintenance(getSelfLink());
     }
 
     private void checkConvergence() {
+
         CompletionHandler c = (o, e) -> {
             if (e != null) {
                 logSevere(e);
                 return;
             }
 
+            final int quorumWarningsBeforeQuiet = 10;
             NodeGroupState ngs = o.getBody(NodeGroupState.class);
             long membershipUpdate = ngs.membershipUpdateTimeMicros;
             this.cachedGroupState = ngs;
             Operation op = Operation.createPost(null)
                     .setReferer(getUri())
                     .setExpiration(Utils.getNowMicrosUtc() + getHost().getOperationTimeoutMicros());
-            NodeGroupUtils.checkConvergence(getHost(), ngs, op.setCompletion((o1, e1) -> {
-                if (e1 != null) {
-                    logWarning("Failed convergence check, will retry: %s", e1.getMessage());
-                    return;
-                }
+            NodeGroupUtils
+                    .checkConvergence(
+                            getHost(),
+                            ngs,
+                            op.setCompletion((o1, e1) -> {
+                                if (e1 != null) {
+                                    logWarning("Failed convergence check, will retry: %s",
+                                            e1.getMessage());
+                                    return;
+                                }
 
-                // if node group changed since we kicked of this check, we need to wait for
-                // newer convergence completions
-                this.isNodeGroupConverged = membershipUpdate == this.cachedGroupState.membershipUpdateTimeMicros;
-            }));
+                                if (!NodeGroupUtils.hasMembershipQuorum(getHost(),
+                                        this.cachedGroupState)) {
+                                    if (this.synchQuorumWarningCount < quorumWarningsBeforeQuiet) {
+                                        logWarning("Synchronization quorum not met");
+                                    } else if (this.synchQuorumWarningCount == quorumWarningsBeforeQuiet) {
+                                        logWarning("Synchronization quorum not met, warning will be silenced");
+                                    }
+                                    this.synchQuorumWarningCount++;
+                                    return;
+                                }
+
+                                // if node group changed since we kicked of this check, we need to wait for
+                                // newer convergence completions
+                                this.isNodeGroupConverged = membershipUpdate == this.cachedGroupState.membershipUpdateTimeMicros;
+                                if (this.isNodeGroupConverged) {
+                                    this.synchQuorumWarningCount = 0;
+                                }
+                            }));
         };
 
         sendRequest(Operation.createGet(this, this.cachedState.nodeGroupLink).setCompletion(c));

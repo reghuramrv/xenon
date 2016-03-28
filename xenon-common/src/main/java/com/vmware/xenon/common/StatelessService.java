@@ -22,6 +22,7 @@ import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.ServiceStats.ServiceStatLogHistogram;
 import com.vmware.xenon.common.jwt.Signer;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 
 /**
  * Infrastructure use only. Minimal Service implementation. Core service implementations that do not
@@ -34,7 +35,7 @@ public class StatelessService implements Service {
     private ProcessingStage stage = ProcessingStage.CREATED;
     private ServiceHost host;
     private String selfLink;
-    protected EnumSet<ServiceOption> options = EnumSet.noneOf(ServiceOption.class);
+    protected final EnumSet<ServiceOption> options = EnumSet.noneOf(ServiceOption.class);
     private UtilityService utilityService;
     protected Class<? extends ServiceDocument> stateType;
 
@@ -43,6 +44,7 @@ public class StatelessService implements Service {
             throw new IllegalArgumentException("stateType is required");
         }
         this.stateType = stateType;
+        this.options.add(ServiceOption.CONCURRENT_GET_HANDLING);
         this.options.add(ServiceOption.CONCURRENT_UPDATE_HANDLING);
     }
 
@@ -51,8 +53,28 @@ public class StatelessService implements Service {
     }
 
     @Override
+    public void handleCreate(Operation post) {
+        post.complete();
+    }
+
+    @Override
     public void handleStart(Operation startPost) {
         startPost.complete();
+    }
+
+    @Override
+    public void authorizeRequest(Operation op) {
+        // A state-less service has no service state to apply policy to, but it does have a
+        // self link. Create a document with the service link so we can apply roles with resource
+        // specifications targeting the self link field
+        ServiceDocument doc = new ServiceDocument();
+        doc.documentSelfLink = this.selfLink;
+        if (getHost().isAuthorized(this, doc, op)) {
+            op.complete();
+            return;
+        }
+
+        op.fail(Operation.STATUS_CODE_FORBIDDEN);
     }
 
     @Override
@@ -77,39 +99,107 @@ public class StatelessService implements Service {
 
     @Override
     public void handleRequest(Operation op, OperationProcessingStage opProcessingStage) {
-        if (opProcessingStage == OperationProcessingStage.PROCESSING_FILTERS) {
-            OperationProcessingChain opProcessingChain = getOperationProcessingChain();
-            if (opProcessingChain != null && !opProcessingChain.processRequest(op)) {
-                return;
+        try {
+            if (opProcessingStage == OperationProcessingStage.PROCESSING_FILTERS) {
+                OperationProcessingChain opProcessingChain = getOperationProcessingChain();
+                if (opProcessingChain != null && !opProcessingChain.processRequest(op)) {
+                    return;
+                }
+                opProcessingStage = OperationProcessingStage.EXECUTING_SERVICE_HANDLER;
             }
-            opProcessingStage = OperationProcessingStage.EXECUTING_SERVICE_HANDLER;
-        }
 
-        if (opProcessingStage == OperationProcessingStage.EXECUTING_SERVICE_HANDLER) {
-            if (op.getAction() == Action.GET) {
-                op.nestCompletion(o -> {
-                    handleGetCompletion(op);
-                });
-                try {
+            if (opProcessingStage == OperationProcessingStage.EXECUTING_SERVICE_HANDLER) {
+                if (op.getAction() == Action.GET) {
+                    if (ServiceHost.isForServiceNamespace(this, op)) {
+                        handleGet(op);
+                        return;
+                    }
+                    op.nestCompletion(o -> {
+                        handleGetCompletion(op);
+                    });
                     handleGet(op);
-                } catch (Throwable e) {
-                    op.fail(e);
-                }
-                return;
-            } else if (op.getAction() == Action.DELETE) {
-                op.nestCompletion(o -> {
-                    handleDeleteCompletion(op);
-                });
-                try {
-                    handleDelete(op);
-                } catch (Throwable e) {
-                    op.fail(e);
-                }
-                return;
-            }
-        }
+                } else if (op.getAction() == Action.POST) {
+                    handlePost(op);
+                } else if (op.getAction() == Action.DELETE) {
+                    if (ServiceHost.isForServiceNamespace(this, op)) {
+                        // this is a request for the namespace, not the service itself.
+                        // Call handleDelete but do not nest completion that stops the service.
+                        handleDelete(op);
+                        return;
+                    }
+                    if (ServiceHost.isServiceStop(op)) {
+                        op.nestCompletion(o -> {
+                            handleStopCompletion(op);
+                        });
+                        handleStop(op);
+                    } else {
+                        op.nestCompletion(o -> {
+                            handleDeleteCompletion(op);
+                        });
+                        handleDelete(op);
+                    }
+                } else if (op.getAction() == Action.OPTIONS) {
+                    if (ServiceHost.isForServiceNamespace(this, op)) {
+                        handleOptions(op);
+                        return;
+                    }
+                    op.nestCompletion(o -> {
+                        handleOptionsCompletion(op);
+                    });
 
-        getHost().failRequestActionNotSupported(op);
+                    handleOptions(op);
+                } else if (op.getAction() == Action.PATCH) {
+                    handlePatch(op);
+                } else if (op.getAction() == Action.PUT) {
+                    handlePut(op);
+                }
+            }
+        } catch (Throwable e) {
+            op.fail(e);
+        }
+    }
+
+    public void handlePut(Operation put) {
+        getHost().failRequestActionNotSupported(put);
+    }
+
+    public void handlePatch(Operation patch) {
+        getHost().failRequestActionNotSupported(patch);
+    }
+
+    public void handleOptions(Operation options) {
+        options.setBody(null).complete();
+    }
+
+    /**
+     * Runs after a DELETE operation, that is not a service stop, completes.
+     * It guarantees that the handleStop handler will execute next, and the shared
+     * completion that stops the service will run after the stop operation is completed
+     */
+    protected void handleDeleteCompletion(Operation op) {
+        op.nestCompletion((o) -> {
+            handleStopCompletion(op);
+        });
+        handleStop(op);
+    }
+
+    /**
+     * Stops the service
+     */
+    protected void handleStopCompletion(Operation op) {
+        getHost().stopService(this);
+        op.complete();
+    }
+
+    protected void handleOptionsCompletion(Operation options) {
+        if (!options.hasBody()) {
+            options.setBodyNoCloning(getDocumentTemplate());
+        }
+        options.complete();
+    }
+
+    public void handlePost(Operation post) {
+        getHost().failRequestActionNotSupported(post);
     }
 
     public void handleGet(Operation get) {
@@ -120,8 +210,7 @@ public class StatelessService implements Service {
         delete.complete();
     }
 
-    protected void handleDeleteCompletion(Operation delete) {
-        getHost().stopService(this);
+    public void handleStop(Operation delete) {
         delete.complete();
     }
 
@@ -145,8 +234,59 @@ public class StatelessService implements Service {
         }));
     }
 
+    /**
+     * Infrastructure use. Invoked by host to execute a service handler for a maintenance request.
+     * ServiceMaintenanceRequest object is set in the operation body, with the reasons field
+     * indicating the maintenance reason. Its invoked when
+     *
+     * 1) Periodically, if ServiceOption.PERIODIC_MAINTENANCE is set.
+     *
+     * 2) Node group change.
+     *
+     * Services should override handlePeriodicMaintenance and handleNodeGroupMaintenance.
+     *
+     * An implementation of this method that needs to interact with the state of this service must
+     * do so as if it were a client of this service. That is: the state of the service should be
+     * retrieved by requesting a GET; and the state of the service should be mutated by submitting a
+     * PATCH, PUT or DELETE.
+     */
     @Override
     public void handleMaintenance(Operation post) {
+        ServiceMaintenanceRequest request = post.getBody(ServiceMaintenanceRequest.class);
+        if (request.reasons.contains(ServiceMaintenanceRequest.MaintenanceReason.PERIODIC_SCHEDULE)) {
+            this.handlePeriodicMaintenance(post);
+        } else if (request.reasons.contains(ServiceMaintenanceRequest.MaintenanceReason.NODE_GROUP_CHANGE)) {
+            this.handleNodeGroupMaintenance(post);
+        } else {
+            post.complete();
+        }
+    }
+
+    /**
+     * Invoked by the host periodically, if ServiceOption.PERIODIC_MAINTENANCE is set.
+     * ServiceMaintenanceRequest object is set in the operation body, with the reasons field
+     * indicating the maintenance reason.
+     *
+     * An implementation of this method that needs to interact with the state of this service must
+     * do so as if it were a client of this service. That is: the state of the service should be
+     * retrieved by requesting a GET; and the state of the service should be mutated by submitting a
+     * PATCH, PUT or DELETE.
+     */
+    public void handlePeriodicMaintenance(Operation post) {
+        post.complete();
+    }
+
+    /**
+     * Invoked by the host on node group change.
+     * ServiceMaintenanceRequest object is set in the operation body, with the reasons field
+     * indicating the maintenance reason.
+     *
+     * An implementation of this method that needs to interact with the state of this service must
+     * do so as if it were a client of this service. That is: the state of the service should be
+     * retrieved by requesting a GET; and the state of the service should be mutated by submitting a
+     * PATCH, PUT or DELETE.
+     */
+    public void handleNodeGroupMaintenance(Operation post) {
         post.complete();
     }
 
@@ -186,7 +326,7 @@ public class StatelessService implements Service {
             if (option == ServiceOption.REPLICATION) {
                 throw new IllegalArgumentException("Option is not supported");
             }
-            if (option == ServiceOption.ENFORCE_QUORUM) {
+            if (option == ServiceOption.OWNER_SELECTION) {
                 throw new IllegalArgumentException("Option is not supported");
             }
             if (option == ServiceOption.IDEMPOTENT_POST) {
@@ -260,14 +400,40 @@ public class StatelessService implements Service {
         return s;
     }
 
-    private boolean allocateUtilityService() {
+    /**
+     * Value indicating whether GET on /available returns 200 or 503
+     * The method is a convenience method since it relies on STAT_NAME_AVAILABLE to report
+     * availability.
+     */
+    public void setAvailable(boolean isAvailable) {
+        this.toggleOption(ServiceOption.INSTRUMENTATION, true);
+        this.setStat(STAT_NAME_AVAILABLE, isAvailable ? STAT_VALUE_TRUE : STAT_VALUE_FALSE);
+    }
+
+    /**
+     * Value indicating whether GET on /available returns 200 or 503
+     */
+    public boolean isAvailable() {
+        if (!hasOption(Service.ServiceOption.INSTRUMENTATION)) {
+            return true;
+        }
+        // processing stage must also indicate service is started
+        if (this.stage != ProcessingStage.AVAILABLE && this.stage != ProcessingStage.PAUSED) {
+            return false;
+        }
+        ServiceStat st = this.getStat(STAT_NAME_AVAILABLE);
+        if (st != null && st.latestValue == STAT_VALUE_TRUE) {
+            return true;
+        }
+        return false;
+    }
+
+    private void allocateUtilityService() {
         synchronized (this.options) {
             if (this.utilityService == null) {
                 this.utilityService = new UtilityService().setParent(this);
-                ;
             }
         }
-        return true;
     }
 
     @Override
@@ -277,11 +443,7 @@ public class StatelessService implements Service {
 
     @Override
     public void setSelfLink(String path) {
-        if (path != null) {
-            this.selfLink = path.intern();
-        } else {
-            this.selfLink = null;
-        }
+        this.selfLink = path;
     }
 
     @Override
@@ -300,7 +462,7 @@ public class StatelessService implements Service {
             return;
         }
 
-        getHost().notifyServiceAvailabilitySubscribers(this);
+        getHost().processPendingServiceAvailableOperations(this, null);
     }
 
     @Override
@@ -399,6 +561,13 @@ public class StatelessService implements Service {
         if (micros < 0) {
             throw new IllegalArgumentException("micros must be positive");
         }
+
+        if (micros > 0 && micros < Service.MIN_MAINTENANCE_INTERVAL_MICROS) {
+            log(Level.WARNING, "Maintenance interval %d is less than the minimum interval %d"
+                    + ", reducing to min interval", micros, Service.MIN_MAINTENANCE_INTERVAL_MICROS);
+            micros = Service.MIN_MAINTENANCE_INTERVAL_MICROS;
+        }
+
         this.maintenanceIntervalMicros = micros;
     }
 
@@ -468,5 +637,62 @@ public class StatelessService implements Service {
         } else {
             throw new RuntimeException("Service not allowed to get system authorization context");
         }
+    }
+
+    /**
+     * @see #handleUiGet(String, Service, Operation)
+     * @param get
+     */
+    protected void handleUiGet(Operation get) {
+        handleUiGet(getSelfLink(), this, get);
+    }
+
+    /**
+     * This method does basic URL rewriting and forwards to the Ui service.
+     *
+     * Every request to /some/service/FILE gets forwarded to
+     * /user-interface/resources/${serviceClass}/FILE
+     * @param get
+     */
+    protected void handleUiGet(String selfLink, Service ownerService, Operation get) {
+        String requestUri = get.getUri().getPath();
+
+        String uiResourcePath;
+
+        ServiceDocumentDescription desc = ownerService.getDocumentTemplate().documentDescription;
+        if (desc != null && desc.userInterfaceResourcePath != null) {
+            uiResourcePath = UriUtils.buildUriPath(ServiceUriPaths.UI_RESOURCES,
+                    desc.userInterfaceResourcePath);
+        } else {
+            uiResourcePath = Utils.buildUiResourceUriPrefixPath(ownerService);
+        }
+
+        if (selfLink.equals(requestUri)) {
+            // no trailing /, redirect to a location with trailing /
+            get.setStatusCode(Operation.STATUS_CODE_MOVED_TEMP);
+            get.addResponseHeader(Operation.LOCATION_HEADER, selfLink + UriUtils.URI_PATH_CHAR);
+            get.complete();
+            return;
+        } else {
+            String relativeToSelfUri = requestUri.substring(selfLink.length());
+            if (relativeToSelfUri.equals(UriUtils.URI_PATH_CHAR)) {
+                // serve the index.html
+                uiResourcePath += UriUtils.URI_PATH_CHAR + ServiceUriPaths.UI_RESOURCE_DEFAULT_FILE;
+            } else {
+                // serve whatever resource
+                uiResourcePath += relativeToSelfUri;
+            }
+        }
+
+        // Forward request to the /user-interface service
+        Operation operation = get.clone();
+        operation.setUri(UriUtils.buildUri(getHost(), uiResourcePath))
+                .setCompletion((o, e) -> {
+                    get.setBody(o.getBodyRaw())
+                            .setContentType(o.getContentType())
+                            .complete();
+                });
+
+        getHost().sendRequest(operation);
     }
 }

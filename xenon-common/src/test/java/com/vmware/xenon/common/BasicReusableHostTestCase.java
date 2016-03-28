@@ -25,11 +25,14 @@ import org.junit.rules.TestWatcher;
 import org.junit.runner.Description;
 
 import com.vmware.xenon.common.CommandLineArgumentParser;
+import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.services.common.ExampleService;
 
 public class BasicReusableHostTestCase {
 
-    private static final int MAINTENANCE_INTERVAL_MILLIS = 1000;
+    private static final int MAINTENANCE_INTERVAL_MILLIS = 250;
 
     private static VerificationHost HOST;
 
@@ -47,8 +50,10 @@ public class BasicReusableHostTestCase {
         HOST.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS
                 .toMicros(MAINTENANCE_INTERVAL_MILLIS));
         CommandLineArgumentParser.parseFromProperties(HOST);
+        HOST.setStressTest(HOST.isStressTest);
         try {
             HOST.start();
+            HOST.waitForServiceAvailable(ExampleService.FACTORY_LINK);
         } catch (Throwable e) {
             throw new Exception(e);
         }
@@ -58,6 +63,14 @@ public class BasicReusableHostTestCase {
     public void setUpPerMethod() {
         CommandLineArgumentParser.parseFromProperties(this);
         this.host = HOST;
+    }
+
+    public TestContext testCreate(int c) {
+        return this.host.testCreate(c);
+    }
+
+    public void testWait(TestContext ctx) throws Throwable {
+        ctx.await();
     }
 
     protected TestRule watcher = new TestWatcher() {
@@ -74,4 +87,12 @@ public class BasicReusableHostTestCase {
         HOST.tearDown();
     }
 
+    /**
+     * @see VerificationHost#getSafeHandler(CompletionHandler)
+     * @param handler
+     * @return
+     */
+    public static CompletionHandler getSafeHandler(CompletionHandler handler) {
+        return HOST.getSafeHandler(handler);
+    }
 }

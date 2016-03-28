@@ -15,10 +15,11 @@ package com.vmware.xenon.common;
 
 import java.net.URI;
 import java.util.EnumSet;
+import java.util.concurrent.TimeUnit;
 
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 
-public interface Service {
+public interface Service extends ServiceRequestSender {
     enum Action {
         GET, POST, PATCH, PUT, DELETE, OPTIONS
     }
@@ -56,39 +57,39 @@ public interface Service {
          * Service state updates are replicated among peer instances on other nodes. The default
          * replication group is used if no group is specified. Updates are replicated into phases
          * and use the appropriate protocol depending on other options.  See
-         * OWNER_SELECTION and EAGER_CONSISTENCY options on how they affect replication.
+         * OWNER_SELECTION on how it affects replication.
          *
          */
         REPLICATION,
 
         /**
          * Service runtime performs a node selection process, per service, and forwards all updates
-         * to the service instance on the selected node. Ownership is tracked in the indexed state
-         * versions and remains fixed as long as the current owner is healthy. To enable scale out
-         * only the service instance on the owner node performs work. All instances will receive the
-         * updated state but the service handler is only invoked on the instance in the owner node.
-         * This option causes replication to happen after the owner service has validated the update
-         * and waits for quorum number of peers to accept the replicated state, before completing
-         * the operation to the client. If less than quorum peers accept the update, the owner will
-         * still proceed with committing the update and completion the operation successfully. To
-         * enforce strict quorum and avoid value divergence see the {@code EAGER_CONSISTENCY}
-         * option
+         * to the service instance on the selected node.
          *
-         * Requires: REPLICATION Not compatible with: CONCURRENT_UPDATE_HANDLING
+         * This option enables the mechanism for strong consensus
+         * and leader election.
+         *
+         * Ownership is tracked in the indexed state versions and remains fixed given a stable node
+         * group. To enable scale out, only the service instance on the owner node performs work.
+         *
+         * The runtime will route requests to the owner, regardless to which node receives a client
+         * request.
+         *
+         * These service handlers are invoked only on the service instance on the owner node:
+         * handleStart, handleMaintenance, handleGet, handleDelete, handlePut, handlePatch
+         *
+         * Service instances (replicas) on the other nodes will see replicated updates, as part of the
+         * consensus protocol but there will be no service handler up-call.
+         * Updates are committed on the owner, and the client sees success on the operation only
+         * if quorum number of peers accept the updated state. If the node group has been partitioned
+         * or multiple peers have failed, this option makes the service unavailable, since no updates
+         * will be accepted.
+         *
+         * Requires: REPLICATION
+         *
+         * Not compatible with: CONCURRENT_UPDATE_HANDLING
          */
         OWNER_SELECTION,
-
-        /**
-         * Modifies the replication protocol in a single way: Updates are committed on the owner, and
-         * the client sees success on the operation only if quorum number of peers accept the updated
-         * state. If the node group has been partitioned or multiple peers have failed, this option
-         * makes the service unavailable, since no updates will be accepted. Enabling this option
-         * provides strong consistency guarantees for service updates. It also affects availability,
-         * since the service will fail all updates unless quorum or more nodes are available.
-         *
-         * Requires: REPLICATION, OWNER_SELECTION Not compatible with: CONCURRENT_UPDATE_HANDLING
-         */
-        ENFORCE_QUORUM,
 
         /**
          * Document update operations are conditional: the client must provide the expected
@@ -100,7 +101,9 @@ public interface Service {
          * If there is no signature in the current state, then the version from the current state
          * must match the version in the request body.
          *
-         * Requires: REPLICATION Not compatible with: CONCURRENT_UPDATE_HANDLING
+         * Requires: REPLICATION
+         *
+         * Not compatible with: CONCURRENT_UPDATE_HANDLING
          */
         STRICT_UPDATE_CHECKING,
 
@@ -123,9 +126,19 @@ public interface Service {
          * allowed to execute concurrently with updates, using the latest committed version of the
          * service state
          *
-         * Not compatible with: STRICT_UPDATE_CHECKING, PERSISTENCE, REPLICATION, EAGER_CONSISTENCY
+         * Not compatible with: STRICT_UPDATE_CHECKING, PERSISTENCE, REPLICATION, OWNER_SELECTION
          */
         CONCURRENT_UPDATE_HANDLING,
+
+        /**
+         * Service runtime allows a GET to execute concurrently with updates.
+         *
+         * This option is enabled by default. Disabling this option helps in situations where,
+         * for example, an operation processing filter reads the current state and then
+         * conditionally updates it, relying on the state not being updated by some other
+         * operation in the meantime.
+         */
+        CONCURRENT_GET_HANDLING,
 
         /**
          * Service factory will convert a POST to a PUT if a child service is already present, and
@@ -134,6 +147,33 @@ public interface Service {
          * prevent POSTs from modifying state unless the version and signature match
          */
         IDEMPOTENT_POST,
+
+        /**
+         * Runtime will load factory child services the first time a client attempts to access
+         * them. Replication services might load due to synchronization, when joining node groups.
+         *
+         * Requires: FACTORY_ITEM (services created through factories)
+         *
+         */
+        ON_DEMAND_LOAD,
+
+        /**
+         * Service will queue operation in last in first out order. If limit on operation queue is
+         * exceeded, oldest operation in the queue will be cancelled to make room for the most
+         * recent one
+         */
+        LIFO_QUEUE,
+
+        /**
+         * Service owns a portion of the URI name space for the service host. It can register for
+         * a single URI path prefix and all requests that start with the prefix will be routed to
+         * it. The service self link will be the prefix path, for the purpose of life cycle
+         * REST operations
+         *
+         * Not compatible with: PERSISTENCE, REPLICATION
+         *
+         */
+        URI_NAMESPACE_OWNER,
 
         /**
          * Set by runtime. Service is associated with another service providing functionality for
@@ -152,17 +192,12 @@ public interface Service {
          */
         FACTORY_ITEM,
 
+
         /**
          * Set by runtime. Service is currently assigned ownership of the replicated document. Any
          * work initiated through an update should only happen on this instance
          */
         DOCUMENT_OWNER,
-
-        /**
-         * Service will queue operation in last in first out order. If limit on operation queue is exceeded,
-         * oldest operation in the queue will be cancelled to make room for the most recent one
-         */
-        LIFO_QUEUE,
 
         NONE
     }
@@ -190,9 +225,14 @@ public interface Service {
         SYNCHRONIZING,
 
         /**
-         * Service is visible to other services (its URI is registered) and can process self
-         * issued-operations and durable store has its state available for access. Operations issued
-         * by other services or clients are queued
+         * Service handleCreate is invoked. Runtime proceeds when the create Operation
+         * is completed
+         */
+        EXECUTING_CREATE_HANDLER,
+
+        /**
+         * Service handleStart is invoked. Runtime proceeds when the start Operation
+         * is completed
          */
         EXECUTING_START_HANDLER,
 
@@ -237,38 +277,91 @@ public interface Service {
         EXECUTING_SERVICE_HANDLER
     }
 
-    String STAT_NAME_REQUEST_COUNT = "requestCount";
-    String STAT_NAME_PRE_AVAILABLE_OP_COUNT = "preAvailableReceivedOperationCount";
-    String STAT_NAME_FAILURE_COUNT = "failureCount";
+    static final double STAT_VALUE_TRUE = 1.0;
+    static final double STAT_VALUE_FALSE = 0.0;
 
-    String STAT_NAME_REQUEST_OUT_OF_ORDER_COUNT = "requestOutOfOrderCount";
-    String STAT_NAME_STATE_PERSIST_LATENCY = "statePersistLatencyMicros";
-    String STAT_NAME_OPERATION_QUEUEING_LATENCY = "operationQueueingLatencyMicros";
-    String STAT_NAME_SERVICE_HANDLER_LATENCY = "operationHandlerProcessingLatencyMicros";
-    String STAT_NAME_OPERATION_DURATION = "operationDuration";
-    String STAT_NAME_MAINTENANCE_COUNT = "maintenanceCount";
-    String STAT_NAME_NODE_GROUP_CHANGE_MAINTENANCE_COUNT = "maintenanceForNodeGroupChangeCount";
-    String STAT_NAME_NODE_GROUP_CHANGE_PENDING_MAINTENANCE_COUNT = "pendingMaintenanceForNodeGroupChangeCount";
-    String STAT_NAME_MAINTENANCE_COMPLETION_DELAYED_COUNT = "maintenanceCompletionDelayedCount";
-    String STAT_NAME_CACHE_MISS_COUNT = "stateCacheMissCount";
-    String STAT_NAME_CACHE_CLEAR_COUNT = "stateCacheClearCount";
-    String STAT_NAME_VERSION_CONFLICT_COUNT = "stateVersionConflictCount";
-    String STAT_NAME_VERSION_IN_CONFLICT = "stateVersionInConflict";
-    String STAT_NAME_PAUSE_COUNT = "pauseCount";
-    String STAT_NAME_RESUME_COUNT = "resumeCount";
+    static final String STAT_NAME_REQUEST_COUNT = "requestCount";
+    static final String STAT_NAME_PRE_AVAILABLE_OP_COUNT = "preAvailableReceivedOperationCount";
+    static final String STAT_NAME_AVAILABLE = "isAvailable";
+    static final String STAT_NAME_FAILURE_COUNT = "failureCount";
+    static final String STAT_NAME_REQUEST_OUT_OF_ORDER_COUNT = "requestOutOfOrderCount";
+    static final String STAT_NAME_STATE_PERSIST_LATENCY = "statePersistLatencyMicros";
+    static final String STAT_NAME_OPERATION_QUEUEING_LATENCY = "operationQueueingLatencyMicros";
+    static final String STAT_NAME_SERVICE_HANDLER_LATENCY = "operationHandlerProcessingLatencyMicros";
+    static final String STAT_NAME_CREATE_COUNT = "createCount";
+    static final String STAT_NAME_OPERATION_DURATION = "operationDuration";
+    static final String STAT_NAME_MAINTENANCE_COUNT = "maintenanceCount";
+    static final String STAT_NAME_NODE_GROUP_CHANGE_MAINTENANCE_COUNT = "maintenanceForNodeGroupChangeCount";
+    static final String STAT_NAME_NODE_GROUP_SYNCH_DELAYED_COUNT = "maintenanceForNodeGroupDelayedCount";
+    static final String STAT_NAME_MAINTENANCE_COMPLETION_DELAYED_COUNT = "maintenanceCompletionDelayedCount";
+    static final String STAT_NAME_CACHE_MISS_COUNT = "stateCacheMissCount";
+    static final String STAT_NAME_CACHE_CLEAR_COUNT = "stateCacheClearCount";
+    static final String STAT_NAME_VERSION_CONFLICT_COUNT = "stateVersionConflictCount";
+    static final String STAT_NAME_VERSION_IN_CONFLICT = "stateVersionInConflict";
+    static final String STAT_NAME_PAUSE_COUNT = "pauseCount";
+    static final String STAT_NAME_RESUME_COUNT = "resumeCount";
 
     /**
      * Estimate on run time context cost in bytes, per service instance. Services should not use instanced
      * fields, so, other than queuing context and utility service usage, the memory overhead should be small
      */
-    int MAX_SERIALIZED_SIZE_BYTES = 8192;
+    static final int MAX_SERIALIZED_SIZE_BYTES = 8192;
 
     /**
      * Default operation queue limit
      */
-    int OPERATION_QUEUE_DEFAULT_LIMIT = 10000;
+    static final int OPERATION_QUEUE_DEFAULT_LIMIT = 10000;
 
+    /**
+     * Equivalent to {@code getSelfId} and {@code UriUtils.getLastPathSegment}
+     */
+    static String getId(String link) {
+        return UriUtils.getLastPathSegment(link);
+    }
+
+    /**
+     * Minimum maintenance interval value
+     */
+    static final long MIN_MAINTENANCE_INTERVAL_MICROS = TimeUnit.MILLISECONDS.toMicros(1);
+
+    /**
+     * Invoked by host only when a client issues a POST operation to a factory service.
+     */
+    void handleCreate(Operation createPost);
+
+    /**
+     * Invoked by the host any time the service starts. This can happen due to
+     *
+     * 1) Client POST request to a factory
+     *
+     * 2) Host restart for a persisted service
+     *
+     * 3) On demand load and start of a persisted service
+     *
+     * 4) Node group synchronization
+     */
     void handleStart(Operation startPost);
+
+    /**
+     * Invoked by the host when the service needs to stop and detach from the host dispatching
+     * map. Its invoked when
+     *
+     * 1) Client DELETE to service
+     *
+     * 2) Host stop (clean shutdown)
+     *
+     * 3) DELETE request with PRAGMA_VALUE_NO_INDEX_UPDATE (same as service host stop
+     *     induced operations)
+     */
+    void handleStop(Operation stopDelete);
+
+    /**
+     * Infrastructure use. Invoked by host to let the service decide if the request is authorized.
+     * Services can defer authorization for a later stage, during handleRequest(), or do it as
+     * part of this method. The method must either complete or fail the operation to allow
+     * for further processing
+     */
+    void authorizeRequest(Operation op);
 
     /**
      * Infrastructure use. Invoked by host to determine if a request can be scheduled for processing
@@ -306,7 +399,16 @@ public interface Service {
     void handleConfigurationRequest(Operation request);
 
     /**
-     * Invoked by the host periodically, if ServiceOption.PERIODIC_MAINTENANCE is set.
+     * Infrastructure use. Invoked by host to execute a service handler for a maintenance request.
+     * ServiceMaintenanceRequest object is set in the operation body, with the reasons field
+     * indicating the maintenance reason. Its invoked when
+     *
+     * 1) Periodically, if ServiceOption.PERIODIC_MAINTENANCE is set.
+     *
+     * 2) Node group change.
+     *
+     * Services should override handlePeriodicMaintenance and handleNodeGroupMaintenance when using
+     * StatelessService and StatefulService services.
      *
      * An implementation of this method that needs to interact with the state of this service must
      * do so as if it were a client of this service. That is: the state of the service should be

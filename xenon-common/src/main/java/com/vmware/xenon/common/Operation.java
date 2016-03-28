@@ -71,7 +71,7 @@ public class Operation implements Cloneable {
 
         private static int maxRequestSize = 1024 * 1024 * 16;
 
-        private static int MAX_CLIENT_REQUEST_SIZE = 1024 * 1024 * 128;
+        private static final int MAX_CLIENT_REQUEST_SIZE = 1024 * 1024 * 128;
 
         /**
          * Set maximum request/response size for socket I/O.
@@ -165,14 +165,14 @@ public class Operation implements Cloneable {
          * The resource query is a composite query constructed by grouping all
          * resource group queries that apply to this user's authorization context.
          */
-        private Query resourceQuery = null;
+        private Map<Action, Query> resourceQueryMap = null;
 
         /**
          * The resource query filter is a query filter of the composite query
          * constructed by grouping all resource group queries that apply to
          * this user's authorization context.
          */
-        private QueryFilter resourceQueryFilter = null;
+        private Map<Action, QueryFilter> resourceQueryFiltersMap = null;
 
         public Claims getClaims() {
             return this.claims;
@@ -186,12 +186,18 @@ public class Operation implements Cloneable {
             return this.propagateToClient;
         }
 
-        public Query getResourceQuery() {
-            return Utils.clone(this.resourceQuery);
+        public Query getResourceQuery(Action action) {
+            if (this.resourceQueryMap == null) {
+                return null;
+            }
+            return Utils.clone(this.resourceQueryMap.get(action));
         }
 
-        public QueryFilter getResourceQueryFilter() {
-            return this.resourceQueryFilter;
+        public QueryFilter getResourceQueryFilter(Action action) {
+            if (this.resourceQueryFiltersMap == null) {
+                return null;
+            }
+            return this.resourceQueryFiltersMap.get(action);
         }
 
         public boolean isSystemUser() {
@@ -244,13 +250,13 @@ public class Operation implements Cloneable {
                 return this;
             }
 
-            public Builder setResourceQuery(Query resourceQuery) {
-                this.authorizationContext.resourceQuery = resourceQuery;
+            public Builder setResourceQueryMap(Map<Action, Query> resourceQueryMap) {
+                this.authorizationContext.resourceQueryMap = resourceQueryMap;
                 return this;
             }
 
-            public Builder setResourceQueryFilter(QueryFilter resourceQueryFilter) {
-                this.authorizationContext.resourceQueryFilter = resourceQueryFilter;
+            public Builder setResourceQueryFilterMap(Map<Action, QueryFilter> resourceQueryFiltersMap) {
+                this.authorizationContext.resourceQueryFiltersMap = resourceQueryFiltersMap;
                 return this;
             }
         }
@@ -330,6 +336,7 @@ public class Operation implements Cloneable {
     public static final String SET_COOKIE_HEADER = "set-cookie";
     public static final String LOCATION_HEADER = "location";
     public static final String USER_AGENT_HEADER = "user-agent";
+    public static final String ACCEPT_HEADER = "accept";
 
     // Proprietary header definitions
     public static final String HEADER_NAME_PREFIX = "x-xenon-";
@@ -344,17 +351,88 @@ public class Operation implements Cloneable {
             + "rpl-phase";
     public static final String VMWARE_DCP_TRANSACTION_HEADER = HEADER_NAME_PREFIX
             + "tx-phase";
+    public static final String TRANSACTION_ID_HEADER = HEADER_NAME_PREFIX + "tx-id";
 
+    /**
+     * Infrastructure use only. Set when a service is first created due to a client request. Since
+     * service start can be invoked by the runtime during node synchronization, restart, this
+     * directive is the only way to distinguish original creation of arbitrary services (without relying
+     * on state version heuristics)
+     */
+    public static final String PRAGMA_DIRECTIVE_CREATED = "xn-created";
+
+    /**
+     * Infrastructure use only. Set when the runtime, as part of its consensus protocol,
+     * forwards a client request from one node, to a node deemed as the owner of the service
+     */
     public static final String PRAGMA_DIRECTIVE_FORWARDED = "xn-fwd";
+
+    /**
+     * Infrastructure use only. Set when the consensus protocol replicates an update, on the owner
+     * node service instance, to the peer replica instances
+     */
     public static final String PRAGMA_DIRECTIVE_REPLICATED = "xn-rpl";
+
+    /**
+     * Infrastructure use only. Set when the consensus protocol determines that a service instance,
+     * on the owner node, must synchronize its state with peers. Associated with a PUT action.
+     */
+    public static final String PRAGMA_DIRECTIVE_SYNCH = "xn-synch";
+
+    /**
+     * Advanced use. Prevents the request from getting queued, if a service is not yet available.
+     */
     public static final String PRAGMA_DIRECTIVE_NO_QUEUING = "xn-no-queuing";
+
+    /**
+     * Advanced use. Instructs the runtime to queue a request, for a service to become available
+     * independent of the service options.
+     */
     public static final String PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY = "xn-queue";
+
+    /**
+     * Infrastructure use only. Instructs the runtime that this request should be processed on the node
+     * it arrived on. It should not be forwarded regardless of owner selection and load balancing decisions.
+     */
     public static final String PRAGMA_DIRECTIVE_NO_FORWARDING = "xn-no-fwd";
+
+    /**
+     * Infrastructure use only. Set on notifications only.
+     */
     public static final String PRAGMA_DIRECTIVE_NOTIFICATION = "xn-nt";
+
+    /**
+     * Infrastructure use only. Set by the runtime to inform a subscriber that they might have missed notifications
+     * due to state updates occurring when the subscriber was not available.
+     */
     public static final String PRAGMA_DIRECTIVE_SKIPPED_NOTIFICATIONS = "xn-nt-skipped";
-    public static final String PRAGMA_DIRECTIVE_INDEX_CHECK = "xn-check-index";
-    public static final String PRAGMA_DIRECTIVE_VERSION_CHECK = "xn-check-version";
+
+    /**
+     * Infrastructure use only. Experimental. Forces the use of HTTP2 streams.
+     */
     public static final String PRAGMA_DIRECTIVE_USE_HTTP2 = "xn-use-http2";
+
+    /**
+     *  Infrastructure use only. Does a strict update version check and if the service exists or
+     *  the service has been previously deleted the request will fail.
+     *
+     *  Overridden by: PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE
+     */
+    public static final String PRAGMA_DIRECTIVE_VERSION_CHECK = "xn-check-version";
+
+    /**
+     * Infrastructure use only. Used for on demand load of services. Checks the index if a service
+     * exists.
+     */
+    public static final String PRAGMA_DIRECTIVE_INDEX_CHECK = "xn-check-index";
+
+    /**
+     * Instructs a persisted service to force the update, overriding version checks. It should be used
+     * for conflict resolution only.
+     *
+     * Overrides: PRAGMA_DIRECTIVE_VERSION_CHECK
+     */
+    public static final String PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE = "xn-force-index-update";
 
     /**
      * Infrastructure use only. Instructs a persisted service to complete the operation but skip any index
@@ -362,14 +440,20 @@ public class Operation implements Cloneable {
      */
     public static final String PRAGMA_DIRECTIVE_NO_INDEX_UPDATE = "xn-no-index-update";
 
+    /**
+     * Infrastructure use only. Debugging only. Indicates this operation was converted from POST to PUT
+     * due to {@link ServiceOption.IDEMPOTENT_POST}
+     */
+    public static final String PRAGMA_DIRECTIVE_POST_TO_PUT = "xn-post-to-put";
+
     public static final String TX_TRY_COMMIT = "try-commit";
     public static final String TX_ENSURE_COMMIT = "ensure-commit";
     public static final String TX_COMMIT = "commit";
     public static final String TX_ABORT = "abort";
     public static final String REPLICATION_PHASE_COMMIT = "commit";
-    public static final String REPLICATION_PHASE_SYNCHRONIZE = "synchronize";
 
     public static final String MEDIA_TYPE_APPLICATION_JSON = "application/json";
+    public static final String MEDIA_TYPE_TEXT_YAML = "text/x-yaml";
     public static final String MEDIA_TYPE_APPLICATION_OCTET_STREAM = "application/octet-stream";
     public static final String MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED = "application/x-www-form-urlencoded";
     public static final String MEDIA_TYPE_TEXT_HTML = "text/html";
@@ -456,7 +540,11 @@ public class Operation implements Cloneable {
     }
 
     public static Operation createPost(Service sender, String targetPath) {
-        return createPost(UriUtils.buildUri(sender.getHost(), targetPath));
+        return createPost(sender.getHost(), targetPath);
+    }
+
+    public static Operation createPost(ServiceHost sender, String targetPath) {
+        return createPost(UriUtils.buildUri(sender, targetPath));
     }
 
     public static Operation createPost(URI uri) {
@@ -464,7 +552,11 @@ public class Operation implements Cloneable {
     }
 
     public static Operation createPatch(Service sender, String targetPath) {
-        return createPatch(UriUtils.buildUri(sender.getHost(), targetPath));
+        return createPatch(sender.getHost(), targetPath);
+    }
+
+    public static Operation createPatch(ServiceHost sender, String targetPath) {
+        return createPatch(UriUtils.buildUri(sender, targetPath));
     }
 
     public static Operation createPatch(URI uri) {
@@ -475,12 +567,32 @@ public class Operation implements Cloneable {
         return createPut(UriUtils.buildUri(sender.getHost(), targetPath));
     }
 
+    public static Operation createPut(ServiceHost sender, String targetPath) {
+        return createPut(UriUtils.buildUri(sender, targetPath));
+    }
+
     public static Operation createPut(URI uri) {
         return createOperation(Action.PUT, uri);
     }
 
+    public static Operation createOptions(Service sender, String targetPath) {
+        return createOptions(UriUtils.buildUri(sender.getHost(), targetPath));
+    }
+
+    public static Operation createOptions(ServiceHost sender, String targetPath) {
+        return createOptions(UriUtils.buildUri(sender, targetPath));
+    }
+
+    public static Operation createOptions(URI uri) {
+        return createOperation(Action.OPTIONS, uri);
+    }
+
     public static Operation createDelete(Service sender, String targetPath) {
         return createDelete(UriUtils.buildUri(sender.getHost(), targetPath));
+    }
+
+    public static Operation createDelete(ServiceHost sender, String targetPath) {
+        return createDelete(UriUtils.buildUri(sender, targetPath));
     }
 
     public static Operation createDelete(URI uri) {
@@ -491,20 +603,16 @@ public class Operation implements Cloneable {
         return createGet(UriUtils.buildUri(sender.getHost(), targetPath));
     }
 
+    public static Operation createGet(ServiceHost sender, String targetPath) {
+        return createGet(UriUtils.buildUri(sender, targetPath));
+    }
+
     public static Operation createGet(URI uri) {
         return createOperation(Action.GET, uri);
     }
 
-    public void sendWith(ServiceHost host) {
-        host.sendRequest(this);
-    }
-
-    public void sendWith(Service service) {
-        service.sendRequest(this);
-    }
-
-    public void sendWith(ServiceClient client) {
-        client.send(this);
+    public void sendWith(ServiceRequestSender sender) {
+        sender.sendRequest(this);
     }
 
     @Override
@@ -648,6 +756,16 @@ public class Operation implements Cloneable {
         return this;
     }
 
+    /**
+     * Deserializes the body associated with the operation, given the type.
+     *
+     * Note: This method is *not* idempotent. It will modify the body contents
+     * so subsequent calls will not have access to the original instance. This
+     * occurs only for local operations, not operations that have a serialized
+     * body already attached (in the form of a JSON string).
+     *
+     * If idempotent behavior is desired, use {@link getBodyRaw}
+     */
     @SuppressWarnings("unchecked")
     public <T> T getBody(Class<T> type) {
         if (this.body != null && this.body.getClass() == type) {
@@ -856,14 +974,25 @@ public class Operation implements Cloneable {
 
         boolean hasErrorResponseBody = false;
         if (this.body != null && this.body instanceof String) {
-            try {
-                ServiceErrorResponse rsp = Utils.fromJson(this.body, ServiceErrorResponse.class);
-                if (rsp.message != null) {
-                    hasErrorResponseBody = true;
+            if (Operation.MEDIA_TYPE_APPLICATION_JSON.equals(this.contentType)) {
+                try {
+                    ServiceErrorResponse rsp = Utils.fromJson(this.body,
+                            ServiceErrorResponse.class);
+                    if (rsp.message != null) {
+                        hasErrorResponseBody = true;
+                    }
+                } catch (Throwable ex) {
+                    // the body is not JSON, ignore
                 }
-            } catch (Throwable ex) {
-                // the body is not JSON, ignore
+            } else {
+                // the response body is text but not JSON, we will leave as is
+                hasErrorResponseBody = true;
             }
+        }
+
+        if (this.body != null && this.body instanceof byte[]) {
+            // the response body is binary or unknown text encoding, leave as is
+            hasErrorResponseBody = true;
         }
 
         if (this.body == null
@@ -889,7 +1018,7 @@ public class Operation implements Cloneable {
             return;
         }
 
-        if (!completionUpdater.compareAndSet(this, c, (CompletionHandler) null)) {
+        if (!completionUpdater.compareAndSet(this, c, null)) {
             Utils.logWarning("%s:%s",
                     Utils.toString(new IllegalStateException("double completion")),
                     toString());
@@ -918,7 +1047,7 @@ public class Operation implements Cloneable {
     }
 
     public Operation nestCompletion(CompletionHandler h) {
-        final CompletionHandler existing = this.completion;
+        CompletionHandler existing = this.completion;
 
         setCompletion((o, e) -> {
             setCompletion(existing);
@@ -929,7 +1058,7 @@ public class Operation implements Cloneable {
     }
 
     public void nestCompletion(Consumer<Operation> successHandler) {
-        final CompletionHandler existing = this.completion;
+        CompletionHandler existing = this.completion;
 
         setCompletion((o, e) -> {
             setCompletion(existing);
@@ -992,8 +1121,12 @@ public class Operation implements Cloneable {
         allocateRemoteContext();
         directive = directive.toLowerCase();
         String existingDirectives = getRequestHeader(PRAGMA_HEADER);
-        if (existingDirectives != null && !existingDirectives.contains(directive)) {
-            directive = existingDirectives + ";" + directive;
+        if (existingDirectives != null) {
+            if (!existingDirectives.contains(directive)) {
+                directive = existingDirectives + ";" + directive;
+            } else {
+                directive = existingDirectives;
+            }
         }
         addRequestHeader(PRAGMA_HEADER, directive);
         return this;
@@ -1140,8 +1273,13 @@ public class Operation implements Cloneable {
         }
     }
 
+    /**
+     * Infrastructure use only. Used by service request client logic.
+     *
+     * First decrements the retry count then returns the current value
+     */
     public int decrementRetriesRemaining() {
-        return this.retriesRemaining--;
+        return --this.retriesRemaining;
     }
 
     /**
@@ -1190,6 +1328,15 @@ public class Operation implements Cloneable {
      */
     public boolean isFromReplication() {
         return this.options.contains(OperationOption.REPLICATED);
+    }
+
+    /**
+     * Infrastructure use only.
+     *
+     * Value indicating whether this operation was forwarded from a peer node
+     */
+    public boolean isForwarded() {
+        return this.hasPragmaDirective(PRAGMA_DIRECTIVE_FORWARDED);
     }
 
     public String getRequestCallbackLocation() {
@@ -1323,5 +1470,14 @@ public class Operation implements Cloneable {
 
     boolean isForwardingDisabled() {
         return hasPragmaDirective(PRAGMA_DIRECTIVE_NO_FORWARDING);
+    }
+
+    boolean isCommit() {
+        String phase = getRequestHeader(Operation.REPLICATION_PHASE_HEADER);
+        return Operation.REPLICATION_PHASE_COMMIT.equals(phase);
+    }
+
+    boolean isSynchronize() {
+        return hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH);
     }
 }

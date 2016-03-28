@@ -13,16 +13,43 @@
 
 package com.vmware.xenon.services.common;
 
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.StatefulService;
+import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.services.common.QueryTask.Query;
 
 public class ResourceGroupService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS;
+
+    public static Service createFactory() {
+
+        // workaround for GSON issue https://github.com/google/gson/issues/764
+        // We serialize the complex type once, on service creation, to avoid possible GSON race
+        ResourceGroupState st = new ResourceGroupState();
+        st.query = QueryTask.Query.Builder.create().addFieldClause("one", "one").build();
+        Utils.toJson(st);
+        return FactoryService.createIdempotent(ResourceGroupService.class);
+    }
+
     /**
-     * The {@link ResourceGroupState} holds the query that is used to represent a group of users.
+     * The {@link ResourceGroupState} holds a query that is used to represent a group of
+     * resources (services). {@link ResourceGroupState} and {@link UserGroupState) are used
+     * together in a {@link RoleState} to specify what resources a set of users has access to
      */
     public static class ResourceGroupState extends ServiceDocument {
+        /**
+         * A standard query to the index service.
+         *
+         * The result of this query will be the set of resources (services) that a user has
+         * access to. Typical queries might be "all services with a documentAuthPrincipalLink
+         * field that matches the user's" or "all services with documentKind with a particular
+         * kind". These may be typical queries, but you can use any query that matches the set
+         * of documents you want a user to have access to.
+         */
         public Query query;
     }
 
@@ -35,15 +62,6 @@ public class ResourceGroupService extends StatefulService {
 
     @Override
     public void handleStart(Operation op) {
-        handleOp(op);
-    }
-
-    @Override
-    public void handlePut(Operation put) {
-        handleOp(put);
-    }
-
-    private void handleOp(Operation op) {
         if (!op.hasBody()) {
             op.fail(new IllegalArgumentException("body is required"));
             return;
@@ -52,6 +70,29 @@ public class ResourceGroupService extends StatefulService {
         ResourceGroupState state = op.getBody(ResourceGroupState.class);
         if (!validate(op, state)) {
             return;
+        }
+
+        op.complete();
+    }
+
+    @Override
+    public void handlePut(Operation op) {
+        if (!op.hasBody()) {
+            op.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+
+        ResourceGroupState newState = op.getBody(ResourceGroupState.class);
+        if (!validate(op, newState)) {
+            return;
+        }
+
+        ResourceGroupState currentState = getState(op);
+        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        if (ServiceDocument.equals(documentDescription, currentState, newState)) {
+            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
+        } else {
+            setState(op, newState);
         }
 
         op.complete();

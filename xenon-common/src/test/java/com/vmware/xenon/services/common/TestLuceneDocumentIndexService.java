@@ -47,6 +47,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import com.vmware.xenon.common.BasicReportTestCase;
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.FileUtils;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service;
@@ -93,15 +94,50 @@ class FaultInjectionLuceneDocumentIndexService extends LuceneDocumentIndexServic
 }
 
 public class TestLuceneDocumentIndexService extends BasicReportTestCase {
+
+    public static class OnDemandLoadFactoryService extends FactoryService {
+        public static final String SELF_LINK = "test/on-demand-load-services";
+
+        public OnDemandLoadFactoryService() {
+            super(MinimalTestServiceState.class);
+        }
+
+        private EnumSet<ServiceOption> childServiceCaps;
+
+        /**
+         * Test use only.
+         */
+        public void setChildServiceCaps(EnumSet<ServiceOption> caps) {
+            this.childServiceCaps = caps;
+        }
+
+        @Override
+        public Service createServiceInstance() throws Throwable {
+            Service s = new MinimalTestService();
+            if (this.childServiceCaps != null) {
+                for (ServiceOption c : this.childServiceCaps) {
+                    s.toggleOption(c, true);
+                }
+            }
+            s.toggleOption(ServiceOption.ON_DEMAND_LOAD, true);
+            return s;
+        }
+    }
+
     /**
      * Parameter that specifies number of durable service instances to create
      */
-    public long serviceCount = 50;
+    public long serviceCount = 10;
 
     /**
      * Parameter that specifies number of concurrent update requests
      */
     public int updateCount = 10;
+
+    /**
+     * Parameter that specifies long running test duration in seconds
+     */
+    public long testDurationSeconds;
 
     private final String EXAMPLES_BODIES_FILE = "example_bodies.json";
     private final String INDEX_DIR_NAME = "lucene510";
@@ -114,6 +150,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
         this.indexService = new FaultInjectionLuceneDocumentIndexService();
         this.indexService.toggleOption(ServiceOption.INSTRUMENTATION, true);
         host.setDocumentIndexingService(this.indexService);
+        host.setPeerSynchronizationEnabled(false);
     }
 
     @Test
@@ -183,8 +220,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                     ExampleServiceState b = new ExampleServiceState();
                     b.name = Utils.getNowMicrosUtc() + " before stop";
                     o.setBody(b);
-                }, UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK));
-
+                }, UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK));
 
         exampleServices = updateUriMapWithNewPort(this.host.getPort(), exampleServices);
         // make sure all services have started
@@ -192,6 +228,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
         // close the writer!
         this.indexService.closeWriter();
+
         // issue some updates, which at least some failing and expect the host to stay alive. There
         // is no guarantee at this point that future writes will succeed since the writer re-open
         // is asynchronous and happens on maintenance intervals
@@ -199,6 +236,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
         // now induce a failure we can NOT recover from
         corruptLuceneIndexFiles();
+
         // try to poke the services we created before we corrupted the index. Some if not all should
         // fail and we should also see the host self stop
         updateServices(exampleServices, true);
@@ -219,25 +257,53 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
     private void updateServices(Map<URI, ExampleServiceState> exampleServices, boolean expectFailure)
             throws Throwable {
-        this.host.testStart(exampleServices.size());
+        AtomicInteger g = new AtomicInteger();
+        Throwable[] failure = new Throwable[1];
         for (URI service : exampleServices.keySet()) {
             ExampleServiceState b = new ExampleServiceState();
             b.name = Utils.getNowMicrosUtc() + " after stop";
-            this.host.send(Operation.createPut(service).setBody(b).setCompletion((o, e) -> {
-                if (expectFailure) {
-                    this.host.completeIteration();
-                    return;
-                }
+            this.host.send(Operation.createPut(service)
+                    .forceRemote()
+                    .setBody(b).setCompletion((o, e) -> {
+                        if (expectFailure) {
+                            g.incrementAndGet();
+                            return;
+                        }
 
-                if (e != null && !expectFailure) {
-                    this.host.failIteration(e);
-                    return;
-                }
+                        if (e != null && !expectFailure) {
+                            g.incrementAndGet();
+                            failure[0] = e;
+                            return;
+                        }
 
-                this.host.completeIteration();
-            }));
+                        g.incrementAndGet();
+                    }));
         }
-        this.host.testWait();
+
+        // if host self stops some requests might not complete, so we use a counter and
+        // a polling loop. If the counter reaches expected count, or there is failure or host
+        // stops, we exit
+
+        Date exp = this.host.getTestExpiration();
+        while (new Date().before(exp)) {
+            if (failure[0] != null) {
+                throw failure[0];
+            }
+
+            if (!this.host.isStarted()) {
+                return;
+            }
+
+            if (g.get() == exampleServices.size()) {
+                return;
+            }
+            this.host.log("Remaining: %d", g.get());
+            Thread.sleep(250);
+        }
+
+        if (new Date().after(exp)) {
+            throw new TimeoutException();
+        }
     }
 
     private void corruptLuceneIndexFiles() throws IOException {
@@ -283,6 +349,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
             args.port = 0;
             args.sandbox = tmpFolder.getRoot().toPath();
             h.initialize(args);
+            h.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(250));
             h.setOperationTimeOutMicros(this.host.getOperationTimeoutMicros());
             h.start();
 
@@ -290,10 +357,14 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                     EnumSet.of(ServiceOption.INSTRUMENTATION),
                     null);
 
+            // create on demand load services
+            String factoryLink = createOnDemandLoadFactoryService(h);
+            createOnDemandLoadServices(h, factoryLink);
+
             this.host.testStart(1);
             h.registerForServiceAvailability((o, e) -> {
                 this.host.completeIteration();
-            } , ExampleFactoryService.SELF_LINK);
+            }, ExampleService.FACTORY_LINK);
             this.host.testWait();
 
             ServiceHostState initialState = h.getState();
@@ -301,7 +372,12 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
             ExampleServiceState body = new ExampleServiceState();
             body.name = UUID.randomUUID().toString();
             List<URI> exampleURIs = new ArrayList<>();
+
+            // create example services
             this.host.createExampleServices(h, this.serviceCount, exampleURIs, null);
+
+            verifyCreateStatCount(exampleURIs, 1.0);
+
             int vc = 2;
             this.host.testStart(exampleURIs.size() * vc);
             for (int i = 0; i < vc; i++) {
@@ -312,20 +388,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
             }
             this.host.testWait();
 
-            // delete one of the services (with no body)
-            URI deletedService = exampleURIs.remove(0);
-            this.host.testStart(1);
-            this.host.send(Operation.createDelete(deletedService)
-                    .setCompletion(this.host.getCompletion()));
-            this.host.testWait();
-
-            // delete another, with body, verifying that delete works either way
-            deletedService = exampleURIs.remove(0);
-            this.host.testStart(1);
-            this.host.send(Operation.createDelete(deletedService)
-                    .setBody(new ServiceDocument())
-                    .setCompletion(this.host.getCompletion()));
-            this.host.testWait();
+            verifyDeleteRePost(h, exampleURIs);
 
             Map<URI, ExampleServiceState> beforeState = this.host.getServiceState(null,
                     ExampleServiceState.class, exampleURIs);
@@ -346,8 +409,14 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                 h.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(100));
             }
 
-            long start = Utils.getNowMicrosUtc();
-            h.start();
+            long start = 0;
+            try {
+                start = Utils.getNowMicrosUtc();
+                h.start();
+            } catch (org.apache.lucene.store.LockObtainFailedException e) {
+                this.host.log("Lock still held on lucene index: %s, aborting", e.toString());
+                return;
+            }
 
             this.host.toggleServiceOptions(h.getDocumentIndexServiceUri(),
                     EnumSet.of(ServiceOption.INSTRUMENTATION),
@@ -364,15 +433,30 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
             assertTrue(initialState.id.equals(stateAfterRestart.id));
 
-            this.host.testStart(1);
-            h.registerForServiceAvailability((o, e) -> {
-                this.host.completeIteration();
-            } , ExampleFactoryService.SELF_LINK);
-            this.host.testWait();
+            String onDemandFactoryLink = createOnDemandLoadFactoryService(h);
+
+            URI exampleFactoryUri = UriUtils.buildUri(h, ExampleService.FACTORY_LINK);
+            URI exampleFactoryStatsUri = UriUtils.buildStatsUri(exampleFactoryUri);
+            this.host.waitForServiceAvailable(exampleFactoryUri, null);
+
+            String statName = Service.STAT_NAME_NODE_GROUP_CHANGE_MAINTENANCE_COUNT;
+            this.host.waitFor("node group change stat missing", () -> {
+                ServiceStats stats = this.host.getServiceState(null, ServiceStats.class,
+                        exampleFactoryStatsUri);
+                ServiceStat st = stats.entries.get(statName);
+                if (st != null && st.latestValue >= 1) {
+                    return true;
+                }
+                return false;
+            });
 
             long end = Utils.getNowMicrosUtc();
 
-            this.host.log("Factory available %d micros after host start", end - start);
+            this.host.log("Example Factory available %d micros after host start", end - start);
+
+            verifyCreateStatCount(exampleURIs, 0.0);
+
+            verifyOnDemandLoad(h, onDemandFactoryLink);
 
             // make sure all services are there
             Map<URI, ExampleServiceState> afterState = this.host.getServiceState(null,
@@ -392,7 +476,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
             }
 
             ServiceDocumentQueryResult rsp = this.host.getFactoryState(UriUtils.buildUri(h,
-                    ExampleFactoryService.SELF_LINK));
+                    ExampleService.FACTORY_LINK));
             assertEquals(beforeState.size(), rsp.documentLinks.size());
 
             if (this.host.isStressTest()) {
@@ -421,10 +505,238 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
             }
             this.host.testWait();
 
+            verifyFactoryStartedAndSynchronizedAfterNodeSynch(h, statName);
+
         } finally {
             h.stop();
             tmpFolder.delete();
         }
+    }
+
+    private void verifyFactoryStartedAndSynchronizedAfterNodeSynch(ExampleServiceHost h,
+            String statName) throws Throwable {
+        // start another instance of the example factory, verify that node synchronization maintenance
+        // happened, even if it was started after the initial synch occurred
+        Service factory = ExampleService.createFactory();
+        factory.toggleOption(ServiceOption.INSTRUMENTATION, true);
+        Operation post = Operation.createPost(
+                UriUtils.buildUri(h, UUID.randomUUID().toString()))
+                .setCompletion(this.host.getCompletion());
+        this.host.testStart(1);
+        h.startService(post, factory);
+        this.host.testWait();
+
+        URI newExampleFactoryStatsUri = UriUtils.buildStatsUri(factory.getUri());
+
+        this.host.waitFor("node group change stat missing", () -> {
+            ServiceStats stats = this.host.getServiceState(null, ServiceStats.class,
+                    newExampleFactoryStatsUri);
+            ServiceStat st = stats.entries.get(statName);
+            if (st != null && st.latestValue >= 1) {
+                return true;
+            }
+            return false;
+        });
+
+        this.host.waitForServiceAvailable(factory.getUri(), null);
+
+    }
+
+    private void verifyCreateStatCount(List<URI> exampleURIs, double expectedStat) throws Throwable {
+        // verify create method was called
+        List<URI> exampleStatUris = new ArrayList<>();
+        exampleURIs.forEach((u) -> {
+            exampleStatUris.add(UriUtils.buildStatsUri(u));
+        });
+
+        Map<URI, ServiceStats> stats = this.host.getServiceState(null, ServiceStats.class,
+                exampleStatUris);
+        stats.values().forEach(
+                (sts) -> {
+                    ServiceStat st = sts.entries.get(Service.STAT_NAME_CREATE_COUNT);
+                    if (st == null && expectedStat == 0.0) {
+                        return;
+                    }
+                    if (st == null || st.latestValue != expectedStat) {
+                        throw new IllegalStateException("Expected create stat count of "
+                                + expectedStat);
+                    }
+                });
+    }
+
+    private void verifyDeleteRePost(ExampleServiceHost h, List<URI> exampleURIs)
+            throws Throwable {
+        ExampleServiceState body;
+        // delete one of the services (with no body)
+        URI deletedService = exampleURIs.remove(0);
+        this.host.testStart(1);
+        this.host.send(Operation.createDelete(deletedService)
+                .setCompletion(this.host.getCompletion()));
+        this.host.testWait();
+
+        // delete another, with body, verifying that delete works either way
+        deletedService = exampleURIs.remove(0);
+        this.host.testStart(1);
+        this.host.send(Operation.createDelete(deletedService)
+                .setBody(new ServiceDocument())
+                .setCompletion(this.host.getCompletion()));
+        this.host.testWait();
+
+        URI deletedUri = deletedService;
+        // recreate the service we just deleted, it should fail
+        this.host.testStart(1);
+        body = new ExampleServiceState();
+        body.name = UUID.randomUUID().toString();
+        body.documentSelfLink = deletedUri.getPath().replace(ExampleService.FACTORY_LINK, "");
+        URI factory = UriUtils.buildUri(h, ExampleService.FACTORY_LINK);
+        this.host.send(Operation.createPost(factory)
+                .setBody(body)
+                .setCompletion(this.host.getExpectedFailureCompletion()));
+        this.host.testWait();
+
+
+        int count = Utils.DEFAULT_THREAD_COUNT;
+
+        for (int i = 0; i < count; i++) {
+            this.host.testStart(2);
+            ExampleServiceState clonedBody = Utils.clone(body);
+            this.host.send(Operation.createPost(factory)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
+                    .setBody(clonedBody)
+                    .setCompletion(this.host.getCompletion()));
+
+            // in parallel, attempt to POST it AGAIN, it should be converted to PUT
+            this.host.send(Operation.createPost(factory)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
+                    .setBody(clonedBody)
+                    .setCompletion(this.host.getCompletion()));
+            this.host.testWait();
+            // DELETE
+            this.host.testStart(1);
+            this.host.send(Operation.createDelete(deletedUri)
+                    .setCompletion(this.host.getCompletion()));
+            this.host.testWait();
+        }
+    }
+
+    private void verifyOnDemandLoad(ServiceHost h, String onDemandFactoryLink) throws Throwable {
+        URI factoryUri = UriUtils.buildUri(h, onDemandFactoryLink);
+        ServiceDocumentQueryResult rsp = this.host.getFactoryState(factoryUri);
+        // verify that for every factory child reported by the index, through the GET (query), the service is NOT
+        // started
+        assertEquals(this.serviceCount, rsp.documentLinks.size());
+        List<URI> childUris = new ArrayList<>();
+        for (String childLink : rsp.documentLinks) {
+            assertTrue(h.getServiceStage(childLink) == null);
+            childUris.add(UriUtils.buildUri(h, childLink));
+        }
+
+        // explicitly trigger synchronization and verify on demand load services did NOT start
+        this.host.log("Triggering synchronization to verify on demand load is not affected");
+        h.scheduleNodeGroupChangeMaintenance(ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+        Thread.sleep(TimeUnit.MICROSECONDS.toMillis(h.getMaintenanceIntervalMicros()) * 2);
+        for (String childLink : rsp.documentLinks) {
+            assertTrue(h.getServiceStage(childLink) == null);
+        }
+
+        int startCount = MinimalTestService.HANDLE_START_COUNT.get();
+        // attempt to on demand load a service that *never* existed
+        Operation getToNowhere = Operation.createGet(new URI(childUris.get(0) + "random"))
+                .setCompletion(
+                        this.host.getExpectedFailureCompletion(Operation.STATUS_CODE_NOT_FOUND));
+        this.host.sendAndWait(getToNowhere);
+
+        // verify that no attempts to start service occured
+        assertTrue(startCount == MinimalTestService.HANDLE_START_COUNT.get());
+
+        // delete some of the services, not using a body, emulation DELETE through expiration
+        URI serviceToDelete = childUris.remove(0);
+        Operation delete = Operation.createDelete(serviceToDelete)
+                .setCompletion(this.host.getCompletion());
+        this.host.sendAndWait(delete);
+
+        // attempt to use service we just deleted, we should get failure
+        MinimalTestServiceState st = new MinimalTestServiceState();
+        st.id = Utils.getNowMicrosUtc() + "";
+        // do a PATCH, expect failure
+        Operation patch = Operation.createPatch(serviceToDelete)
+                .setBody(st)
+                .setCompletion(
+                        this.host.getExpectedFailureCompletion(Operation.STATUS_CODE_CONFLICT));
+        this.host.sendAndWait(patch);
+
+        // verify that attempting to start a service, through factory POST, that was previously created,
+        // but not yet loaded/started, fails, with ServiceAlreadyStarted exception
+        int count = Math.min(100, childUris.size());
+        this.host.testStart(count);
+        for (int i = 0; i < count; i++) {
+            MinimalTestServiceState body = new MinimalTestServiceState();
+            // use a link hint for a previously created service, guaranteeing a collision
+            URI u = childUris.get(i);
+            body.documentSelfLink = u.getPath();
+            body.id = UUID.randomUUID().toString();
+            Operation post = Operation.createPost(factoryUri)
+                    .setCompletion(this.host.getExpectedFailureCompletion())
+                    .setBody(body);
+            this.host.send(post);
+        }
+        this.host.testWait();
+
+        // issue a GET per child link, which should force the on-demand load to take place, implicitly
+        Map<URI, MinimalTestServiceState> childStates = this.host.getServiceState(null,
+                MinimalTestServiceState.class,
+                childUris);
+
+        for (MinimalTestServiceState s : childStates.values()) {
+            assertTrue(s.id != null);
+            assertTrue(s.stringValue != null);
+            assertEquals(s.stringValue, s.id);
+        }
+
+        // Lets try stop now, then delete, on a service that should be on demand loaded
+        serviceToDelete = childUris.remove(0);
+        Operation stopDelete = Operation.createDelete(serviceToDelete)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)
+                .setCompletion(this.host.getCompletion());
+        this.host.sendAndWait(stopDelete);
+
+        // try again, with regular delete, emulating expiration
+        delete = Operation.createDelete(serviceToDelete)
+                .setCompletion(this.host.getCompletion());
+        this.host.sendAndWait(delete);
+    }
+
+    private void createOnDemandLoadServices(ExampleServiceHost h, String factoryLink)
+            throws Throwable {
+        this.host.testStart(this.serviceCount);
+        for (int i = 0; i < this.serviceCount; i++) {
+            MinimalTestServiceState body = new MinimalTestServiceState();
+            body.id = UUID.randomUUID().toString();
+            body.stringValue = body.id;
+            Operation post = Operation.createPost(UriUtils.buildUri(h, factoryLink))
+                    .setCompletion(this.host.getCompletion())
+                    .setBody(body);
+            this.host.send(post);
+
+        }
+        this.host.testWait();
+    }
+
+    private String createOnDemandLoadFactoryService(ExampleServiceHost h) throws Throwable {
+        // create an on demand load factory and services
+        this.host.testStart(1);
+        OnDemandLoadFactoryService s = new OnDemandLoadFactoryService();
+        s.setChildServiceCaps(EnumSet.of(ServiceOption.PERSISTENCE,
+                ServiceOption.REPLICATION, ServiceOption.OWNER_SELECTION,
+                ServiceOption.ON_DEMAND_LOAD, ServiceOption.INSTRUMENTATION));
+        Operation factoryPost = Operation.createPost(
+                UriUtils.buildUri(h, s.getClass()))
+                .setCompletion(this.host.getCompletion());
+        h.startService(factoryPost, s);
+        this.host.testWait();
+        String factoryLink = s.getSelfLink();
+        this.host.log("Started on demand load factory at %s", factoryLink);
+        return factoryLink;
     }
 
     private Map<URI, ExampleServiceState> updateUriMapWithNewPort(int port,
@@ -452,7 +764,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                     ServiceDocumentQueryResult r = o.getBody(ServiceDocumentQueryResult.class);
                     int count = 0;
                     for (String u : r.documentLinks) {
-                        if (u.contains(ExampleFactoryService.SELF_LINK)) {
+                        if (u.contains(ExampleService.FACTORY_LINK)) {
                             count++;
                         }
                     }
@@ -469,9 +781,9 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
     @Test
     public void interleavedUpdatesWithQueries() throws Throwable {
-        this.host.waitForServiceAvailable(ExampleFactoryService.SELF_LINK);
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
         final String initialServiceNameValue = "initial-" + UUID.randomUUID().toString();
-        URI factoryUri = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK);
+        URI factoryUri = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK);
         Consumer<Operation> setInitialStateBody = (o) -> {
             ExampleServiceState body = new ExampleServiceState();
             body.name = initialServiceNameValue;
@@ -553,7 +865,6 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                             inFlightRequests.decrementAndGet();
                             if (e != null) {
                                 failure[0] = e;
-                                return;
                             }
                         });
                 inFlightRequests.incrementAndGet();
@@ -612,8 +923,9 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
         queryDocumentIndexByVersionAndVerify(state.documentSelfLink, 10L, null);
     }
 
-    private void queryDocumentIndexByVersionAndVerify(String selfLink, Long version, Long latestVersion)
-        throws Throwable {
+    private void queryDocumentIndexByVersionAndVerify(String selfLink, Long version,
+            Long latestVersion)
+            throws Throwable {
 
         URI localQueryUri = UriUtils.buildDocumentQueryUri(
                 this.host,
@@ -623,22 +935,24 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                 ServiceOption.PERSISTENCE);
 
         if (version != null) {
-            localQueryUri = UriUtils.appendQueryParam(localQueryUri, ServiceDocument.FIELD_NAME_VERSION,
-                Long.toString(version));
+            localQueryUri = UriUtils.appendQueryParam(localQueryUri,
+                    ServiceDocument.FIELD_NAME_VERSION,
+                    Long.toString(version));
         }
 
         this.host.testStart(1);
-        Operation remoteGet = Operation.createGet(localQueryUri)
+        Operation remoteGet = Operation
+                .createGet(localQueryUri)
                 .setReferer(this.host.getUri())
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         throw new IllegalStateException("Could not query document-index");
                     }
 
-                    // No result expected when latestVersion is null
                     if (latestVersion == null) {
                         if (o.hasBody()) {
-                            this.host.failIteration(new IllegalStateException("Document not expected"));
+                            this.host.failIteration(new IllegalStateException(
+                                    "Document not expected"));
                             return;
                         }
 
@@ -654,7 +968,8 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                     }
 
                     if (result.documentVersion != expectedVersion.intValue()) {
-                        this.host.failIteration(new IllegalStateException("Invalid document version returned"));
+                        this.host.failIteration(new IllegalStateException(
+                                "Invalid document version returned"));
                         return;
                     }
 
@@ -721,7 +1036,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
     @Test
     public void serviceCreationAndDocumentExpirationLongRunning() throws Throwable {
-        this.host.waitForServiceAvailable(ExampleFactoryService.SELF_LINK);
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
         Date expiration = this.host.getTestExpiration();
 
         long opTimeoutMicros = this.host.testDurationSeconds != 0 ? this.host
@@ -730,14 +1045,15 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
         this.host.setTimeoutSeconds((int) TimeUnit.MICROSECONDS.toSeconds(opTimeoutMicros));
 
-        URI factoryUri = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK);
+        URI factoryUri = UriUtils.buildFactoryUri(this.host, ExampleService.class);
         Consumer<Operation> setBody = (o) -> {
             ExampleServiceState body = new ExampleServiceState();
             body.name = UUID.randomUUID().toString();
             o.setBody(body);
         };
         Consumer<Operation> setBodyMinimal = (o) -> {
-            MinimalTestServiceState body = (MinimalTestServiceState) this.host.buildMinimalTestState();
+            MinimalTestServiceState body = (MinimalTestServiceState) this.host
+                    .buildMinimalTestState();
             o.setBody(body);
         };
 
@@ -745,85 +1061,82 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
         Service minimalFactory = this.host.startServiceAndWait(
                 new MinimalFactoryTestService(), minimalSelfLinkPrefix, new ServiceDocument());
 
-        try {
-            while (new Date().before(expiration)) {
+        while (new Date().before(expiration)) {
 
-                this.host.log("Expiration: %s, now: %s", expiration, new Date());
+            this.host.log("Expiration: %s, now: %s", expiration, new Date());
 
-                Map<URI, ExampleServiceState> services = this.host.doFactoryChildServiceStart(
-                        null,
-                        this.serviceCount, ExampleServiceState.class,
-                        setBody, factoryUri);
+            Map<URI, ExampleServiceState> services = this.host.doFactoryChildServiceStart(
+                    null,
+                    this.serviceCount, ExampleServiceState.class,
+                    setBody, factoryUri);
 
-                Set<String> names = new HashSet<>();
-                this.host.testStart(services.size());
-                // patch services to a new version so we verify expiration across multiple versions
+            Set<String> names = new HashSet<>();
+            this.host.testStart(services.size());
+            // patch services to a new version so we verify expiration across multiple versions
+            for (URI u : services.keySet()) {
+                ExampleServiceState s = new ExampleServiceState();
+                s.name = UUID.randomUUID().toString();
+                // set a very long expiration
+                s.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
+                        + TimeUnit.DAYS.toMicros(1);
+                names.add(s.name);
+                this.host.send(Operation.createPatch(u).setBody(s)
+                        .setCompletion(this.host.getCompletion()));
+            }
+            this.host.testWait();
+
+            // verify state was saved by issuing a factory GET which goes to the index
+            Map<URI, ExampleServiceState> states = this.host.getServiceState(null,
+                    ExampleServiceState.class, services.keySet());
+            for (ExampleServiceState st : states.values()) {
+                assertTrue(names.contains(st.name));
+            }
+
+            URI luceneStatsUri = UriUtils.buildStatsUri(this.host.getDocumentIndexServiceUri());
+            ServiceStats stats = this.host.getServiceState(null, ServiceStats.class,
+                    luceneStatsUri);
+            ServiceStat deletedCountBeforeExpiration = stats.entries
+                    .get(LuceneDocumentIndexService.STAT_NAME_SERVICE_DELETE_COUNT);
+            if (deletedCountBeforeExpiration == null) {
+                deletedCountBeforeExpiration = new ServiceStat();
+            }
+
+            stats = this.host.getServiceState(null, ServiceStats.class, luceneStatsUri);
+            ServiceStat expiredCountBeforeExpiration = stats.entries
+                    .get(LuceneDocumentIndexService.STAT_NAME_DOCUMENT_EXPIRATION_COUNT);
+
+            if (expiredCountBeforeExpiration == null) {
+                expiredCountBeforeExpiration = new ServiceStat();
+            }
+
+            long expTime = 0;
+            int expectedCount = services.size();
+
+            // first time, patch to zero, which means ignore expiration, and we should not
+            // observe any expired documents
+            patchExpiration(factoryUri, services, expTime, expectedCount);
+
+            // now set expiration to 1, which is definitely in the past, observe all documents expired
+            expTime = 1;
+            expectedCount = 0;
+            patchExpiration(factoryUri, services, expTime, expectedCount);
+            this.host.log("All example services expired");
+
+            ServiceStat expiredCountAfterExpiration = null;
+            Date exp = this.host.getTestExpiration();
+            while (exp.after(new Date())) {
+                boolean isConverged = true;
+                // confirm services are stopped
                 for (URI u : services.keySet()) {
-                    ExampleServiceState s = new ExampleServiceState();
-                    s.name = UUID.randomUUID().toString();
-                    // set a very long expiration
-                    s.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                            + TimeUnit.DAYS.toMicros(1);
-                    names.add(s.name);
-                    this.host.send(Operation.createPatch(u).setBody(s)
-                            .setCompletion(this.host.getCompletion()));
-                }
-                this.host.testWait();
-
-                // verify state was saved by issuing a factory GET which goes to the index
-                Map<URI, ExampleServiceState> states = this.host.getServiceState(null,
-                        ExampleServiceState.class, services.keySet());
-                for (ExampleServiceState st : states.values()) {
-                    assertTrue(names.contains(st.name));
-                }
-
-                URI luceneStatsUri = UriUtils.buildStatsUri(this.host.getDocumentIndexServiceUri());
-                ServiceStats stats = this.host.getServiceState(null, ServiceStats.class,
-                        luceneStatsUri);
-                ServiceStat deletedCountBeforeExpiration = stats.entries
-                        .get(LuceneDocumentIndexService.STAT_NAME_SERVICE_DELETE_COUNT);
-                if (deletedCountBeforeExpiration == null) {
-                    deletedCountBeforeExpiration = new ServiceStat();
-                }
-
-                stats = this.host.getServiceState(null, ServiceStats.class, luceneStatsUri);
-                ServiceStat expiredCountBeforeExpiration = stats.entries
-                        .get(LuceneDocumentIndexService.STAT_NAME_DOCUMENT_EXPIRATION_COUNT);
-
-                if (expiredCountBeforeExpiration == null) {
-                    expiredCountBeforeExpiration = new ServiceStat();
-                }
-
-                long expTime = 0;
-                int expectedCount = services.size();
-
-                // first time, patch to zero, which means ignore expiration, and we should not
-                // observe any expired documents
-                patchExpiration(factoryUri, services, expTime, expectedCount);
-
-                // now set expiration to 1, which is definately in the past, observe all documents expired
-                expTime = 1;
-                expectedCount = 0;
-                patchExpiration(factoryUri, services, expTime, expectedCount);
-                this.host.log("All example services expired");
-
-                Date exp = this.host.getTestExpiration();
-                while (exp.after(new Date())) {
-                    boolean isConverged = true;
-                    // confirm services are stopped
-                    for (URI u : services.keySet()) {
-                        ProcessingStage s = this.host.getServiceStage(u.getPath());
-                        if (s != null && s != ProcessingStage.STOPPED) {
-                            isConverged = false;
-                        }
-                    }
-                    if (isConverged) {
-                        break;
+                    ProcessingStage s = this.host.getServiceStage(u.getPath());
+                    if (s != null && s != ProcessingStage.STOPPED) {
+                        isConverged = false;
                     }
                 }
 
-                if (exp.before(new Date())) {
-                    throw new TimeoutException();
+                if (!isConverged) {
+                    Thread.sleep(250);
+                    continue;
                 }
 
                 stats = this.host.getServiceState(null, ServiceStats.class,
@@ -831,102 +1144,117 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                 ServiceStat deletedCountAfterExpiration = stats.entries
                         .get(LuceneDocumentIndexService.STAT_NAME_SERVICE_DELETE_COUNT);
 
-                assertTrue(deletedCountBeforeExpiration.latestValue < deletedCountAfterExpiration.latestValue);
+                if (deletedCountBeforeExpiration.latestValue >= deletedCountAfterExpiration.latestValue) {
+                    this.host.log("No service deletions seen, currently at %f",
+                            deletedCountAfterExpiration.latestValue);
+                    Thread.sleep(250);
+                    continue;
+                }
 
                 stats = this.host.getServiceState(null, ServiceStats.class, luceneStatsUri);
-                ServiceStat expiredCountAfterExpiration = stats.entries
+                expiredCountAfterExpiration = stats.entries
                         .get(LuceneDocumentIndexService.STAT_NAME_DOCUMENT_EXPIRATION_COUNT);
 
-                assertTrue(expiredCountBeforeExpiration.latestValue < expiredCountAfterExpiration.latestValue);
-
-                // do a more thorough check to ensure the services were removed from the index
-                this.host.validatePermanentServiceDocumentDeletion(ExampleFactoryService.SELF_LINK,
-                        0, this.host.testDurationSeconds == 0);
-
-                // now create in memory, non indexed services
-                Map<URI, MinimalTestServiceState> minimalServices = this.host
-                        .doFactoryChildServiceStart(null,
-                                this.serviceCount, MinimalTestServiceState.class,
-                                setBodyMinimal, minimalFactory.getUri());
-
-                this.host.testStart(minimalServices.size());
-                for (URI u : minimalServices.keySet()) {
-                    this.host.send(Operation.createDelete(u)
-                            .setCompletion(this.host.getCompletion()));
-                }
-                this.host.testWait();
-                waitForFactoryResults(factoryUri, 0);
-                this.host.log("All minimal services deleted");
-
-                File f = new File(this.host.getStorageSandbox());
-                this.host.log("Disk: free %d, usable: %d, total: %d", f.getFreeSpace(),
-                        f.getUsableSpace(),
-                        f.getTotalSpace());
-
-                this.host.log("Memory: free %d, total: %d, max: %d", Runtime.getRuntime()
-                        .freeMemory(),
-                        Runtime.getRuntime().totalMemory(),
-                        Runtime.getRuntime().maxMemory());
-
-                stats = this.host.getServiceState(null, ServiceStats.class,
-                        luceneStatsUri);
-                ServiceStat stAll = stats.entries
-                        .get(LuceneDocumentIndexService.STAT_NAME_INDEXED_DOCUMENT_COUNT);
-                if (stAll != null) {
-                    this.host.log("total versions: %f", stAll.latestValue);
+                if (expiredCountBeforeExpiration.latestValue >= expiredCountAfterExpiration.latestValue) {
+                    this.host.log("No service expirations seen, currently at %f",
+                            expiredCountAfterExpiration.latestValue);
+                    Thread.sleep(250);
+                    continue;
                 }
 
-                Consumer<Operation> maintExpSetBody = (o) -> {
-                    ExampleServiceState body = new ExampleServiceState();
-                    body.name = UUID.randomUUID().toString();
-                    body.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                            + this.host.getMaintenanceIntervalMicros();
-                    o.setBody(body);
-                };
-
-                // create a new set of services, meant to expire on their own, quickly
-                services = this.host.doFactoryChildServiceStart(
-                        null,
-                        this.serviceCount, ExampleServiceState.class,
-                        maintExpSetBody, factoryUri);
-
-                // do not do anything on the services, rely on the maintenance interval to expire them
-                exp = this.host.getTestExpiration();
-                while (exp.after(new Date())) {
-                    stats = this.host.getServiceState(null, ServiceStats.class, luceneStatsUri);
-                    ServiceStat maintExpiredCount = stats.entries
-                            .get(LuceneDocumentIndexService.STAT_NAME_DOCUMENT_EXPIRATION_COUNT);
-
-                    if (expiredCountAfterExpiration.latestValue >= maintExpiredCount.latestValue) {
-                        Thread.sleep(this.host.getMaintenanceIntervalMicros() / 1000);
-                        continue;
-                    }
-
-                    ServiceDocumentQueryResult r = this.host.getFactoryState(factoryUri);
-                    if (r.documentLinks.size() > 0) {
-                        this.host.log("Documents not expired: %d", r.documentLinks.size());
-                        Thread.sleep(this.host.getMaintenanceIntervalMicros() / 1000);
-                        continue;
-                    }
-
-                    break;
-                }
-
-                this.host.log("Documents expired through maintenance");
-
-                if (new Date().after(exp)) {
-                    throw new IllegalStateException(
-                            "Lucene service maintenanance never expired services");
-                }
-
-                if (this.host.isLongDurationTest()) {
-                    Thread.sleep(1000);
-                } else {
-                    break;
-                }
-
+                break;
             }
-        } finally {
+
+            if (exp.before(new Date())) {
+                throw new TimeoutException();
+            }
+
+            // do a more thorough check to ensure the services were removed from the index
+            this.host.validatePermanentServiceDocumentDeletion(ExampleService.FACTORY_LINK,
+                    0, this.host.testDurationSeconds == 0);
+
+            // now create in memory, non indexed services
+            Map<URI, MinimalTestServiceState> minimalServices = this.host
+                    .doFactoryChildServiceStart(null,
+                            this.serviceCount, MinimalTestServiceState.class,
+                            setBodyMinimal, minimalFactory.getUri());
+
+            this.host.testStart(minimalServices.size());
+            for (URI u : minimalServices.keySet()) {
+                this.host.send(Operation.createDelete(u)
+                        .setCompletion(this.host.getCompletion()));
+            }
+            this.host.testWait();
+            waitForFactoryResults(factoryUri, 0);
+            this.host.log("All minimal services deleted");
+
+            File f = new File(this.host.getStorageSandbox());
+            this.host.log("Disk: free %d, usable: %d, total: %d", f.getFreeSpace(),
+                    f.getUsableSpace(),
+                    f.getTotalSpace());
+
+            this.host.log("Memory: free %d, total: %d, max: %d", Runtime.getRuntime()
+                    .freeMemory(),
+                    Runtime.getRuntime().totalMemory(),
+                    Runtime.getRuntime().maxMemory());
+
+            stats = this.host.getServiceState(null, ServiceStats.class,
+                    luceneStatsUri);
+            ServiceStat stAll = stats.entries
+                    .get(LuceneDocumentIndexService.STAT_NAME_INDEXED_DOCUMENT_COUNT);
+            if (stAll != null) {
+                this.host.log("total versions: %f", stAll.latestValue);
+            }
+
+            Consumer<Operation> maintExpSetBody = (o) -> {
+                ExampleServiceState body = new ExampleServiceState();
+                body.name = UUID.randomUUID().toString();
+                body.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
+                        + this.host.getMaintenanceIntervalMicros();
+                o.setBody(body);
+            };
+
+            // create a new set of services, meant to expire on their own, quickly
+            services = this.host.doFactoryChildServiceStart(
+                    null,
+                    this.serviceCount, ExampleServiceState.class,
+                    maintExpSetBody, factoryUri);
+
+            // do not do anything on the services, rely on the maintenance interval to expire them
+            exp = this.host.getTestExpiration();
+            while (exp.after(new Date())) {
+                stats = this.host.getServiceState(null, ServiceStats.class, luceneStatsUri);
+                ServiceStat maintExpiredCount = stats.entries
+                        .get(LuceneDocumentIndexService.STAT_NAME_DOCUMENT_EXPIRATION_COUNT);
+
+                if (expiredCountAfterExpiration.latestValue >= maintExpiredCount.latestValue) {
+                    Thread.sleep(this.host.getMaintenanceIntervalMicros() / 1000);
+                    continue;
+                }
+
+                ServiceDocumentQueryResult r = this.host.getFactoryState(factoryUri);
+                if (r.documentLinks.size() > 0) {
+                    this.host.log("Documents not expired: %d", r.documentLinks.size());
+                    Thread.sleep(this.host.getMaintenanceIntervalMicros() / 1000);
+                    continue;
+                }
+
+                break;
+            }
+
+            this.host.log("Documents expired through maintenance");
+
+            if (new Date().after(exp)) {
+                throw new IllegalStateException(
+                        "Lucene service maintenanance never expired services");
+            }
+
+            if (this.host.isLongDurationTest()) {
+                Thread.sleep(1000);
+            } else {
+                break;
+            }
+
             ServiceDocumentQueryResult r = this.host.getFactoryState(factoryUri);
             ServiceHostState s = this.host.getState();
             this.host.log("number of documents: %d, host state: %s", r.documentLinks.size(),
@@ -934,7 +1262,6 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
             assertEquals(0, r.documentLinks.size());
         }
-
     }
 
     private void patchExpiration(URI factoryUri, Map<URI, ExampleServiceState> services,
@@ -1000,7 +1327,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
                 actualCount++;
             }
 
-            this.host.log("Waiting example service count %d, currently at %d", expectedCount,
+            this.host.log("Expected example service count: %d, current: %d", expectedCount,
                     actualCount);
 
             if (actualCount == expectedCount && rsp.documentLinks.size() == expectedCount) {
@@ -1030,7 +1357,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
         int count = 1000;
         URI factoryUri = UriUtils.buildUri(this.host,
-                ExampleFactoryService.SELF_LINK);
+                ExampleService.FACTORY_LINK);
 
         Map<URI, ExampleServiceState> exampleStates = this.host.doFactoryChildServiceStart(null,
                 count,
@@ -1087,7 +1414,7 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
         // Check our documents are still there
         ServiceDocumentQueryResult queryResult = this.host
                 .getFactoryState(UriUtils.buildExpandLinksQueryUri(UriUtils.buildUri(this.host,
-                        ExampleFactoryService.SELF_LINK)));
+                        ExampleService.FACTORY_LINK)));
         assertNotNull(queryResult);
         assertNotNull(queryResult.documents);
         assertEquals(queryResult.documents.size(), exampleStates.keySet().size());
@@ -1111,62 +1438,80 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
     }
 
     private void doServiceVersionGroomingValidation(EnumSet<ServiceOption> caps) throws Throwable {
-        int serviceCount = 2;
-        List<Service> services = this.host.doThroughputServiceStart(
-                serviceCount, MinimalTestServiceWithDefaultRetention.class,
-                this.host.buildMinimalTestState(), caps,
-                null);
+        long end = Utils.getNowMicrosUtc() + TimeUnit.SECONDS.toMicros(this.testDurationSeconds);
 
-        Collection<URI> serviceUrisWithDefaultRetention = new ArrayList<>();
-        for (Service s : services) {
-            serviceUrisWithDefaultRetention.add(s.getUri());
-        }
+        do {
+            List<Service> services = this.host.doThroughputServiceStart(
+                    this.serviceCount, MinimalTestServiceWithDefaultRetention.class,
+                    this.host.buildMinimalTestState(), caps,
+                    null);
 
-        URI factoryUri = UriUtils.buildUri(this.host,
-                ExampleFactoryService.SELF_LINK);
-        Map<URI, ExampleServiceState> exampleStates = this.host.doFactoryChildServiceStart(null,
-                serviceCount,
-                ExampleServiceState.class,
-                (o) -> {
-                    ExampleServiceState s = new ExampleServiceState();
-                    s.name = UUID.randomUUID().toString();
-                    o.setBody(s);
-                }, factoryUri);
+            Collection<URI> serviceUrisWithDefaultRetention = new ArrayList<>();
+            for (Service s : services) {
+                serviceUrisWithDefaultRetention.add(s.getUri());
+            }
 
-        Collection<URI> serviceUrisWithCustomRetention = exampleStates.keySet();
+            URI factoryUri = UriUtils.buildUri(this.host,
+                    ExampleService.FACTORY_LINK);
+            Map<URI, ExampleServiceState> exampleStates = this.host.doFactoryChildServiceStart(
+                    null,
+                    this.serviceCount,
+                    ExampleServiceState.class,
+                    (o) -> {
+                        ExampleServiceState s = new ExampleServiceState();
+                        s.name = UUID.randomUUID().toString();
+                        o.setBody(s);
+                    }, factoryUri);
 
-        long count = ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT * 2;
-        this.host.testStart(serviceCount * count);
-        for (int i = 0; i < count; i++) {
+            Collection<URI> serviceUrisWithCustomRetention = exampleStates.keySet();
+
+            long count = ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT * 2;
+            this.host.testStart(this.serviceCount * count);
+            for (int i = 0; i < count; i++) {
+                for (URI u : serviceUrisWithDefaultRetention) {
+                    this.host.send(Operation.createPut(u)
+                            .setBody(this.host.buildMinimalTestState())
+                            .setCompletion(this.host.getCompletion()));
+                }
+            }
+            this.host.testWait();
+
+            count = ExampleServiceState.VERSION_RETENTION_LIMIT + 100;
+            this.host.testStart(serviceUrisWithCustomRetention.size() * count);
+            for (int i = 0; i < count; i++) {
+                for (URI u : serviceUrisWithCustomRetention) {
+                    ExampleServiceState st = new ExampleServiceState();
+                    st.name = Utils.getNowMicrosUtc() + "";
+                    this.host.send(Operation.createPut(u)
+                            .setBody(st)
+                            .setCompletion(this.host.getCompletion()));
+                }
+            }
+            this.host.testWait();
+
+            Collection<URI> serviceUris = serviceUrisWithDefaultRetention;
+            long limit = ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT
+                    * serviceUris.size();
+            verifyVersionRetention(count, serviceUris, limit);
+
+            serviceUris = serviceUrisWithCustomRetention;
+            limit = ExampleServiceState.VERSION_RETENTION_LIMIT * serviceUris.size();
+            verifyVersionRetention(count, serviceUris, limit);
+
+            this.host.testStart(this.serviceCount);
             for (URI u : serviceUrisWithDefaultRetention) {
-                this.host.send(Operation.createPut(u)
-                        .setBody(this.host.buildMinimalTestState())
+                this.host.send(Operation.createDelete(u)
                         .setCompletion(this.host.getCompletion()));
             }
-        }
-        this.host.testWait();
+            this.host.testWait();
 
-        count = ExampleServiceState.VERSION_RETENTION_LIMIT + 100;
-        this.host.testStart(serviceUrisWithCustomRetention.size() * count);
-        for (int i = 0; i < count; i++) {
+            this.host.testStart(this.serviceCount);
             for (URI u : serviceUrisWithCustomRetention) {
-                ExampleServiceState st = new ExampleServiceState();
-                st.name = Utils.getNowMicrosUtc() + "";
-                this.host.send(Operation.createPut(u)
-                        .setBody(st)
+                this.host.send(Operation.createDelete(u)
                         .setCompletion(this.host.getCompletion()));
             }
-        }
-        this.host.testWait();
-
-        Collection<URI> serviceUris = serviceUrisWithDefaultRetention;
-        long limit = ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT
-                * serviceUris.size();
-        verifyVersionRetention(count, serviceUris, limit);
-
-        serviceUris = serviceUrisWithCustomRetention;
-        limit = ExampleServiceState.VERSION_RETENTION_LIMIT * serviceUris.size();
-        verifyVersionRetention(count, serviceUris, limit);
+            this.host.testWait();
+        } while (Utils.getNowMicrosUtc() < end);
     }
 
     private void verifyVersionRetention(long count,
@@ -1313,8 +1658,9 @@ public class TestLuceneDocumentIndexService extends BasicReportTestCase {
 
         // do GET on all child URIs
         ServiceDocumentQueryResult queryResult = this.host
-                .getFactoryState(UriUtils.buildExpandLinksQueryUri(UriUtils.buildUri(this.host,
-                        ExampleFactoryService.SELF_LINK)));
+                .getFactoryState(UriUtils.buildExpandLinksQueryUri(UriUtils.buildFactoryUri(
+                        this.host,
+                        ExampleService.class)));
         assertNotNull(queryResult);
         assertNotNull(queryResult.documents);
         assertEquals(queryResult.documents.size(), reference.size());

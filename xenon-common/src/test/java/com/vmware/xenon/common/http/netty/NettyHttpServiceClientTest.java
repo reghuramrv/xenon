@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.net.ssl.SSLContext;
 
+import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 
@@ -43,6 +44,7 @@ import org.junit.Test;
 
 import com.vmware.xenon.common.CommandLineArgumentParser;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceClient;
 import com.vmware.xenon.common.ServiceDocument;
@@ -53,9 +55,12 @@ import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 import com.vmware.xenon.common.test.TestProperty;
 import com.vmware.xenon.common.test.VerificationHost;
-import com.vmware.xenon.services.common.ExampleFactoryService;
+import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.MinimalTestService;
+import com.vmware.xenon.services.common.ReplicationFactoryTestService;
+import com.vmware.xenon.services.common.ReplicationTestService;
+import com.vmware.xenon.services.common.ReplicationTestService.ReplicationTestServiceState;
 
 public class NettyHttpServiceClientTest {
 
@@ -118,8 +123,7 @@ public class NettyHttpServiceClientTest {
 
     @After
     public void cleanUp() {
-        ((NettyHttpServiceClient) this.host.getClient()).setConnectionLimitPerHost(
-                NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST);
+        this.host.getClient().setConnectionLimitPerHost(NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST);
     }
 
     @Test
@@ -410,9 +414,9 @@ public class NettyHttpServiceClientTest {
     @Test
     public void putSingleNoQueueing() throws Throwable {
         long s = Utils.getNowMicrosUtc();
-        this.host.waitForServiceAvailable(ExampleFactoryService.SELF_LINK);
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
 
-        URI uriToMissingService = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK
+        URI uriToMissingService = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK
                 + "/"
                 + UUID.randomUUID().toString());
 
@@ -427,7 +431,7 @@ public class NettyHttpServiceClientTest {
         this.host.send(put);
         this.host.testWait();
 
-        uriToMissingService = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK + "/"
+        uriToMissingService = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK + "/"
                 + UUID.randomUUID().toString());
 
         this.host.testStart(1);
@@ -447,7 +451,7 @@ public class NettyHttpServiceClientTest {
             throw new TimeoutException("Request got queued, it should have bypassed queuing");
         }
 
-        uriToMissingService = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK + "/"
+        uriToMissingService = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK + "/"
                 + UUID.randomUUID().toString());
 
         ServiceClient nonXenonLookingClient = null;
@@ -514,7 +518,7 @@ public class NettyHttpServiceClientTest {
     public void putOverMaxRequestLimit() throws Throwable {
         this.host.setOperationTimeOutMicros(TimeUnit.SECONDS.toMicros(1));
         List<Service> services = this.host.doThroughputServiceStart(
-                8, MinimalTestService.class, this.host.buildMinimalTestState(), null,
+                2, MinimalTestService.class, this.host.buildMinimalTestState(), null,
                 null);
         // force failure by using a payload higher than max size
         this.host.doPutPerService(1,
@@ -530,6 +534,12 @@ public class NettyHttpServiceClientTest {
                 MinimalTestService.class,
                 this.host.buildMinimalTestState(),
                 null, null);
+
+        verifyErrorResponseBodyHandling(services);
+
+        // induce a failure that does warrant a retry. Verify we do get proper retries
+        verifyRequestRetryPolicy(services);
+
         this.host.doPutPerService(
                 EnumSet.of(TestProperty.FORCE_FAILURE,
                         TestProperty.SINGLE_ITERATION),
@@ -547,12 +557,160 @@ public class NettyHttpServiceClientTest {
                 .setCompletion(this.host.getExpectedFailureCompletion()));
         this.host.testWait();
 
+        this.host.testStart(1);
+        this.host.send(Operation.createPut(services.get(0).getUri())
+                .setBody("this is not JSON")
+                .forceRemote()
+                .setCompletion(this.host.getExpectedFailureCompletion()));
+        this.host.testWait();
+
         // create an operation with no body and verify completion gets called with
         // failure
         this.host.testStart(1);
         this.host.send(Operation.createPatch(services.get(0).getUri())
                 .setCompletion(this.host.getExpectedFailureCompletion()));
         this.host.testWait();
+
+        this.host.testStart(1);
+        this.host.send(Operation.createPatch(services.get(0).getUri())
+                .forceRemote()
+                .setCompletion(this.host.getExpectedFailureCompletion()));
+        this.host.testWait();
+    }
+
+    private void verifyErrorResponseBodyHandling(List<Service> services) throws Throwable {
+        // send a body with instructions to the test service to fail the
+        // request, but set the error body as plain text. This verifies the runtime
+        // preserves the plain text error response
+        CompletionHandler ch = (o, e) -> {
+            if (e == null) {
+                this.host.failIteration(new IllegalStateException("expected failure"));
+                return;
+            }
+
+            Object rsp = o.getBodyRaw();
+            if (!o.getContentType().equals(Operation.MEDIA_TYPE_TEXT_PLAIN)
+                    || !(rsp instanceof String)) {
+                this.host.failIteration(new IllegalStateException(
+                        "expected text plain content type and response"));
+                return;
+            }
+            this.host.completeIteration();
+        };
+
+        MinimalTestServiceState body = new MinimalTestServiceState();
+        body.id = MinimalTestService.STRING_MARKER_FAIL_WITH_PLAIN_TEXT_RESPONSE;
+        this.host.testStart(1);
+        this.host.send(Operation.createPatch(services.get(0).getUri())
+                .setBody(body)
+                .setCompletion(ch));
+        this.host.testWait();
+
+        this.host.testStart(1);
+        this.host.send(Operation.createPatch(services.get(0).getUri())
+                .setBody(body)
+                .forceRemote()
+                .setCompletion(ch));
+        this.host.testWait();
+
+        // now verify we leave binary or custom content type error responses alone
+        // in process response will stay as string
+        ch = (o, e) -> {
+            if (e == null) {
+                this.host.failIteration(new IllegalStateException("expected failure"));
+                return;
+            }
+
+            Object rsp = o.getBodyRaw();
+            if (!o.getContentType().equals(MinimalTestService.CUSTOM_CONTENT_TYPE)
+                    || !(rsp instanceof String)) {
+                this.host.failIteration(new IllegalStateException(
+                        "expected custom content type and binary response"));
+                return;
+            }
+            this.host.completeIteration();
+        };
+
+        body = new MinimalTestServiceState();
+        body.id = MinimalTestService.STRING_MARKER_FAIL_WITH_CUSTOM_CONTENT_TYPE_RESPONSE;
+        this.host.testStart(1);
+        this.host.send(Operation.createPatch(services.get(0).getUri())
+                .setBody(body)
+                .setCompletion(ch));
+        this.host.testWait();
+
+        // cross node response will stay as binary
+        ch = (o, e) -> {
+            if (e == null) {
+                this.host.failIteration(new IllegalStateException("expected failure"));
+                return;
+            }
+
+            Object rsp = o.getBodyRaw();
+            if (!o.getContentType().equals(MinimalTestService.CUSTOM_CONTENT_TYPE)
+                    || !(rsp instanceof byte[])) {
+                this.host.failIteration(new IllegalStateException(
+                        "expected custom content type and binary response"));
+                return;
+            }
+            this.host.completeIteration();
+        };
+
+        this.host.testStart(1);
+        this.host.send(Operation.createPatch(services.get(0).getUri())
+                .setBody(body)
+                .forceRemote()
+                .setCompletion(ch));
+        this.host.testWait();
+    }
+
+    private void verifyRequestRetryPolicy(List<Service> services) throws Throwable {
+        MinimalTestService targetService = (MinimalTestService) services.get(0);
+        MinimalTestServiceState body = new MinimalTestServiceState();
+        body.id = MinimalTestService.STRING_MARKER_RETRY_REQUEST;
+        body.stringValue = MinimalTestService.STRING_MARKER_RETRY_REQUEST;
+        Operation patchWithRetry = Operation.createPatch(targetService.getUri())
+                .setCompletion(this.host.getCompletion())
+                .setBody(body)
+                .forceRemote()
+                .setRetryCount(1)
+                .setContextId(UUID.randomUUID().toString());
+        // the service should fail the request, the client should then retry, the service will then
+        // succeed it. We use the context id to track and correlate the retried requests
+        this.host.sendAndWait(patchWithRetry);
+
+        // create a replicated, owner selected Service, since its the replication code that
+        // does implicit retries, and we want to verify it does not do them unless its a replication
+        // conflict
+
+        ReplicationFactoryTestService replFactory = new ReplicationFactoryTestService();
+        this.host.startServiceAndWait(replFactory,
+                ReplicationFactoryTestService.OWNER_SELECTION_SELF_LINK, null);
+
+        // create a child service
+        ReplicationTestServiceState initState = new ReplicationTestServiceState();
+        initState.documentSelfLink = UUID.randomUUID().toString();
+        Operation post = Operation.createPost(replFactory.getUri())
+                .setBody(initState)
+                .setCompletion(this.host.getCompletion());
+        this.host.sendAndWait(post);
+        URI childURI = UriUtils.buildUri(this.host.getUri(),
+                ReplicationFactoryTestService.OWNER_SELECTION_SELF_LINK,
+                initState.documentSelfLink);
+
+        // verify that we do NOT retry, unless the service error response has SHOULD_RETRY
+        // enabled
+        initState.stringField = ReplicationTestService.STRING_MARKER_FAIL_WITH_CONFLICT_CODE;
+        Operation put = Operation.createPut(childURI)
+                .setCompletion(
+                        this.host.getExpectedFailureCompletion(Operation.STATUS_CODE_CONFLICT))
+                .setBody(initState)
+                .forceRemote()
+                .setRetryCount(1)
+                .setContextId(UUID.randomUUID().toString());
+        // if the replication code retries, the request will timeout, since it retries until expiration. We check
+        // for CONFLICT code explicitly so the test will fail if fail due to timeout
+        this.host.sendAndWait(put);
     }
 
     @Test
@@ -564,7 +722,7 @@ public class NettyHttpServiceClientTest {
 
         if (!this.host.isStressTest()) {
             this.host.log("Single connection runs");
-            ((NettyHttpServiceClient) this.host.getClient()).setConnectionLimitPerHost(1);
+            this.host.getClient().setConnectionLimitPerHost(1);
             this.host.doPutPerService(
                     this.requestCount,
                     EnumSet.of(TestProperty.FORCE_REMOTE),
@@ -593,7 +751,7 @@ public class NettyHttpServiceClientTest {
     @Test
     public void throughputNonPersistedServiceGetSingleConnection() throws Throwable {
         long serviceCount = 256;
-        ((NettyHttpServiceClient) this.host.getClient()).setConnectionLimitPerHost(1);
+        this.host.getClient().setConnectionLimitPerHost(1);
         MinimalTestServiceState body = (MinimalTestServiceState) this.host.buildMinimalTestState();
 
         EnumSet<TestProperty> props = EnumSet.of(TestProperty.FORCE_REMOTE);
@@ -660,13 +818,15 @@ public class NettyHttpServiceClientTest {
                         return;
                     }
 
-                    MinimalTestServiceState st = o.getBody(MinimalTestServiceState.class);
-                    try {
-                        assertTrue(st.id != null);
-                        assertTrue(st.documentSelfLink != null);
-                        assertTrue(st.documentUpdateTimeMicros > 0);
-                    } catch (Throwable ex) {
-                        this.host.failIteration(ex);
+                    if (!props.contains(TestProperty.TEXT_RESPONSE)) {
+                        MinimalTestServiceState st = o.getBody(MinimalTestServiceState.class);
+                        try {
+                            assertTrue(st.id != null);
+                            assertTrue(st.documentSelfLink != null);
+                            assertTrue(st.documentUpdateTimeMicros > 0);
+                        } catch (Throwable ex) {
+                            this.host.failIteration(ex);
+                        }
                     }
                     this.host.completeIteration();
                 });
@@ -799,54 +959,117 @@ public class NettyHttpServiceClientTest {
         }
     }
 
+    /**
+     * Here we can test that headers sent by the client are sent correctly. The MinimalTestService
+     * can return the headers it receives. Currently we are only testing the Accept header.
+     */
     @Test
-    public void basicHttp2() throws Throwable {
-        int numGets = 10;
+    public void validateHeaders() throws Throwable {
+        MinimalTestService service = new MinimalTestService();
+        MinimalTestServiceState initialState = new MinimalTestServiceState();
+        initialState.id = "";
+        initialState.stringValue = "";
+        this.host.startServiceAndWait(service, UUID.randomUUID().toString(), initialState);
 
-        MinimalTestServiceState body = (MinimalTestServiceState) this.host.buildMinimalTestState();
-        // produce a JSON PODO that serialized is about 2048 bytes
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < 53; i++) {
-            sb.append(UUID.randomUUID().toString());
-        }
-        body.stringValue = sb.toString();
+        Map<String, String> headers;
 
-        List<Service> services = this.host.doThroughputServiceStart(
-                1,
-                MinimalTestService.class,
-                body,
-                EnumSet.noneOf(Service.ServiceOption.class), null);
-        Service service = services.get(0);
-        URI u = service.getUri();
+        headers = getHeaders(service.getUri(), false);
+        assertTrue(headers != null);
+        assertTrue(headers.containsKey(HttpHeaderNames.ACCEPT.toString()));
+        assertTrue(headers.get(HttpHeaderNames.ACCEPT.toString()).equals("*/*"));
 
-        this.host.testStart(numGets);
+        headers = getHeaders(service.getUri(), true);
+        assertTrue(headers != null);
+        assertTrue(headers.containsKey(HttpHeaderNames.ACCEPT.toString()));
+        assertTrue(headers.get(HttpHeaderNames.ACCEPT.toString())
+                .equals(Operation.MEDIA_TYPE_APPLICATION_JSON));
 
-        Operation get = Operation.createGet(u)
+        this.host.log("Headers validated");
+    }
+
+    /**
+     * GET the headers the client sent by querying the MinimalTestService
+     */
+    Map<String, String> getHeaders(URI serviceUri, boolean setAccept) throws Throwable {
+        final String[] headersRaw = new String[1];
+        URI queryUri = UriUtils.extendUriWithQuery(
+                serviceUri, MinimalTestService.QUERY_HEADERS, "true");
+        Operation get = Operation.createGet(queryUri)
                 .forceRemote()
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_USE_HTTP2)
-                .setCompletion((o, e) -> {
-                    if (e != null) {
-                        this.host.failIteration(e);
+                .setCompletion((op, ex) -> {
+                    if (ex != null) {
+                        this.host.failIteration(ex);
                         return;
                     }
-
-                    MinimalTestServiceState st = o.getBody(MinimalTestServiceState.class);
-                    try {
-                        assertTrue(st.id != null);
-                        assertTrue(st.documentSelfLink != null);
-                        assertTrue(st.documentUpdateTimeMicros > 0);
-                        assertTrue(st.stringValue != null);
-                    } catch (Throwable ex) {
-                        this.host.failIteration(ex);
-                    }
+                    MinimalTestServiceState s = op.getBody(MinimalTestServiceState.class);
+                    headersRaw[0] = s.stringValue;
                     this.host.completeIteration();
                 });
 
-        for (int i = 0; i < numGets; i++) {
-            this.host.send(get);
+        if (setAccept) {
+            get.addRequestHeader(HttpHeaderNames.ACCEPT.toString(),
+                    Operation.MEDIA_TYPE_APPLICATION_JSON);
         }
+
+        this.host.testStart(1);
+        this.host.send(get);
         this.host.testWait();
-        this.host.logThroughput();
+
+        if (headersRaw[0] == null) {
+            return null;
+        }
+        String[] headerLines = headersRaw[0].split("\\n");
+        Map <String, String> headers = new HashMap<>();
+        for (String headerLine : headerLines) {
+            String[] splitHeader = headerLine.split(":", 2);
+            if (splitHeader.length == 2) {
+                headers.put(splitHeader[0], splitHeader[1]);
+            }
+        }
+        return headers;
+    }
+
+    /**
+     * Validate that we throw reasonable exceptions when the URI is null, or the URI's host is null.
+     */
+    @Test
+    public void validateOperationChecks() throws Throwable {
+        URI noUri = null;
+        URI noHostUri = new URI("/foo/bar/baz");
+
+        Operation noUriOp = Operation.createGet(noUri).setReferer(noHostUri);
+        Operation noHostOp = Operation.createGet(noHostUri).setReferer(noHostUri);
+
+        this.host.testStart(2);
+        noUriOp.setCompletion((op, ex) -> {
+            if (ex == null) {
+                this.host.failIteration(ex);;
+                return;
+            }
+            if (!ex.getMessage().contains("Uri is required")) {
+                this.host.failIteration(new IllegalStateException("Unexpected exception"));
+                return;
+            }
+            this.host.completeIteration();
+        });
+
+        noHostOp.setCompletion((op, ex) -> {
+            if (ex == null) {
+                this.host.failIteration(ex);
+                return;
+            }
+            if (!ex.getMessage().contains("Missing host")) {
+                this.host.failIteration(new IllegalStateException("Unexpected exception"));
+                return;
+            }
+            this.host.completeIteration();
+        });
+
+        this.host.toggleNegativeTestMode(true);
+        this.host.getClient().send(noUriOp);
+        this.host.getClient().send(noHostOp);
+        this.host.testWait();
+        this.host.toggleNegativeTestMode(false);
     }
 
 }

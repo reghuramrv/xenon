@@ -185,10 +185,23 @@ public class FileUtils {
         }
 
         // Find prefix in JAR that contains the specified service
-        String className = clazz.getName().replace('.', '/') + ".class";
+        String className = clazz.getName().replace('.', '/');
+        className += ".class";
         URL classURL = clazz.getClassLoader().getResource(className);
+
         if (classURL == null) {
-            throw new RuntimeException("Expected to find class resource for specified class");
+            // handle runtime-generated classes not found in a jar
+            // still not perfect but doesn't break anything
+            int i = className.lastIndexOf('$');
+            if (i > 0) {
+                className = className.substring(0, i);
+                className += ".class";
+                classURL = clazz.getClassLoader().getResource(className);
+            }
+
+            if (classURL == null) {
+                throw new RuntimeException("Expected to find class resource for specified class");
+            }
         }
 
         if (!classURL.getProtocol().equals("jar")) {
@@ -256,11 +269,15 @@ public class FileUtils {
 
     private static List<File> findFiles(Path rootPath, Set<String> fileNames, List<File> files,
             boolean isExactMatch) {
-
         DirectoryStream.Filter<Path> filter = (file) -> {
             if (file.toFile().isDirectory()) {
                 return true;
             }
+
+            if (fileNames.isEmpty()) {
+                return true;
+            }
+
             String thisFileName = file.getFileName().toString();
             if (fileNames.contains(thisFileName)) {
                 return true;
@@ -389,7 +406,7 @@ public class FileUtils {
     }
 
     public static String getContentType(URI uri) {
-        String mediaType = null;
+        String mediaType;
         String uriPathLower = uri.getPath().toLowerCase();
         if (uriPathLower.endsWith("css")) {
             mediaType = Operation.MEDIA_TYPE_TEXT_CSS;
@@ -419,7 +436,7 @@ public class FileUtils {
 
         final ByteBuffer bb = ByteBuffer.allocate((int) f.length());
 
-        ch.read(bb, 0L, (Void) null,
+        ch.read(bb, 0L, null,
                 new CompletionHandler<Integer, Void>() {
 
                     @Override
@@ -495,8 +512,7 @@ public class FileUtils {
 
             String contentRangeHeader = o.getResponseHeader(Operation.CONTENT_RANGE_HEADER);
             if (contentRangeHeader == null) {
-                // done
-                get.complete();
+                // done, get operation will be completed by writeBody() above
                 return;
             }
 
@@ -556,7 +572,8 @@ public class FileUtils {
 
         byte[] b = (byte[]) o.getBodyRaw();
         if (b == null || b.length == 0) {
-            throw new IllegalStateException("no data");
+            parentOp.fail(new IllegalStateException("no data"));
+            return;
         }
 
         final ByteBuffer buf = ByteBuffer.wrap(b);
@@ -730,12 +747,16 @@ public class FileUtils {
                     // Copy bytes
                     out.write(buffer, 0, bytes_read);
                 }
-                in.close(); // Close input stream
+                try {
+                    in.close();
+                } catch (IOException ignore) {
+                }
             }
-        } catch (Exception e) {
-            throw e;
         } finally {
-            out.close();
+            try {
+                out.close();
+            } catch (IOException ignore) {
+            }
         }
 
         Logger.getAnonymousLogger().info(
@@ -789,7 +810,7 @@ public class FileUtils {
     public static String md5sum(File f) throws Exception {
         MessageDigest md = MessageDigest.getInstance("MD5");
         byte[] bytes = new byte[1 << 13];
-        int numBytes = 0;
+        int numBytes;
         try (InputStream is = Files.newInputStream(f.toPath())) {
             while ((numBytes = is.read(bytes)) != -1) {
                 md.update(bytes, 0, numBytes);

@@ -29,6 +29,9 @@ import com.vmware.xenon.services.common.NodeState;
  */
 public interface NodeSelectorService extends Service {
 
+    public static final String STAT_NAME_QUEUED_REQUEST_COUNT = "queuedRequestCount";
+    public static final String STAT_NAME_SYNCHRONIZATION_COUNT = "synchronizationCount";
+
     /**
      * Request to select one or more nodes from the available nodes in the node group, and optionally
      * forward the request
@@ -81,21 +84,29 @@ public interface NodeSelectorService extends Service {
     public class SelectOwnerResponse {
         public String key;
         public String ownerNodeId;
-        public URI ownerNodeReference;
+        public URI ownerNodeGroupReference;
         public boolean isLocalHostOwner;
+
+        /**
+         * Number of nodes eligible and available for selection
+         */
+        public int availableNodeCount;
 
         /**
          * All nodes eligible for the supplied key
          */
         public Collection<NodeState> selectedNodes;
 
+
         public static URI buildUriToOwner(SelectOwnerResponse rsp, String path, String query) {
-            return UriUtils.buildUri(rsp.ownerNodeReference.getHost(), rsp.ownerNodeReference.getPort(), path,
+            return UriUtils.buildUri(rsp.ownerNodeGroupReference.getScheme(),
+                    rsp.ownerNodeGroupReference.getHost(), rsp.ownerNodeGroupReference.getPort(), path,
                     query);
         }
 
         public static URI buildUriToOwner(SelectOwnerResponse rsp, Operation op) {
-            return UriUtils.buildUri(rsp.ownerNodeReference.getHost(), rsp.ownerNodeReference.getPort(), op
+            return UriUtils.buildUri(rsp.ownerNodeGroupReference.getScheme(),
+                    rsp.ownerNodeGroupReference.getHost(), rsp.ownerNodeGroupReference.getPort(), op
                     .getUri().getPath(), op.getUri().getQuery());
         }
     }

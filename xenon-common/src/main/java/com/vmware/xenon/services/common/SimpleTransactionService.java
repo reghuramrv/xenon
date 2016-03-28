@@ -19,6 +19,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Predicate;
@@ -188,7 +189,7 @@ public class SimpleTransactionService extends StatefulService {
             try {
                 ClearTransactionRequest op = request
                         .getBody(ClearTransactionRequest.class);
-                if (op == null || op.kind != ClearTransactionRequest.KIND) {
+                if (op == null || !Objects.equals(op.kind, ClearTransactionRequest.KIND)) {
                     return null;
                 }
 
@@ -207,43 +208,44 @@ public class SimpleTransactionService extends StatefulService {
             String requestTransactionId = request.getTransactionId();
             String currentStateTransactionId = currentState.documentTransactionId;
 
-            // TODO: support 'multi-versioned' states: allow reading a previous state revision in case requestTransactionId is null or < currentStateTransactionId
-
             if (request.getAction() == Action.GET) {
-                if (requestTransactionId == null) { // non-transactional read
+                if (requestTransactionId == null) {
+                    // non-transactional read
                     if (currentStateTransactionId == null) {
                         return false;
                     } else {
-                        // TODO: in the future we might want to allow reading the state before the pending transaction
                         logTransactionConflict(request, currentState);
                         return true;
                     }
-                } else { // transactional read
+                } else {
+                    // transactional read
                     if (currentStateTransactionId == null) {
-                        logTransactionUpdate(request, currentState);
+                        logTransactionUpdate(buildLogTransactionUpdateMsg(request, currentState));
                         currentState.documentTransactionId = requestTransactionId;
                         return false;
                     } else {
                         if (requestTransactionId.equals(currentStateTransactionId)) {
                             return false;
                         } else {
-                            // TODO: in the future we might want to allow reading a previous state if requestTransactionId < currentStateTransactionId
                             logTransactionConflict(request, currentState);
                             return true;
                         }
                     }
                 }
             } else {
-                if (requestTransactionId == null) { // non-transactional write
-                    if (currentStateTransactionId == null || request.hasPragmaDirective(PRAGMA_DIRECTIVE_DELETE_ON_TRANSACTION_END)) {
+                if (requestTransactionId == null) {
+                    // non-transactional write
+                    if (currentStateTransactionId == null ||
+                            request.hasPragmaDirective(PRAGMA_DIRECTIVE_DELETE_ON_TRANSACTION_END)) {
                         return false;
                     } else {
                         logTransactionConflict(request, currentState);
                         return true;
                     }
-                } else { // transactional write
+                } else {
+                    // transactional write
                     if (currentStateTransactionId == null) {
-                        logTransactionUpdate(request, currentState);
+                        logTransactionUpdate(buildLogTransactionUpdateMsg(request, currentState));
                         currentState.documentTransactionId = requestTransactionId;
                         return false;
                     } else {
@@ -267,12 +269,14 @@ public class SimpleTransactionService extends StatefulService {
             }
 
             if (!request.getTransactionId().equals(currentState.documentTransactionId)) {
-                String error = String.format(
-                        "Request to clear transaction %s from service %s but current transaction is: %s",
-                        request.getTransactionId(), this.service.getSelfLink(),
-                        currentState.documentTransactionId);
-                this.service.getHost().log(Level.WARNING, error);
-                request.fail(new IllegalStateException(error));
+                if (clearTransactionRequest.transactionOutcome == TransactionOutcome.COMMIT) {
+                    String warning = String.format(
+                            "Request to clear transaction %s from service %s but current transaction is: %s",
+                            request.getTransactionId(), this.service.getSelfLink(),
+                            currentState.documentTransactionId);
+                    this.service.getHost().log(Level.WARNING, warning);
+                }
+                request.complete();
                 return;
             }
 
@@ -294,7 +298,8 @@ public class SimpleTransactionService extends StatefulService {
                     ServiceDocument previousState = o.getBody(currentState.getClass());
                     this.service.getHost().log(Level.INFO,
                             "Aborting transaction %s on service %s, current version %d, restoring version %d",
-                            request.getTransactionId(), this.service.getSelfLink(), currentState.documentVersion, clearTransactionRequest.originalVersion);
+                            request.getTransactionId(), this.service.getSelfLink(),
+                            currentState.documentVersion, clearTransactionRequest.originalVersion);
                     previousState.documentTransactionId = null;
                     this.service.setState(request, previousState);
                     request.complete();
@@ -310,9 +315,10 @@ public class SimpleTransactionService extends StatefulService {
         private void handleEnrollInTransaction(Operation request) {
             String serviceSelfLink = this.service.getSelfLink();
             if (Action.POST == request.getAction()) {
-                ServiceDocument body = request.getBody(ServiceDocument.class);
+                ServiceDocument body = request.getBody(this.service.getStateType());
                 if (body.documentSelfLink == null) {
                     body.documentSelfLink = UUID.randomUUID().toString();
+                    request.setBody(body);
                 }
                 serviceSelfLink = UriUtils.buildUriPath(serviceSelfLink, body.documentSelfLink);
             }
@@ -345,14 +351,16 @@ public class SimpleTransactionService extends StatefulService {
                             currentState.documentTransactionId);
         }
 
-        private void logTransactionUpdate(Operation request, ServiceDocument currentState) {
-            this.service
-                    .getHost()
-                    .log(Level.INFO,
-                            "Transaction %s set on service %s: operation: %s, previous transaction: %s",
-                            request.getTransactionId(), this.service.getSelfLink(),
-                            request.getAction(),
-                            currentState.documentTransactionId);
+        private String buildLogTransactionUpdateMsg(Operation request, ServiceDocument currentState) {
+            return String.format("Transaction %s set on service %s: operation: %s, previous transaction: %s",
+                    request.getTransactionId(),
+                    this.service.getSelfLink(),
+                    request.getAction(),
+                    currentState.documentTransactionId);
+        }
+
+        private void logTransactionUpdate(String msg) {
+            this.service.getHost().log(Level.INFO, msg);
         }
 
     }
@@ -379,13 +387,13 @@ public class SimpleTransactionService extends StatefulService {
         RequestRouter myRouter = new RequestRouter();
         myRouter.register(
                 Action.PATCH,
-                new RequestRouter.RequestBodyMatcher<EnrollRequest>(
+                new RequestRouter.RequestBodyMatcher<>(
                         EnrollRequest.class, "kind",
                         EnrollRequest.KIND),
                 this::handlePatchForEnroll, "Register service");
         myRouter.register(
                 Action.PATCH,
-                new RequestRouter.RequestBodyMatcher<EndTransactionRequest>(
+                new RequestRouter.RequestBodyMatcher<>(
                         EndTransactionRequest.class, "kind",
                         EndTransactionRequest.KIND),
                 this::handlePatchForEndTransaction, "Commit or abort transaction");
@@ -534,7 +542,7 @@ public class SimpleTransactionService extends StatefulService {
             return null;
         }
 
-        Collection<Operation> requests = new ArrayList<Operation>(
+        Collection<Operation> requests = new ArrayList<>(
                 currentState.enrolledServices.size());
         for (String serviceSelfLink : currentState.enrolledServices.keySet()) {
             EnrollmentInfo enrollmentInfo = currentState.enrolledServices.get(serviceSelfLink);
@@ -559,7 +567,7 @@ public class SimpleTransactionService extends StatefulService {
             return null;
         }
 
-        Collection<Operation> requests = new ArrayList<Operation>(servicesToBDeleted.size());
+        Collection<Operation> requests = new ArrayList<>(servicesToBDeleted.size());
         for (String serviceSelfLink : servicesToBDeleted) {
             Operation op = Operation.createDelete(UriUtils.buildUri(getHost(), serviceSelfLink));
             op.addPragmaDirective(PRAGMA_DIRECTIVE_DELETE_ON_TRANSACTION_END);

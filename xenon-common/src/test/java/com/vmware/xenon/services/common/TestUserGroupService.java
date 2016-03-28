@@ -16,7 +16,10 @@ package com.vmware.xenon.services.common;
 import static org.junit.Assert.assertEquals;
 
 import java.net.URI;
+import java.util.UUID;
 
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 
 import com.vmware.xenon.common.BasicReusableHostTestCase;
@@ -26,6 +29,17 @@ import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.UserGroupService.UserGroupState;
 
 public class TestUserGroupService extends BasicReusableHostTestCase {
+    private URI factoryUri;
+
+    @Before
+    public void setUp() {
+        this.factoryUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
+    }
+
+    @After
+    public void cleanUp() throws Throwable {
+        this.host.deleteAllChildServices(this.factoryUri);
+    }
 
     @Test
     public void testFactoryPost() throws Throwable {
@@ -36,8 +50,7 @@ public class TestUserGroupService extends BasicReusableHostTestCase {
 
         final UserGroupState[] outState = new UserGroupState[1];
 
-        URI uri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
-        Operation op = Operation.createPost(uri)
+        Operation op = Operation.createPost(this.factoryUri)
                 .setBody(state)
                 .setCompletion((o, e) -> {
                     if (e != null) {
@@ -58,6 +71,41 @@ public class TestUserGroupService extends BasicReusableHostTestCase {
     }
 
     @Test
+    public void testFactoryIdempotentPost() throws Throwable {
+        UserGroupState state = new UserGroupState();
+        state.documentSelfLink = UUID.randomUUID().toString();
+        state.query = new Query();
+        state.query.setTermPropertyName("name");
+        state.query.setTermMatchValue("value");
+
+        UserGroupState responseState = (UserGroupState) this.host.verifyPost(UserGroupState.class,
+                ServiceUriPaths.CORE_AUTHZ_USER_GROUPS,
+                state,
+                Operation.STATUS_CODE_OK);
+
+        assertEquals(state.query.term.propertyName, responseState.query.term.propertyName);
+        assertEquals(state.query.term.matchValue, responseState.query.term.matchValue);
+
+        responseState = (UserGroupState) this.host.verifyPost(UserGroupState.class,
+                ServiceUriPaths.CORE_AUTHZ_USER_GROUPS,
+                state,
+                Operation.STATUS_CODE_NOT_MODIFIED);
+
+        assertEquals(state.query.term.propertyName, responseState.query.term.propertyName);
+        assertEquals(state.query.term.matchValue, responseState.query.term.matchValue);
+
+        state.query.setTermMatchValue("valueModified");
+
+        responseState = (UserGroupState) this.host.verifyPost(UserGroupState.class,
+                ServiceUriPaths.CORE_AUTHZ_USER_GROUPS,
+                state,
+                Operation.STATUS_CODE_OK);
+
+        assertEquals(state.query.term.propertyName, responseState.query.term.propertyName);
+        assertEquals(state.query.term.matchValue, responseState.query.term.matchValue);
+    }
+
+    @Test
     public void testFactoryPostFailure() throws Throwable {
         UserGroupState state = new UserGroupState();
         state.query = null;
@@ -65,8 +113,7 @@ public class TestUserGroupService extends BasicReusableHostTestCase {
         Operation[] outOp = new Operation[1];
         Throwable[] outEx = new Throwable[1];
 
-        URI uri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
-        Operation op = Operation.createPost(uri)
+        Operation op = Operation.createPost(this.factoryUri)
                 .setBody(state)
                 .setCompletion((o, e) -> {
                     if (e != null) {

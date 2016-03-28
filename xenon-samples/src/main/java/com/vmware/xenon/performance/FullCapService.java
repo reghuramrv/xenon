@@ -13,32 +13,16 @@
 
 package com.vmware.xenon.performance;
 
-import java.util.ArrayList;
-import java.util.List;
-
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.StatefulService;
 
 public class FullCapService extends StatefulService {
-    public static class FullCapFactoryService extends FactoryService {
-        public static String SELF_LINK = PerfUtils.BENCH + "/full-caps";
-        public List<ServiceOption> caps = new ArrayList<>();
+    public static String FACTORY_LINK = PerfUtils.BENCH + "/full-caps";
 
-        public FullCapFactoryService(Class <? extends ServiceDocument> stateClass) {
-            super(stateClass);
-        }
-
-        public static FullCapFactoryService create(Class<? extends ServiceDocument> stateClass) {
-            FullCapFactoryService gfs = new FullCapFactoryService(stateClass);
-            return gfs;
-        }
-
-        @Override
-        public Service createServiceInstance() throws Throwable {
-            return new FullCapService(this.stateType);
-        }
+    public static Service createFactory(Class<? extends ServiceDocument> stateClass) {
+        return FactoryService.create(FullCapService.class, stateClass);
     }
 
     public FullCapService(Class <? extends ServiceDocument> stateClass) {
@@ -46,7 +30,6 @@ public class FullCapService extends StatefulService {
         toggleOption(ServiceOption.PERSISTENCE, true);
         toggleOption(ServiceOption.REPLICATION, true);
         toggleOption(ServiceOption.OWNER_SELECTION, true);
-        toggleOption(ServiceOption.ENFORCE_QUORUM, true);
         toggleOption(ServiceOption.INSTRUMENTATION, true);
         toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
     }

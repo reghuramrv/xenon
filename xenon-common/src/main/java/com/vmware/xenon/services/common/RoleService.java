@@ -15,12 +15,21 @@ package com.vmware.xenon.services.common;
 
 import java.util.Set;
 
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.Utils;
 
 public class RoleService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_ROLES;
+
+    public static Service createFactory() {
+        return FactoryService.createIdempotent(RoleService.class);
+    }
+
     public enum Policy {
         ALLOW,
         DENY,
@@ -59,6 +68,29 @@ public class RoleService extends StatefulService {
         RoleState state = op.getBody(RoleState.class);
         if (!validate(op, state)) {
             return;
+        }
+
+        op.complete();
+    }
+
+    @Override
+    public void handlePut(Operation op) {
+        if (!op.hasBody()) {
+            op.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+
+        RoleState newState = op.getBody(RoleState.class);
+        if (!validate(op, newState)) {
+            return;
+        }
+
+        RoleState currentState = getState(op);
+        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        if (ServiceDocument.equals(documentDescription, currentState, newState)) {
+            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
+        } else {
+            setState(op, newState);
         }
 
         op.complete();

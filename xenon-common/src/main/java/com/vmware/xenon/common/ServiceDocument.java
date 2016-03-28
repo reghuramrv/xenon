@@ -21,6 +21,8 @@ import java.lang.annotation.Target;
 import java.util.EnumSet;
 
 import com.vmware.xenon.common.Service.Action;
+import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
+import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 
 /**
  * Base implementation class for Service documents. A service document is a PODO (data only object,
@@ -39,22 +41,25 @@ public class ServiceDocument {
     }
 
     /**
-     * Specifies {@link com.vmware.xenon.common.ServiceDocument} field usage option. This annotation is repeatable.
+     * Specifies {@link com.vmware.xenon.common.ServiceDocument} field usage option.
+     * This annotation is repeatable.
+     * Use {@link PropertyOptions} instead.
      *
-     * @see com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption
+     * @see PropertyUsageOption
      */
     @Retention(RetentionPolicy.RUNTIME)
-    @Repeatable(value = UsageOptions.class)
+    @Repeatable(UsageOptions.class)
     @Target(ElementType.FIELD)
     public @interface UsageOption {
         /**
          * Field usage option to apply.
          */
-        ServiceDocumentDescription.PropertyUsageOption option();
+        PropertyUsageOption option();
     }
 
     /**
      * This annotation defines field usage options.
+     * Use {@link PropertyOptions} instead.
      */
     @Retention(RetentionPolicy.RUNTIME)
     @Target(ElementType.FIELD)
@@ -63,6 +68,45 @@ public class ServiceDocument {
          * Field usage options to apply.
          */
         UsageOption[] value();
+    }
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.FIELD)
+    public @interface PropertyOptions {
+        /**
+         * Specifies how a field is used
+         * @return
+         */
+        PropertyUsageOption[] usage() default {};
+
+        /**
+         * Specifies how a filed should be indexed.
+         * @return
+         */
+        PropertyIndexingOption[] indexing() default {};
+    }
+
+    /**
+     * Limits about a {@link ServiceDocument}.
+     * In the rare case that the same ServiceDocument type is used to
+     * represent the state of different services and different limits are
+     * needed then {@link Service#getDocumentTemplate()} can still be used to
+     * override the values.
+     */
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.TYPE)
+    public @interface IndexingParameters {
+        /**
+         * Max size of a serialized document
+         * @return
+         */
+        int serializedStateSize() default ServiceDocumentDescription.DEFAULT_SERIALIZED_STATE_LIMIT;
+
+        /**
+         * Max versions to keep for a document.
+         * @return
+         */
+        int versionRetention() default ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT;
     }
 
     /**
@@ -325,7 +369,60 @@ public class ServiceDocument {
         }
     }
 
-    public static boolean isBuiltInIndexedDocumentField(String name) {
+    /**
+     * Returns whether or not the {@code name} should support auto merge by default or not
+     *
+     * @param name Field name
+     * @return true/false
+     *
+     * @see PropertyUsageOption#AUTO_MERGE_IF_NOT_NULL
+     * @see ServiceDocumentDescription
+     */
+    public static boolean isAutoMergeEnabledByDefaultForField(String name) {
+        switch (name) {
+        case ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /**
+     * Returns whether or not the {@code name} is a built-in field that should be excluded from
+     * the service document signature computation.
+     *
+     * @see PropertyIndexingOption#EXCLUDE_FROM_SIGNATURE
+     *
+     * @param name Field name
+     * @return true/false
+     */
+    public static boolean isBuiltInSignatureExcludedDocumentField(String name) {
+        switch (name) {
+        case ServiceDocument.FIELD_NAME_KIND:
+        case ServiceDocument.FIELD_NAME_OWNER:
+        case ServiceDocument.FIELD_NAME_SOURCE_LINK:
+        case ServiceDocument.FIELD_NAME_VERSION:
+        case ServiceDocument.FIELD_NAME_EPOCH:
+        case ServiceDocument.FIELD_NAME_UPDATE_TIME_MICROS:
+        case ServiceDocument.FIELD_NAME_SELF_LINK:
+        case ServiceDocument.FIELD_NAME_AUTH_PRINCIPAL_LINK:
+        case ServiceDocument.FIELD_NAME_TRANSACTION_ID:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /**
+     * Returns whether or not the {@code name} is a built-in field that should be
+     * for infrastructure use only.
+     *
+     * @see PropertyUsageOption#INFRASTRUCTURE
+     *
+     * @param name Field name
+     * @return true/false
+     */
+    public static boolean isBuiltInInfrastructureDocumentField(String name) {
         switch (name) {
         case ServiceDocument.FIELD_NAME_KIND:
         case ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS:
@@ -343,6 +440,12 @@ public class ServiceDocument {
         }
     }
 
+    /**
+     * Returns whether or not the {@code name} is a built-in field that should not be indexed.
+     *
+     * @param name Field name
+     * @return true/false
+     */
     public static boolean isBuiltInNonIndexedDocumentField(String name) {
         switch (name) {
         case ServiceDocument.FIELD_NAME_DESCRIPTION:

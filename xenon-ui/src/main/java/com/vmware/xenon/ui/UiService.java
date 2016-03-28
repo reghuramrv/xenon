@@ -13,35 +13,9 @@
 
 package com.vmware.xenon.ui;
 
-import com.vmware.xenon.common.Operation;
-import com.vmware.xenon.common.StatelessService;
-import com.vmware.xenon.common.UriUtils;
-import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.UiContentService;
 
-public class UiService extends StatelessService {
+public class UiService extends UiContentService {
     public static final String SELF_LINK = ServiceUriPaths.UI_SERVICE_CORE_PATH;
-
-    public UiService() {
-        super();
-        toggleOption(ServiceOption.HTML_USER_INTERFACE, true);
-    }
-
-    @Override
-    public void handleGet(Operation get) {
-        String serviceUiResourcePath = Utils.buildUiResourceUriPrefixPath(this);
-        serviceUiResourcePath += "/" + ServiceUriPaths.UI_RESOURCE_DEFAULT_FILE;
-
-        Operation operation = get.clone();
-        operation.setUri(UriUtils.buildUri(getHost(), serviceUiResourcePath))
-                .setReferer(get.getReferer())
-                .setCompletion((o, e) -> {
-                    get.setBody(o.getBodyRaw())
-                            .setContentType(o.getContentType())
-                            .complete();
-                });
-
-        getHost().sendRequest(operation);
-        return;
-    }
 }

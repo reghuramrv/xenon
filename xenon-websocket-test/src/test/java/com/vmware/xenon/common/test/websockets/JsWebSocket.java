@@ -14,6 +14,7 @@
 package com.vmware.xenon.common.test.websockets;
 
 import java.net.URI;
+import java.util.Collections;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
@@ -31,6 +32,7 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
@@ -41,8 +43,8 @@ import io.netty.handler.codec.http.websocketx.WebSocketClientHandshaker;
 import io.netty.handler.codec.http.websocketx.WebSocketClientHandshakerFactory;
 import io.netty.handler.codec.http.websocketx.WebSocketFrame;
 import io.netty.handler.codec.http.websocketx.WebSocketVersion;
-import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketClientCompressionHandler;
 import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 
 import org.mozilla.javascript.Context;
@@ -53,9 +55,10 @@ import org.mozilla.javascript.annotations.JSFunction;
 import org.mozilla.javascript.annotations.JSGetter;
 import org.mozilla.javascript.annotations.JSSetter;
 
-import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.OperationContext;
 import com.vmware.xenon.common.ServiceHost;
+import com.vmware.xenon.common.http.netty.CookieJar;
+import com.vmware.xenon.services.common.authn.AuthenticationConstants;
 
 /**
  * Lightweight partial implementation of JS Websocket API
@@ -66,10 +69,13 @@ public class JsWebSocket extends ScriptableObject {
     public static final String WS_SCHEME = "ws";
     public static final String WSS_SCHEME = "wss";
     public static final String CLASS_NAME = "WebSocket";
+    public static final String TYPE = "type";
+    public static final String ERROR = "error";
 
     private EventLoopGroup group;
     private Channel channel;
     private Function onopen;
+    private Function onerror;
     private Function onmessage;
     private Function onclose;
 
@@ -82,10 +88,22 @@ public class JsWebSocket extends ScriptableObject {
         }
 
         @Override
-        protected void messageReceived(ChannelHandlerContext ctx, Object msg) throws Exception {
+        protected void channelRead0(ChannelHandlerContext ctx, Object msg) throws Exception {
             if (!this.handshaker.isHandshakeComplete()) {
-                this.handshaker.finishHandshake(ctx.channel(), (FullHttpResponse) msg);
-                this.handshakeFuture.setSuccess();
+                try {
+                    this.handshaker.finishHandshake(ctx.channel(), (FullHttpResponse) msg);
+                    this.handshakeFuture.setSuccess();
+                } catch (Exception e) {
+                    if (JsWebSocket.this.onerror != null) {
+                        NativeObject event = new NativeObject();
+                        event.defineProperty(TYPE, ERROR, 0);
+                        JsExecutor.executeSynchronously(() ->
+                                JsWebSocket.this.onerror.call(Context.getCurrentContext(),
+                                        getParentScope(),
+                                        JsWebSocket.this,
+                                        new Object[] { event }));
+                    }
+                }
                 return;
             }
             if (msg instanceof WebSocketFrame) {
@@ -179,7 +197,9 @@ public class JsWebSocket extends ScriptableObject {
         final boolean ssl = WSS_SCHEME.equalsIgnoreCase(scheme);
         final SslContext sslCtx;
         if (ssl) {
-            sslCtx = SslContext.newClientContext(InsecureTrustManagerFactory.INSTANCE);
+            sslCtx = SslContextBuilder.forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .build();
         } else {
             sslCtx = null;
         }
@@ -192,7 +212,8 @@ public class JsWebSocket extends ScriptableObject {
         DefaultHttpHeaders headers = new DefaultHttpHeaders();
         if (OperationContext.getAuthorizationContext() != null
                 && OperationContext.getAuthorizationContext().getToken() != null) {
-            headers.add(Operation.REQUEST_AUTH_TOKEN_HEADER, OperationContext.getAuthorizationContext().getToken());
+            headers.add(HttpHeaderNames.COOKIE, CookieJar.encodeCookies(Collections.singletonMap(
+                    AuthenticationConstants.XENON_JWT_COOKIE, OperationContext.getAuthorizationContext().getToken())));
         }
         final WebSocketClientHandler handler = new WebSocketClientHandler(
                 WebSocketClientHandshakerFactory.newHandshaker(
@@ -210,7 +231,6 @@ public class JsWebSocket extends ScriptableObject {
                         p.addLast(
                                 new HttpClientCodec(),
                                 new HttpObjectAggregator(8192),
-                                new WebSocketClientCompressionHandler(),
                                 handler);
                     }
                 });
@@ -285,6 +305,16 @@ public class JsWebSocket extends ScriptableObject {
     @JSSetter
     public void setOnopen(Function onopen) {
         this.onopen = onopen;
+    }
+
+    @JSGetter
+    public Function getOnerror() {
+        return this.onerror;
+    }
+
+    @JSSetter
+    public void setOnerror(Function onerror) {
+        this.onerror = onerror;
     }
 
     @Override

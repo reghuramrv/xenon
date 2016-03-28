@@ -19,7 +19,6 @@ import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
 
-import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
@@ -148,7 +147,6 @@ public class QueryTask extends ServiceDocument {
          */
         public Long expectedResultCount;
         public EnumSet<QueryOption> options = EnumSet.noneOf(QueryOption.class);
-        public ServiceOption targetIndex;
 
         /**
          * Infrastructure use only
@@ -235,17 +233,6 @@ public class QueryTask extends ServiceDocument {
                     .of(QueryTask.QuerySpecification.QueryOption.EXPAND_CONTENT);
             return queryTask;
         }
-    }
-
-    public static class PostProcessingSpecification {
-        public enum GroupOperation {
-            SUM, AVG, MIN
-        }
-
-        /**
-         * Query term that picks the property that the group operation will run over its values
-         */
-        public QueryTerm selectionTerm;
     }
 
     public static class NumericRange<T extends Number & Comparable<? super T>> {
@@ -359,7 +346,7 @@ public class QueryTask extends ServiceDocument {
         }
 
         /**
-         * Builder class for constructing {@linkplain Query DCP queries}.
+         * Builder class for constructing {@linkplain Query Xenon queries}.
          */
         public static final class Builder {
             private final Query query;
@@ -594,6 +581,42 @@ public class QueryTask extends ServiceDocument {
             }
 
             /**
+             * Set the term.
+             *
+             * This is only appropriate if you need to query on exactly a single clause and
+             * it is not compatible with the using multiple boolean clauses, as addFieldClause does.
+             *
+             * This assumes you are matching with MatchType.TERM
+             *
+             * @param fieldName the top level field name
+             * @param fieldValue the field value to match
+             * @return
+             */
+            public Builder setTerm(String fieldName, String fieldValue) {
+                return setTerm(fieldName, fieldValue, MatchType.TERM);
+            }
+
+            /**
+             * Set the term.
+             *
+             * This is only appropriate if you need to query on exactly a single clause and
+             * it is not compatible with the using multiple boolean clauses, as addFieldClause does.
+             *
+             * This assumes you are matching with MatchType.TERM
+             *
+             * @param fieldName the top level field name
+             * @param fieldValue the field value to match
+             * @return
+             */
+            public Builder setTerm(String fieldName, String fieldValue, MatchType matchType) {
+                this.query.term = new QueryTerm();
+                this.query.term.propertyName = fieldName;
+                this.query.term.matchValue = fieldValue;
+                this.query.term.matchType = matchType;
+                return this;
+            }
+
+            /**
              * Add a clause which matches a {@link NumericRange} for a given numeric field.
              * @param fieldName the top level numeric field name.
              * @param range a numeric range.
@@ -723,12 +746,6 @@ public class QueryTask extends ServiceDocument {
      */
     public QuerySpecification querySpec;
 
-    /**
-     * Describes any post processing on the query results (such summations, averages) The generation
-     * of a time series is also a post processing
-     */
-    public PostProcessingSpecification postProcessingSpec;
-
     public ServiceDocumentQueryResult results;
 
     /**
@@ -736,6 +753,11 @@ public class QueryTask extends ServiceDocument {
      * document index.
      */
     public String indexLink = ServiceUriPaths.CORE_DOCUMENT_INDEX;
+
+    /**
+     * The node selector to use when {@link QueryOption.BROADCAST} is set
+     */
+    public String nodeSelectorLink = ServiceUriPaths.DEFAULT_NODE_SELECTOR;
 
     public static QueryTask create(QuerySpecification q) {
         QueryTask qt = new QueryTask();
@@ -866,16 +888,6 @@ public class QueryTask extends ServiceDocument {
          */
         public Builder setIndexLink(String indexLink) {
             this.queryTask.indexLink = indexLink;
-            return this;
-        }
-
-        /**
-         * Set the {@link com.vmware.xenon.services.common.QueryTask.PostProcessingSpecification} which will be executed on the query results.
-         * @param spec the post processing specification.
-         * @return a reference to this object.
-         */
-        public Builder setPostProcessingSpec(PostProcessingSpecification spec) {
-            this.queryTask.postProcessingSpec = spec;
             return this;
         }
 

@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
@@ -29,6 +30,16 @@ import com.vmware.xenon.common.Utils;
  * Example service
  */
 public class ExampleService extends StatefulService {
+
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/examples";
+
+    /**
+     * Create a default factory service that starts instances of this service on POST.
+     * This method is optional, {@code FactoryService.create} can be used directly
+     */
+    public static FactoryService createFactory() {
+        return FactoryService.createIdempotent(ExampleService.class);
+    }
 
     public static class ExampleServiceState extends ServiceDocument {
         public static final String FIELD_NAME_KEY_VALUES = "keyValues";
@@ -68,14 +79,13 @@ public class ExampleService extends StatefulService {
             startPost.fail(new IllegalArgumentException("name is required"));
             return;
         }
-        logFine("Initial state is %s", Utils.toJsonHtml(s));
 
         startPost.complete();
     }
 
     @Override
     public void handlePut(Operation put) {
-        ExampleServiceState newState = put.getBody(ExampleServiceState.class);
+        ExampleServiceState newState = getBody(put);
         ExampleServiceState currentState = getState(put);
 
         // example of structural validation: check if the new state is acceptable
@@ -102,11 +112,14 @@ public class ExampleService extends StatefulService {
         // A DCP service handler is state-less: Everything it needs is provided as part of the
         // of the operation. The body and latest state associated with the service are retrieved
         // below.
-        ExampleServiceState body = update.getBody(ExampleServiceState.class);
+        ExampleServiceState body = getBody(update);
         ExampleServiceState currentState = getState(update);
+
+        // use helper that will merge automatically current state, with state supplied in body.
+        // Note the usage option PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL has been set on the
+        // "name" field.
         boolean hasStateChanged = Utils.mergeWithState(getDocumentTemplate().documentDescription,
                 currentState, body);
-        // update state
 
         updateCounter(body, currentState, hasStateChanged);
 

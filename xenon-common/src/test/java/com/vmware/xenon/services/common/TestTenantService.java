@@ -39,7 +39,7 @@ public class TestTenantService extends BasicReusableHostTestCase {
 
     @Before
     public void setUp() throws Exception {
-        this.factoryURI = UriUtils.buildUri(this.host, TenantFactoryService.class);
+        this.factoryURI = UriUtils.buildFactoryUri(this.host, TenantService.class);
     }
 
     @After
@@ -61,7 +61,6 @@ public class TestTenantService extends BasicReusableHostTestCase {
             assertEquals(state.name, initialState.name);
             assertEquals(state.parentLink, initialState.parentLink);
             assertNotNull(state.id);
-            assertTrue(state.documentSelfLink.endsWith(state.id));
         }
     }
 
@@ -74,8 +73,46 @@ public class TestTenantService extends BasicReusableHostTestCase {
         for (Object s : res.documents.values()) {
             TenantService.TenantState state = Utils.fromJson(s, TenantService.TenantState.class);
             assertNotNull(state.id);
-            assertTrue(state.documentSelfLink.endsWith(state.id));
         }
+    }
+
+    @Test
+    public void testFactoryIdempotentPost() throws Throwable {
+        TenantService.TenantState state = new TenantService.TenantState();
+        state.documentSelfLink = UUID.randomUUID().toString();
+        state.id = UUID.randomUUID().toString();
+        state.name = UUID.randomUUID().toString();
+        state.parentLink = UUID.randomUUID().toString();
+
+        TenantService.TenantState responseState =
+                (TenantService.TenantState) this.host.verifyPost(TenantService.TenantState.class,
+                TenantService.FACTORY_LINK,
+                state,
+                Operation.STATUS_CODE_OK);
+
+        assertEquals(state.id, responseState.id);
+        assertEquals(state.name, responseState.name);
+        assertEquals(state.parentLink, responseState.parentLink);
+
+        responseState = (TenantService.TenantState) this.host.verifyPost(TenantService.TenantState.class,
+                TenantService.FACTORY_LINK,
+                state,
+                Operation.STATUS_CODE_NOT_MODIFIED);
+
+        assertEquals(state.id, responseState.id);
+        assertEquals(state.name, responseState.name);
+        assertEquals(state.parentLink, responseState.parentLink);
+
+        state.name = UUID.randomUUID().toString();
+
+        responseState = (TenantService.TenantState) this.host.verifyPost(TenantService.TenantState.class,
+                TenantService.FACTORY_LINK,
+                state,
+                Operation.STATUS_CODE_OK);
+
+        assertEquals(state.id, responseState.id);
+        assertEquals(state.name, responseState.name);
+        assertEquals(state.parentLink, responseState.parentLink);
     }
 
     @Test

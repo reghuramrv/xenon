@@ -21,6 +21,8 @@ import org.junit.rules.TestWatcher;
 import org.junit.runner.Description;
 
 import com.vmware.xenon.common.CommandLineArgumentParser;
+import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.VerificationHost;
 
 /**
@@ -44,9 +46,10 @@ public class BasicTestCase {
         @Override
         protected void before() throws Throwable {
             CommandLineArgumentParser.parseFromProperties(BasicTestCase.this);
-            BasicTestCase.this.host = VerificationHost.create(0);
+            BasicTestCase.this.host = createHost();
             CommandLineArgumentParser.parseFromProperties(BasicTestCase.this.host);
             BasicTestCase.this.host.setStressTest(BasicTestCase.this.isStressTest);
+            initializeHost(BasicTestCase.this.host);
             beforeHostStart(BasicTestCase.this.host);
             BasicTestCase.this.host.start();
         }
@@ -64,10 +67,37 @@ public class BasicTestCase {
         }
     };
 
-    public void beforeHostStart(VerificationHost host) {
+    public VerificationHost createHost() throws Exception {
+        return VerificationHost.create();
+    }
+
+    public void initializeHost(VerificationHost host) throws Exception {
+        ServiceHost.Arguments args = VerificationHost.buildDefaultServiceHostArguments(0);
+        VerificationHost.initialize(host, args);
+    }
+
+    public void beforeHostStart(VerificationHost host) throws Exception {
+
     }
 
     public void beforeHostTearDown(VerificationHost host) {
+    }
+
+    public TestContext testCreate(int c) {
+        return this.host.testCreate(c);
+    }
+
+    public void testWait(TestContext ctx) throws Throwable {
+        ctx.await();
+    }
+
+    /**
+     * @see VerificationHost#getSafeHandler(CompletionHandler)
+     * @param handler
+     * @return
+     */
+    public CompletionHandler getSafeHandler(CompletionHandler handler) {
+        return this.host.getSafeHandler(handler);
     }
 
     @Rule

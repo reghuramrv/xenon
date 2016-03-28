@@ -16,16 +16,30 @@ package com.vmware.xenon.services.common;
 import static org.junit.Assert.assertEquals;
 
 import java.net.URI;
+import java.util.UUID;
 
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 
-import com.vmware.xenon.common.BasicTestCase;
+import com.vmware.xenon.common.BasicReusableHostTestCase;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.ResourceGroupService.ResourceGroupState;
 
-public class TestResourceGroupService extends BasicTestCase {
+public class TestResourceGroupService extends BasicReusableHostTestCase {
+    private URI factoryUri;
+
+    @Before
+    public void setUp() {
+        this.factoryUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
+    }
+
+    @After
+    public void cleanUp() throws Throwable {
+        this.host.deleteAllChildServices(this.factoryUri);
+    }
 
     @Test
     public void testFactoryPost() throws Throwable {
@@ -52,6 +66,41 @@ public class TestResourceGroupService extends BasicTestCase {
     }
 
     @Test
+    public void testFactoryIdempotentPost() throws Throwable {
+        ResourceGroupState state = new ResourceGroupState();
+        state.documentSelfLink = UUID.randomUUID().toString();
+        state.query = new Query();
+        state.query.setTermPropertyName("name");
+        state.query.setTermMatchValue("value");
+
+        ResourceGroupState responseState = (ResourceGroupState) this.host.verifyPost(ResourceGroupState.class,
+                ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS,
+                state,
+                Operation.STATUS_CODE_OK);
+
+        assertEquals(state.query.term.propertyName, responseState.query.term.propertyName);
+        assertEquals(state.query.term.matchValue, responseState.query.term.matchValue);
+
+        responseState = (ResourceGroupState) this.host.verifyPost(ResourceGroupState.class,
+                ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS,
+                state,
+                Operation.STATUS_CODE_NOT_MODIFIED);
+
+        assertEquals(state.query.term.propertyName, responseState.query.term.propertyName);
+        assertEquals(state.query.term.matchValue, responseState.query.term.matchValue);
+
+        state.query.setTermMatchValue("valueModified");
+
+        responseState = (ResourceGroupState) this.host.verifyPost(ResourceGroupState.class,
+                ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS,
+                state,
+                Operation.STATUS_CODE_OK);
+
+        assertEquals(state.query.term.propertyName, responseState.query.term.propertyName);
+        assertEquals(state.query.term.matchValue, responseState.query.term.matchValue);
+    }
+
+    @Test
     public void testFactoryPostFailure() throws Throwable {
         ResourceGroupState state = new ResourceGroupState();
         state.query = null;
@@ -59,8 +108,7 @@ public class TestResourceGroupService extends BasicTestCase {
         Operation[] outOp = new Operation[1];
         Throwable[] outEx = new Throwable[1];
 
-        URI uri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
-        Operation op = Operation.createPost(uri)
+        Operation op = Operation.createPost(this.factoryUri)
                 .setBody(state)
                 .setCompletion((o, e) -> {
                     if (e != null) {
@@ -85,8 +133,7 @@ public class TestResourceGroupService extends BasicTestCase {
     private void postHelper(ResourceGroupState state) throws Throwable {
         ResourceGroupState[] outState = new ResourceGroupState[1];
 
-        URI uri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
-        Operation op = Operation.createPost(uri)
+        Operation op = Operation.createPost(this.factoryUri)
                 .setBody(state)
                 .setCompletion((o, e) -> {
                     if (e != null) {

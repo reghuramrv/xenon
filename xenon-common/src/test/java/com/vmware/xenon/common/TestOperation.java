@@ -25,11 +25,109 @@ import java.util.function.Consumer;
 import org.junit.Test;
 
 import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
+import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.MinimalTestService;
 
 public class TestOperation extends BasicReusableHostTestCase {
     private List<Service> services;
+
+    @Test
+    public void create() throws Throwable {
+        String link = ExampleService.FACTORY_LINK;
+        Service s = this.host.startServiceAndWait(new MinimalTestService(),
+                UUID.randomUUID().toString(), null);
+
+        Action a = Action.POST;
+        Operation op = Operation.createPost(this.host, link);
+        verifyOp(link, a, op);
+        op = Operation.createPost(s, link);
+        verifyOp(link, a, op);
+        op = Operation.createPost(s.getUri());
+        verifyOp(s.getSelfLink(), a, op);
+
+        a = Action.PATCH;
+        op = Operation.createPatch(this.host, link);
+        verifyOp(link, a, op);
+        op = Operation.createPatch(s, link);
+        verifyOp(link, a, op);
+        op = Operation.createPatch(s.getUri());
+        verifyOp(s.getSelfLink(), a, op);
+
+        a = Action.PUT;
+        op = Operation.createPut(this.host, link);
+        verifyOp(link, a, op);
+        op = Operation.createPut(s, link);
+        verifyOp(link, a, op);
+        op = Operation.createPut(s.getUri());
+        verifyOp(s.getSelfLink(), a, op);
+
+        a = Action.DELETE;
+        op = Operation.createDelete(this.host, link);
+        verifyOp(link, a, op);
+        op = Operation.createDelete(s, link);
+        verifyOp(link, a, op);
+        op = Operation.createDelete(s.getUri());
+        verifyOp(s.getSelfLink(), a, op);
+
+        a = Action.GET;
+        op = Operation.createGet(this.host, link);
+        verifyOp(link, a, op);
+        op = Operation.createGet(s, link);
+        verifyOp(link, a, op);
+        op = Operation.createGet(s.getUri());
+        verifyOp(s.getSelfLink(), a, op);
+
+        a = Action.OPTIONS;
+        op = Operation.createOptions(this.host, link);
+        verifyOp(link, a, op);
+        op = Operation.createOptions(s, link);
+        verifyOp(link, a, op);
+        op = Operation.createOptions(s.getUri());
+        verifyOp(s.getSelfLink(), a, op);
+    }
+
+    private void verifyOp(String link, Action a, Operation op) {
+        assertEquals(a, op.getAction());
+        assertEquals(link, op.getUri().getPath());
+    }
+
+    @Test
+    public void addRemovePragma() {
+        Operation op = Operation.createGet(this.host.getUri());
+        op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED);
+        assertTrue(op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED));
+
+        op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK);
+        assertTrue(op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED));
+        assertTrue(op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK));
+
+        // add a pragma that already exists
+        op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK);
+        assertTrue(op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED));
+        assertTrue(op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK));
+
+        op.removePragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK);
+        assertTrue(op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED));
+        assertTrue(!op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK));
+
+        // attempt to remove that does not exist
+        op.removePragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK);
+        assertTrue(op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED));
+        assertTrue(!op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK));
+    }
+
+    @Test
+    public void defaultFailureCompletion() {
+        Operation getToNowhere = Operation
+                .createGet(UriUtils.buildUri(this.host, "/somethingnotvalid"))
+                .setReferer(this.host.getUri())
+                .setContextId("some context");
+        // we are just making no exceptions are thrown in the context of the sendRequest call
+        this.host.sendRequest(getToNowhere);
+
+    }
 
     @Test
     public void setterValidation() {
@@ -115,7 +213,6 @@ public class TestOperation extends BasicReusableHostTestCase {
         this.host.testWait();
         this.host.toggleNegativeTestMode(false);
         assertTrue(completionCount.get() == 1);
-
     }
 
     @Test
@@ -144,6 +241,60 @@ public class TestOperation extends BasicReusableHostTestCase {
                     }
                     this.host.completeIteration();
                 }));
+        this.host.testWait();
+    }
+
+    @Test
+    public void operationMultiStageFlowWithContextId() throws Throwable {
+        String contextId = UUID.randomUUID().toString();
+        int opCount = Utils.DEFAULT_THREAD_COUNT * 2;
+        AtomicInteger pending = new AtomicInteger(opCount);
+
+        CompletionHandler stageTwoCh = (o, e) -> {
+            if (e != null) {
+                this.host.failIteration(e);
+                return;
+            }
+            String contextIdActual = OperationContext.getContextId();
+            if (!contextId.equals(contextIdActual)) {
+                this.host.failIteration(new IllegalStateException("context id not set"));
+                return;
+            }
+            this.host.completeIteration();
+        };
+
+        CompletionHandler stageOneCh = (o, e) -> {
+            if (e != null) {
+                this.host.failIteration(e);
+                return;
+            }
+            String contextIdActual = OperationContext.getContextId();
+            if (!contextId.equals(contextIdActual)) {
+                this.host.failIteration(new IllegalStateException("context id not set"));
+                return;
+            }
+            int r = pending.decrementAndGet();
+            if (r != 0) {
+                return;
+            }
+
+            // now send some new "child" operations, and expect the ID to flow
+            Operation childOp = Operation.createGet(o.getUri())
+                    .setCompletion(stageTwoCh);
+            this.host.send(childOp);
+        };
+
+        // send N parallel requests, that will all complete in parallel, and should have the
+        // same context id. When they all complete (using a join like stageOne completion above)
+        // we will send another operation, and expect it to carry the proper contextId
+        this.host.testStart(1);
+        for (int i = 0; i < opCount; i++) {
+            Operation op = Operation
+                    .createGet(UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK))
+                    .setCompletion(stageOneCh)
+                    .setContextId(contextId);
+            this.host.send(op);
+        }
         this.host.testWait();
     }
 

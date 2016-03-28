@@ -35,11 +35,11 @@ import java.util.Map.Entry;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import org.junit.After;
 import org.junit.Test;
@@ -60,6 +60,7 @@ import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceHost.ServiceNotFoundException;
 import com.vmware.xenon.common.ServiceStats;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.ServiceSubscriptionState.ServiceSubscriber;
 import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.TaskState.TaskStage;
 import com.vmware.xenon.common.UriUtils;
@@ -100,6 +101,13 @@ public class TestQueryTaskService {
             this.host.toggleServiceOptions(this.host.getDocumentIndexServiceUri(),
                     EnumSet.of(ServiceOption.INSTRUMENTATION),
                     null);
+            // disable synchronization so it does not interfere with the factory POSTs.
+            // This test does not test nodes coming and going, it just relies on replication.
+            // In theory, POSTs while the node group is changing should succeed (any failures
+            // should be transparently retried) but its a best effort process.
+            // Disabling it on the core verification host also disables it on all peer in process
+            // hosts since VerificationHost.setupPeerHosts uses the setting of the parent host
+            this.host.setPeerSynchronizationEnabled(false);
         } catch (Throwable e) {
             throw new Exception(e);
         }
@@ -128,11 +136,11 @@ public class TestQueryTaskService {
         ServiceDocumentDescription sdd = b.buildDescription(s.getClass(),
                 EnumSet.of(ServiceOption.PERSISTENCE));
 
-        final int expectedCustomFields = 28;
+        final int expectedCustomFields = 34;
         final int expectedBuiltInFields = 10;
         // Verify the reflection of the root document
         assertTrue(sdd.propertyDescriptions != null && !sdd.propertyDescriptions.isEmpty());
-        assertTrue(sdd.propertyDescriptions.size() == expectedCustomFields + expectedBuiltInFields);
+        assertEquals(sdd.propertyDescriptions.size(), expectedCustomFields + expectedBuiltInFields);
 
         pd = sdd.propertyDescriptions.get(ServiceDocument.FIELD_NAME_SOURCE_LINK);
         assertTrue(pd.exampleValue == null);
@@ -154,13 +162,13 @@ public class TestQueryTaskService {
                 sdd);
         assertTrue(descriptionsPerType.get(TypeName.BOOLEAN) == 1L);
         assertTrue(descriptionsPerType.get(TypeName.MAP) == 8L);
-        assertTrue(descriptionsPerType.get(TypeName.LONG) == 1L + 4L);
+        assertEquals(descriptionsPerType.get(TypeName.LONG), (Long)(1L + 4L + 3L));
         assertTrue(descriptionsPerType.get(TypeName.PODO) == 3L);
         assertTrue(descriptionsPerType.get(TypeName.COLLECTION) == 4L);
         assertTrue(descriptionsPerType.get(TypeName.ARRAY) == 3L);
         assertTrue(descriptionsPerType.get(TypeName.STRING) == 5L + 5L);
         assertTrue(descriptionsPerType.get(TypeName.DATE) == 1L);
-        assertTrue(descriptionsPerType.get(TypeName.DOUBLE) == 1L);
+        assertTrue(descriptionsPerType.get(TypeName.DOUBLE) == 4L);
         assertTrue(descriptionsPerType.get(TypeName.BYTES) == 1L);
 
         pd = sdd.propertyDescriptions.get("exampleValue");
@@ -338,6 +346,85 @@ public class TestQueryTaskService {
                 totalCount);
     }
 
+    /**
+     * This tests a specific bug we encountered that a continuous query task with replay
+     * would fail when there was state to replay. We never got the notification for the
+     * replay because kryo through an exception: Class cannot be created (missing no-arg
+     * constructor)
+     */
+    @Test
+    public void continuousQueryTaskWithReplay() throws Throwable {
+
+        setUpHost();
+
+        // Create services before we create the query
+        QueryValidationServiceState newState = new QueryValidationServiceState();
+        newState.stringValue = UUID.randomUUID().toString();
+        startQueryTargetServices(1, newState);
+
+        // Create query task
+        Query query = Query.Builder.create()
+                .addFieldClause("stringValue", "*", MatchType.WILDCARD)
+                .build();
+        QueryTask task = QueryTask.Builder.create()
+                .addOptions(EnumSet.of(QueryOption.CONTINUOUS, QueryOption.EXPAND_CONTENT))
+                .setQuery(query)
+                .build();
+
+        // If the expiration time is not set, then the query will receive the default
+        // query expiration time of 1 minute.
+        task.documentExpirationTimeMicros = Utils.getNowMicrosUtc() + TimeUnit.DAYS.toMicros(1);
+
+        URI queryTaskUri = this.host.createQueryTaskService(
+                UriUtils.buildUri(this.host.getUri(), ServiceUriPaths.CORE_QUERY_TASKS),
+                task, false, false, task, null);
+
+        // Wait for query task to have data
+        QueryTask queryTaskResponse = null;
+        Date exp = this.host.getTestExpiration();
+        while (new Date().before(exp)) {
+            queryTaskResponse = this.host.getServiceState(
+                    null, QueryTask.class, queryTaskUri);
+            if (queryTaskResponse.results != null
+                    && queryTaskResponse.results.documentLinks != null
+                    && !queryTaskResponse.results.documentLinks.isEmpty()) {
+                break;
+            }
+            Thread.sleep(100);
+        }
+        assertTrue(queryTaskResponse != null);
+        assertTrue(queryTaskResponse.results != null);
+        assertTrue(queryTaskResponse.results.documentLinks != null);
+        assertTrue(!queryTaskResponse.results.documentLinks.isEmpty());
+
+        // Create notification target
+        QueryTask[] notification = new QueryTask[1];
+        Consumer<Operation> notificationTarget = (update) -> {
+            update.complete();
+
+            if (update.hasBody()) {
+                QueryTask taskState = update.getBody(QueryTask.class);
+                notification[0] = taskState;
+                this.host.completeIteration();
+            }
+        };
+
+        // Subscribe to the query with replay enabled
+        this.host.testStart(1);
+        Operation subscribe = Operation.createPost(queryTaskUri)
+                .setReferer(this.host.getReferer());
+        this.host.startSubscriptionService(subscribe, notificationTarget,
+                ServiceSubscriber.create(true));
+
+        // Wait for the notification of the current state
+        this.host.testWait();
+
+        assertTrue(notification[0] != null);
+        assertTrue(notification[0].results != null);
+        assertTrue(notification[0].results.documentLinks != null);
+        assertTrue(!notification[0].results.documentLinks.isEmpty());
+    }
+
     private QueryValidationServiceState createContinuousQueryTasks(Throwable[] failure,
             CountDownLatch stateUpdates)
             throws Throwable, InterruptedException {
@@ -352,6 +439,11 @@ public class TestQueryTaskService {
                 .addOptions(EnumSet.of(QueryOption.CONTINUOUS, QueryOption.EXPAND_CONTENT))
                 .setQuery(query)
                 .build();
+
+        // If the expiration time is not set, then the query will receive the default
+        // query expiration time of 1 minute.
+        task.documentExpirationTimeMicros = Utils.getNowMicrosUtc() + TimeUnit.DAYS.toMicros(1);
+
         URI updateQueryTask = this.host.createQueryTaskService(
                 UriUtils.buildUri(this.host.getUri(), ServiceUriPaths.CORE_QUERY_TASKS),
                 task, false, false, task, null);
@@ -409,6 +501,108 @@ public class TestQueryTaskService {
             break;
         }
         return newState;
+    }
+
+    @Test
+    public void expandContent() throws Throwable {
+        setUpHost();
+        Map<URI, ExampleServiceState> states = this.host.doFactoryChildServiceStart(null,
+                this.serviceCount,
+                ExampleServiceState.class, (o) -> {
+                    ExampleServiceState initialState = new ExampleServiceState();
+                    initialState.name = UUID.randomUUID().toString();
+                    o.setBody(initialState);
+                } ,
+                UriUtils.buildFactoryUri(this.host, ExampleService.class));
+
+        Query kindClause = Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class)
+                .build();
+
+        QueryTask.Builder queryTaskBuilder = QueryTask.Builder.createDirectTask();
+        queryTaskBuilder
+                .setQuery(kindClause)
+                .addOption(QueryOption.EXPAND_CONTENT);
+
+        QueryTask task = queryTaskBuilder.build();
+
+        if (task.documentExpirationTimeMicros != 0) {
+            // the value was set as an interval by the calling test. Make absolute here so
+            // account for service creation above
+            task.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
+                    + task.documentExpirationTimeMicros;
+        }
+
+        this.host.logThroughput();
+
+        int count = 5;
+        this.host.testStart(states.size() * count);
+        for (int i = 0; i < count; i++) {
+            // issue some updates to move the versions forward
+            for (URI u : states.keySet()) {
+                ExampleServiceState body = new ExampleServiceState();
+                body.counter = Long.MAX_VALUE;
+                Operation patch = Operation.createPatch(u)
+                        .setCompletion(this.host.getCompletion())
+                        .setBody(body);
+                this.host.send(patch);
+            }
+        }
+        this.host.testWait();
+
+        this.host.createQueryTaskService(task, false,
+                task.taskInfo.isDirect, task, null);
+
+        URI factoryURI = UriUtils.buildFactoryUri(this.host, ExampleService.class);
+        factoryURI = UriUtils.buildExpandLinksQueryUri(factoryURI);
+        // verify expand from both factory and a direct query task
+        ServiceDocumentQueryResult factoryGetResult = this.host
+                .getFactoryState(factoryURI);
+        validateExpandedResults(factoryGetResult, states.size(), count, Action.PATCH);
+
+        ServiceDocumentQueryResult taskResult = task.results;
+        validateExpandedResults(taskResult, states.size(), count, Action.PATCH);
+
+        // delete a service, verify its filtered from the results
+        URI serviceToRemove = states.keySet().iterator().next();
+        ExampleServiceState removedState = states.remove(serviceToRemove);
+        Operation delete = Operation.createDelete(serviceToRemove)
+                .setCompletion(this.host.getCompletion());
+        this.host.sendAndWait(delete);
+
+        task.results = null;
+        this.host.createQueryTaskService(task, false,
+                task.taskInfo.isDirect, task, null);
+
+        assertEquals(states.size(), task.results.documentLinks.size());
+        assertEquals(task.results.documentLinks.size(), task.results.documents.size());
+        for (Entry<String, Object> e : task.results.documents.entrySet()) {
+            ExampleServiceState st = Utils.fromJson(e.getValue(), ExampleServiceState.class);
+            assertTrue(!st.name.equals(removedState.name));
+        }
+
+        factoryGetResult = this.host
+                .getFactoryState(factoryURI);
+        validateExpandedResults(factoryGetResult, states.size(), count, Action.PATCH);
+
+        taskResult = task.results;
+        validateExpandedResults(taskResult, states.size(), count, Action.PATCH);
+    }
+
+    private void validateExpandedResults(ServiceDocumentQueryResult taskResult, int expectedCount,
+            int expectedVersion,
+            Action expectedLastAction) {
+        String kind = Utils.buildKind(ExampleServiceState.class);
+        assertEquals(expectedCount, taskResult.documentLinks.size());
+        assertEquals(taskResult.documentLinks.size(), taskResult.documents.size());
+        for (Entry<String, Object> e : taskResult.documents.entrySet()) {
+            ExampleServiceState st = Utils.fromJson(e.getValue(), ExampleServiceState.class);
+            assertEquals(e.getKey(), st.documentSelfLink);
+            assertTrue(st.name != null);
+            assertTrue(st.documentVersion == expectedVersion);
+            assertEquals(kind, st.documentKind);
+            assertEquals(expectedLastAction.toString(), st.documentUpdateAction);
+        }
     }
 
     @Test
@@ -725,272 +919,24 @@ public class TestQueryTaskService {
     }
 
     @Test
-    public void replicatedQueryTasksOnExampleStates() throws Throwable {
-
-        setUpHost();
-        this.host.setPeerSynchronizationEnabled(false);
-        int nodeCount = 3;
-        this.host.setUpPeerHosts(nodeCount);
-        this.host.joinNodesAndVerifyConvergence(nodeCount);
-        int serviceCount = 100;
-
-        // pick one host to send the POSTs through, DCP will forward to peers
-        VerificationHost targetHost = this.host.getPeerHost();
-        URI exampleFactoryURI = UriUtils.buildUri(targetHost, ExampleFactoryService.SELF_LINK);
-
-        List<URI> exampleServices = new ArrayList<>();
-        this.host.testStart(serviceCount);
-        for (int i = 0; i < serviceCount; i++) {
-            ExampleServiceState s = new ExampleServiceState();
-            s.name = UUID.randomUUID().toString();
-            s.documentSelfLink = s.name;
-
-            exampleServices.add(UriUtils.buildUri(targetHost.getUri(),
-                    ExampleFactoryService.SELF_LINK, s.documentSelfLink));
-
-            this.host.send(Operation.createPost(exampleFactoryURI)
-                    .setBody(s)
-                    .setCompletion(this.host.getCompletion()));
-
-        }
-        this.host.testWait();
-
-        this.host.testStart(serviceCount);
-        // issue a PATCH to each example service so we can query on the modified state
-        for (URI exampleService : exampleServices) {
-            ExampleServiceState newState = new ExampleServiceState();
-            newState.name = TaskState.TaskStage.STARTED.toString();
-            this.host.send(Operation.createPatch(exampleService).setBody(newState)
-                    .setCompletion(this.host.getCompletion()));
-        }
-        this.host.testWait();
-
-        this.host.testStart(serviceCount);
-        for (URI exampleService : exampleServices) {
-            ExampleServiceState newState = new ExampleServiceState();
-            newState.name = TaskState.TaskStage.FINISHED.toString();
-            this.host.send(Operation.createPatch(exampleService).setBody(newState)
-                    .setCompletion(this.host.getCompletion()));
-        }
-        this.host.testWait();
-
-        Set<String> owners = new HashSet<>();
-        Map<URI, ExampleServiceState> exampleStates = this.host.getServiceState(null,
-                ExampleServiceState.class, exampleServices);
-        for (ExampleServiceState st : exampleStates.values()) {
-            assertTrue(st.name.equals(TaskState.TaskStage.FINISHED.toString()));
-            owners.add(st.documentOwner);
-        }
-
-        this.host.log("owners:%s", owners);
-        assertTrue(owners.size() > 1);
-
-        owners.clear();
-        exampleStates = this.host.getServiceState(null,
-                ExampleServiceState.class, exampleServices);
-        for (ExampleServiceState st : exampleStates.values()) {
-            assertTrue(st.name.equals(TaskState.TaskStage.FINISHED.toString()));
-            owners.add(st.documentOwner);
-        }
-
-        this.host.log("owners:%s", owners);
-        assertTrue(owners.size() > 1);
-
-        Query kindClause = Query.Builder.create()
-                .addKindFieldClause(ExampleServiceState.class)
-                .build();
-
-        Query nameClause = Query.Builder.create()
-                .addFieldClause("name", TaskState.TaskStage.FINISHED.toString())
-                .build();
-
-        Query query = Query.Builder.create()
-                .addClause(kindClause)
-                .addClause(nameClause)
-                .build();
-
-        Date exp = this.host.getTestExpiration();
-        while (new Date().before(exp)) {
-            // create N direct query tasks. Direct tasks complete in the context of the POST to the
-            // query task factory
-            int count = 100;
-            URI factoryUri = UriUtils.buildUri(targetHost,
-                    LuceneQueryTaskFactoryService.class);
-            this.host.testStart(count);
-
-            Map<URI, QueryTask> taskResults = new ConcurrentSkipListMap<>();
-            for (int i = 0; i < count; i++) {
-                QueryTask qt = QueryTask.Builder.create().setQuery(query).build();
-                qt.taskInfo.isDirect = true;
-                qt.documentSelfLink = UUID.randomUUID().toString();
-                Operation startPost = Operation
-                        .createPost(factoryUri)
-                        .setBody(qt)
-                        .setCompletion(
-                                (o, e) -> {
-                                    if (e != null) {
-                                        this.host.failIteration(e);
-                                        return;
-                                    }
-
-                                    QueryTask rsp = o.getBody(QueryTask.class);
-                                    qt.results = rsp.results;
-                                    qt.documentOwner = rsp.documentOwner;
-                                    taskResults.put(
-                                            UriUtils.extendUri(factoryUri, rsp.documentSelfLink),
-                                            qt);
-                                    this.host.completeIteration();
-                                });
-
-                this.host.send(startPost);
-            }
-            this.host.testWait();
-            this.host.logThroughput();
-
-            owners.clear();
-            boolean isConverged = true;
-            for (QueryTask qt : taskResults.values()) {
-                owners.add(qt.documentOwner);
-                if (qt.results == null || qt.results.documentLinks == null) {
-                    throw new IllegalStateException("Missing results");
-                }
-                if (qt.results.documentLinks.size() != serviceCount) {
-                    this.host.log("Task did not return all services: %s", Utils.toJsonHtml(qt));
-                    isConverged = false;
-                    break;
-                }
-            }
-
-            if (isConverged) {
-                break;
-            }
-            Thread.sleep(250);
-        }
-
-        if (new Date().after(exp)) {
-            throw new TimeoutException();
-        }
-
-        this.host.log("owners:%s", owners);
-        assertTrue(owners.size() > 1);
-
-        // induce synchronization during the query to verify it does not interfere (due to state updates)
-        this.host.scheduleSynchronizationIfAutoSyncDisabled();
-
-        exp = this.host.getTestExpiration();
-        while (new Date().before(exp)) {
-            boolean isConverged = true;
-            // verify no query tasks exist on any host
-            // pick one host to send the POSTs through, DCP will forward to peers
-            for (VerificationHost host : this.host.getInProcessHostMap().values()) {
-                URI queryFactoryUri = UriUtils.buildExpandLinksQueryUri(UriUtils.buildUri(
-                        targetHost,
-                        ServiceUriPaths.CORE_QUERY_TASKS));
-                ServiceDocumentQueryResult r = host.getFactoryState(queryFactoryUri);
-                if (!r.documentLinks.isEmpty()) {
-                    host.log("%s", Utils.toJsonHtml(r));
-                    isConverged = false;
-                }
-            }
-            if (!isConverged) {
-                Thread.sleep(250);
-                continue;
-            }
-            break;
-        }
-
-        exp = this.host.getTestExpiration();
-
-        while (new Date().before(exp)) {
-            // issue a paginated task query on one of the nodes. Then use the next page links verifying th elinks
-            // are forwarded to the node that executed the query
-            QueryTask remoteTask = QueryTask.Builder.create().setQuery(query).build();
-            remoteTask.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                    + TimeUnit.DAYS.toMicros(1);
-            int pageSize = exampleStates.size() / 10;
-            remoteTask.querySpec.resultLimit = pageSize;
-            QueryTask results = QueryTask.Builder.create().build();
-
-            URI taskUri = this.host.createQueryTaskService(null, remoteTask, false, false, results,
-                    null);
-
-            results = this.host.waitForQueryTaskCompletion(remoteTask.querySpec,
-                    exampleStates.size(),
-                    1, taskUri,
-                    false, false);
-
-            assertTrue(results.results.nextPageLink != null);
-            URI nextLink = UriUtils.buildUri(targetHost, results.results.nextPageLink);
-            QueryTask resultsFirstPage = this.host.getServiceState(null,
-                    QueryTask.class, nextLink);
-
-            assertEquals(resultsFirstPage.results.documentLinks.size(), pageSize);
-            assertEquals(resultsFirstPage.results.prevPageLink, null);
-
-            QueryTask resultsFirstPageSecondTime = this.host.getServiceState(null, QueryTask.class,
-                    nextLink);
-
-            // if synchronization kicks in, the results might be affected, so we might need to repeat the query task
-            // until results settle
-            if (resultsFirstPage.results.documentLinks.size() != resultsFirstPageSecondTime.results.documentLinks
-                    .size()) {
-                this.host.log("Query links not converged yet");
-                Thread.sleep(250);
-                continue;
-            }
-            if (resultsFirstPage.results.documentCount != resultsFirstPageSecondTime.results.documentCount) {
-                this.host.log("Query result count not converged yet");
-                Thread.sleep(250);
-                continue;
-            }
-
-            assertEquals(resultsFirstPage.results.prevPageLink, null);
-
-            // verify that using the next page link and prev page link on each host works
-            for (VerificationHost h : this.host.getInProcessHostMap().values()) {
-                URI nextLinkUri = UriUtils.buildUri(h, resultsFirstPage.results.nextPageLink);
-                QueryTask resultNextLink = this.host.getServiceState(null,
-                        QueryTask.class, nextLinkUri);
-
-                URI prevLinkUri = UriUtils.buildUri(h, resultNextLink.results.prevPageLink);
-                QueryTask resultPrevLink = this.host.getServiceState(null,
-                        QueryTask.class, prevLinkUri);
-
-                assertEquals(pageSize, resultPrevLink.results.documentLinks.size());
-            }
-
-            // everything converged, all done
-            break;
-        }
-
-        if (new Date().after(exp)) {
-            throw new TimeoutException();
-        }
-
-        // verify that example states did not change due to the induced synchronization
-        Map<URI, ExampleServiceState> exampleStatesAfter = this.host.getServiceState(null,
-                ExampleServiceState.class, exampleServices);
-        for (Entry<URI, ExampleServiceState> afterEntry : exampleStatesAfter.entrySet()) {
-            ExampleServiceState beforeState = exampleStates.get(afterEntry.getKey());
-            ExampleServiceState afterState = afterEntry.getValue();
-            assertEquals(beforeState.documentVersion, afterState.documentVersion);
-        }
-
-    }
-
-    @Test
     public void broadcastQueryTasksOnExampleStates () throws Throwable {
+        final int nodeCount = 3;
+        final int stressTestServiceCountThreshold = 1000;
+
         setUpHost();
 
-        int nodeCount = 3;
         this.host.setUpPeerHosts(nodeCount);
         this.host.joinNodesAndVerifyConvergence(nodeCount);
 
-        verifyOnlySupportSortOnSelfLinkInBroadcast();
-        verifyNotAllowDirectQueryInBroadcast();
-
         VerificationHost targetHost = this.host.getPeerHost();
-        URI exampleFactoryURI = UriUtils.buildUri(targetHost, ExampleFactoryService.SELF_LINK);
+        URI exampleFactoryURI = UriUtils.buildUri(targetHost, ExampleService.FACTORY_LINK);
+
+        CommandLineArgumentParser.parseFromProperties(this);
+        if (this.serviceCount > stressTestServiceCountThreshold) {
+            targetHost.setStressTest(true);
+        }
+
+        verifyOnlySupportSortOnSelfLinkInBroadcast(targetHost);
 
         this.host.testStart(this.serviceCount);
         List<URI> exampleServices = new ArrayList<>();
@@ -999,22 +945,21 @@ public class TestQueryTaskService {
             s.name = "document" + i;
             s.documentSelfLink = s.name;
             exampleServices.add(UriUtils.buildUri(this.host.getUri(),
-                    ExampleFactoryService.SELF_LINK, s.documentSelfLink));
+                    ExampleService.FACTORY_LINK, s.documentSelfLink));
             this.host.send(Operation.createPost(exampleFactoryURI)
                     .setBody(s)
                     .setCompletion(this.host.getCompletion()));
         }
         this.host.testWait();
 
+        verifyDirectQueryAllowedInBroadcast(targetHost);
         nonpaginatedBroadcastQueryTasksOnExampleStates(targetHost);
-        paginatedbroadcastQueryTasksOnExampleStates();
-        paginatedBroadcastQueryTasksWithoutMatching();
-        paginatedBroadcastQueryTasksRepeatSamePage();
+        paginatedBroadcastQueryTasksOnExampleStates(targetHost);
+        paginatedBroadcastQueryTasksWithoutMatching(targetHost);
+        paginatedBroadcastQueryTasksRepeatSamePage(targetHost);
     }
 
-    private void verifyOnlySupportSortOnSelfLinkInBroadcast() throws Throwable {
-        VerificationHost targetHost = this.host.getPeerHost();
-
+    private void verifyOnlySupportSortOnSelfLinkInBroadcast(VerificationHost targetHost) throws Throwable {
         QuerySpecification q = new QuerySpecification();
         Query kindClause = new Query();
         kindClause.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
@@ -1041,9 +986,22 @@ public class TestQueryTaskService {
         targetHost.testWait();
     }
 
-    private void verifyNotAllowDirectQueryInBroadcast() throws Throwable {
-        VerificationHost targetHost = this.host.getPeerHost();
+    private void validateBroadcastQueryPostFailure(VerificationHost targetHost, Operation o,
+                                                   Throwable e) {
+        if (e != null) {
+            ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
+            if (rsp.message == null
+                    || !rsp.message.contains(QueryOption.BROADCAST.toString())) {
+                targetHost.failIteration(new IllegalStateException("Expected failure"));
+                return;
+            }
+            targetHost.completeIteration();
+        } else {
+            targetHost.failIteration(new IllegalStateException("expected failure"));
+        }
+    }
 
+    private void verifyDirectQueryAllowedInBroadcast(VerificationHost targetHost) throws Throwable {
         QuerySpecification q = new QuerySpecification();
         Query kindClause = new Query();
         kindClause.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
@@ -1061,26 +1019,22 @@ public class TestQueryTaskService {
                 .createPost(factoryUri)
                 .setBody(task)
                 .setCompletion((o, e) -> {
-                    validateBroadcastQueryPostFailure(targetHost, o, e);
+                    if (e != null) {
+                        targetHost.failIteration(e);
+                        return;
+                    }
+
+                    QueryTask rsp = o.getBody(QueryTask.class);
+                    if (this.serviceCount != rsp.results.documentCount) {
+                        targetHost.failIteration(new IllegalStateException("Incorrect number of documents returned: "
+                                + this.serviceCount + " expected, but " + rsp.results.documentCount + " returned"));
+                        return;
+                    }
+                    targetHost.completeIteration();
                 });
         targetHost.send(startPost);
 
         targetHost.testWait();
-    }
-
-    private void validateBroadcastQueryPostFailure(VerificationHost targetHost, Operation o,
-            Throwable e) {
-        if (e != null) {
-            ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
-            if (rsp.message == null
-                    || !rsp.message.contains(QueryOption.BROADCAST.toString())) {
-                targetHost.failIteration(new IllegalStateException("Expected failure"));
-                return;
-            }
-            targetHost.completeIteration();
-        } else {
-            targetHost.failIteration(new IllegalStateException("expected failure"));
-        }
     }
 
     private void nonpaginatedBroadcastQueryTasksOnExampleStates(VerificationHost targetHost)
@@ -1118,95 +1072,23 @@ public class TestQueryTaskService {
         targetHost.testWait();
     }
 
-    private void paginatedbroadcastQueryTasksOnExampleStates () throws Throwable {
+    private void paginatedBroadcastQueryTasksOnExampleStates(VerificationHost targetHost) throws Throwable {
 
-        VerificationHost targetHost = this.host.getPeerHost();
+        // Simulate the scenario that multiple users query documents page by page
+        // in broadcast way.
+        targetHost.testStart(this.queryCount);
+        for (int i = 0; i < this.queryCount; i++) {
+            startPagedBroadCastQuery(targetHost);
+        }
 
-        int resultLimit = 30;
-
-        QuerySpecification q = new QuerySpecification();
-        Query kindClause = new Query();
-        kindClause.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
-                .setTermMatchValue(Utils.buildKind(ExampleServiceState.class));
-        q.query = kindClause;
-        q.options = EnumSet.of(QueryOption.EXPAND_CONTENT, QueryOption.BROADCAST);
-        q.resultLimit = resultLimit;
-
-        QueryTask task = QueryTask.create(q);
-
-        URI taskUri = this.host.createQueryTaskService(task, false, task.taskInfo.isDirect, task, null);
-        task = this.host.waitForQueryTaskCompletion(task.querySpec, 0, 0, taskUri, false, false);
-
-        targetHost.testStart(1);
-        Operation startGet = Operation
-                .createGet(taskUri)
-                .setCompletion((o, e) -> {
-                    if (e != null) {
-                        targetHost.failIteration(e);
-                        return;
-                    }
-
-                    QueryTask rsp = o.getBody(QueryTask.class);
-                    if (rsp.results.documentCount != 0) {
-                        targetHost.failIteration(new IllegalStateException("Incorrect number of documents returned: " +
-                                "0 expected, but " + rsp.results.documentCount + " returned"));
-                        return;
-                    }
-
-                    String expectedPageLinkSegment = UriUtils.buildUriPath(ServiceUriPaths.CORE,
-                            BroadcastQueryPageService.SELF_LINK_PREFIX);
-                    if (!rsp.results.nextPageLink.contains(expectedPageLinkSegment)) {
-                        targetHost.failIteration(new IllegalStateException("Incorrect next page link returned: " +
-                                rsp.results.nextPageLink));
-                        return;
-                    }
-
-                    targetHost.completeIteration();
-                });
-        targetHost.send(startGet);
+        // If the query cannot be finished in time, timeout exception would be thrown.
         targetHost.testWait();
-
-        String nextPageLink = task.results.nextPageLink;
-        Set<String> documentLinks = new HashSet<>();
-        while (nextPageLink != null) {
-            List<String> pageLinks = new ArrayList<>();
-            URI u = UriUtils.buildUri(targetHost, nextPageLink);
-
-            targetHost.testStart(1);
-            Operation get = Operation
-                    .createGet(u)
-                    .setCompletion((o, e) -> {
-                        if (e != null) {
-                            targetHost.failIteration(e);
-                            return;
-                        }
-
-                        QueryTask rsp = o.getBody(QueryTask.class);
-                        pageLinks.add(rsp.results.nextPageLink);
-                        documentLinks.addAll(rsp.results.documentLinks);
-
-                        targetHost.completeIteration();
-                    });
-
-            targetHost.send(get);
-            targetHost.testWait();
-
-            nextPageLink = pageLinks.isEmpty() ? null : pageLinks.get(0);
-        }
-
-        assertEquals(this.serviceCount, documentLinks.size());
-
-        for (int i = 0; i < this.serviceCount; i++) {
-            assertTrue(documentLinks.contains(ExampleFactoryService.SELF_LINK + "/document" + i));
-        }
     }
 
-    private void paginatedBroadcastQueryTasksWithoutMatching() throws Throwable {
-
-        VerificationHost targetHost = this.host.getPeerHost();
-
-        int serviceCount = 100;
-        int resultLimit = 30;
+    private void paginatedBroadcastQueryTasksWithoutMatching(VerificationHost targetHost) throws Throwable {
+        final int minPageCount = 3;
+        final int maxPageSize = 100;
+        final int resultLimit = Math.min(this.serviceCount / minPageCount, maxPageSize);
 
         QuerySpecification q = new QuerySpecification();
 
@@ -1217,7 +1099,7 @@ public class TestQueryTaskService {
 
         Query nameClause = new Query();
         nameClause.setTermPropertyName(ExampleServiceState.FIELD_NAME_NAME)
-                .setTermMatchValue("document" + serviceCount);
+                .setTermMatchValue("document" + this.serviceCount);
         q.query.addBooleanClause(nameClause);
 
         q.options = EnumSet.of(QueryOption.EXPAND_CONTENT, QueryOption.BROADCAST);
@@ -1255,11 +1137,10 @@ public class TestQueryTaskService {
         targetHost.testWait();
     }
 
-    private void paginatedBroadcastQueryTasksRepeatSamePage() throws Throwable {
-
-        VerificationHost targetHost = this.host.getPeerHost();
-
-        int resultLimit = 30;
+    private void paginatedBroadcastQueryTasksRepeatSamePage(VerificationHost targetHost) throws Throwable {
+        final int minPageCount = 3;
+        final int maxPageSize = 100;
+        final int resultLimit = Math.min(this.serviceCount / minPageCount, maxPageSize);
 
         QuerySpecification q = new QuerySpecification();
 
@@ -1324,6 +1205,135 @@ public class TestQueryTaskService {
         assertTrue(documentLinksList.get(0).equals(documentLinksList.get(1)));
     }
 
+    private void startPagedBroadCastQuery(VerificationHost targetHost) {
+
+        // This is a multi stage task, that could be easily modelled as a service,
+        // but since we are in test code, we use synchronous waits between stages,
+        // but run N threads in parallel
+        final int documentCount = this.serviceCount;
+        Thread t = new Thread() {
+            @Override
+            public void run() {
+                Set<String> documentLinks = new HashSet<>();
+
+                try {
+                    final int minPageCount = 3;
+                    final int maxPageSize = 100;
+                    final int resultLimit = Math.min(documentCount / minPageCount, maxPageSize);
+
+                    QuerySpecification q = new QuerySpecification();
+                    Query kindClause = new Query();
+                    kindClause.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
+                            .setTermMatchValue(Utils.buildKind(ExampleServiceState.class));
+                    q.query = kindClause;
+                    q.options = EnumSet.of(QueryOption.EXPAND_CONTENT, QueryOption.BROADCAST);
+                    q.resultLimit = resultLimit;
+
+                    QueryTask task = QueryTask.create(q);
+                    if (task.documentExpirationTimeMicros == 0) {
+                        task.documentExpirationTimeMicros = Utils.getNowMicrosUtc() + targetHost
+                                .getOperationTimeoutMicros();
+                    }
+                    task.documentSelfLink = UUID.randomUUID().toString();
+
+                    URI factoryUri = UriUtils.buildUri(targetHost, ServiceUriPaths.CORE_QUERY_TASKS);
+                    Operation post = Operation
+                            .createPost(factoryUri)
+                            .setBody(task);
+                    targetHost.send(post);
+
+                    URI taskUri = UriUtils.extendUri(factoryUri, task.documentSelfLink);
+                    List<String> pageLinks = new ArrayList<>();
+                    do {
+                        CountDownLatch waitForCompletion = new CountDownLatch(1);
+                        Operation get = Operation
+                                .createGet(taskUri)
+                                .setCompletion((o, e) -> {
+                                    if (e != null) {
+                                        targetHost.failIteration(e);
+                                        return;
+                                    }
+
+                                    QueryTask rsp = o.getBody(QueryTask.class);
+                                    if (rsp.taskInfo.stage == TaskStage.FINISHED
+                                            || rsp.taskInfo.stage == TaskStage.FAILED
+                                            || rsp.taskInfo.stage == TaskStage.CANCELLED) {
+
+                                        if (rsp.results.documentCount != 0) {
+                                            targetHost.failIteration(new IllegalStateException("Incorrect number of documents returned: " +
+                                                    "0 expected, but " + rsp.results.documentCount + " returned"));
+                                            return;
+                                        }
+
+                                        String expectedPageLinkSegment = UriUtils.buildUriPath(ServiceUriPaths.CORE,
+                                                BroadcastQueryPageService.SELF_LINK_PREFIX);
+                                        if (!rsp.results.nextPageLink.contains(expectedPageLinkSegment)) {
+                                            targetHost.failIteration(new IllegalStateException("Incorrect next page link returned: " +
+                                                    rsp.results.nextPageLink));
+                                            return;
+                                        }
+
+                                        pageLinks.add(rsp.results.nextPageLink);
+                                    }
+
+                                    waitForCompletion.countDown();
+                                });
+                        targetHost.send(get);
+
+                        waitForCompletion.await();
+
+                        if (!pageLinks.isEmpty()) {
+                            break;
+                        }
+
+                        Thread.sleep(100);
+                    } while (true);
+
+                    String nextPageLink = pageLinks.get(0);
+                    while (nextPageLink != null) {
+                        pageLinks.clear();
+                        URI u = UriUtils.buildUri(targetHost, nextPageLink);
+
+                        CountDownLatch waitForCompletion = new CountDownLatch(1);
+                        Operation get = Operation
+                                .createGet(u)
+                                .setCompletion((o, e) -> {
+                                    if (e != null) {
+                                        targetHost.failIteration(e);
+                                        return;
+                                    }
+
+                                    QueryTask rsp = o.getBody(QueryTask.class);
+                                    pageLinks.add(rsp.results.nextPageLink);
+                                    documentLinks.addAll(rsp.results.documentLinks);
+
+                                    waitForCompletion.countDown();
+                                });
+
+                        targetHost.send(get);
+                        waitForCompletion.await();
+
+                        nextPageLink = pageLinks.isEmpty() ? null : pageLinks.get(0);
+                    }
+                } catch (Throwable e) {
+                    targetHost.failIteration(e);
+
+                    return;
+                }
+
+                targetHost.completeIteration();
+
+                assertEquals(documentCount, documentLinks.size());
+
+                for (int i = 0; i < documentCount; i++) {
+                    assertTrue(documentLinks
+                            .contains(ExampleService.FACTORY_LINK + "/document" + i));
+                }
+            }
+        };
+        t.start();
+    }
+
     @Test
     public void sortTestOnExampleStates() throws Throwable {
         doSortTestOnExampleStates(false, Integer.MAX_VALUE);
@@ -1338,7 +1348,7 @@ public class TestQueryTaskService {
     public void doSortTestOnExampleStates(boolean isDirect, int resultLimit) throws Throwable {
         setUpHost();
         int serviceCount = 100;
-        URI exampleFactoryURI = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK);
+        URI exampleFactoryURI = UriUtils.buildFactoryUri(this.host, ExampleService.class);
         List<URI> exampleServices = new ArrayList<>();
         this.host.testStart(serviceCount);
         for (int i = 0; i < serviceCount; i++) {
@@ -1346,7 +1356,7 @@ public class TestQueryTaskService {
             s.name = UUID.randomUUID().toString();
             s.documentSelfLink = s.name;
             exampleServices.add(UriUtils.buildUri(this.host.getUri(),
-                    ExampleFactoryService.SELF_LINK, s.documentSelfLink));
+                    ExampleService.FACTORY_LINK, s.documentSelfLink));
             this.host.send(Operation.createPost(exampleFactoryURI)
                     .setBody(s)
                     .setCompletion(this.host.getCompletion()));
@@ -1394,13 +1404,7 @@ public class TestQueryTaskService {
         List<String> documentLinks = task.results.documentLinks;
         validateSortedList(documentLinks);
 
-        this.host.testStart(exampleServices.size());
-        for (URI u : exampleServices) {
-            this.host.send(Operation.createDelete(u)
-                    .setBody(new ServiceDocument())
-                    .setCompletion(this.host.getCompletion()));
-        }
-        this.host.testWait();
+        deleteServices(exampleServices);
     }
 
     private void validateSortedList(List<String> documentLinks) {
@@ -1467,7 +1471,7 @@ public class TestQueryTaskService {
         setUpHost();
         int serviceCount = 25;
         int resultLimit = 10;
-        URI exampleFactoryURI = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK);
+        URI exampleFactoryURI = UriUtils.buildFactoryUri(this.host, ExampleService.class);
         List<URI> exampleServices = new ArrayList<>();
         this.host.testStart(serviceCount);
         Random r = new Random();
@@ -1478,7 +1482,7 @@ public class TestQueryTaskService {
             s.documentSelfLink = s.name;
 
             exampleServices.add(UriUtils.buildUri(this.host.getUri(),
-                    ExampleFactoryService.SELF_LINK, s.documentSelfLink));
+                    ExampleService.FACTORY_LINK, s.documentSelfLink));
 
             this.host.send(Operation.createPost(exampleFactoryURI)
                     .setBody(s)
@@ -1567,13 +1571,7 @@ public class TestQueryTaskService {
         assertEquals(serviceCount, numberOfDocumentLinks[0]);
         validateSortedResults(documents, ServiceDocument.FIELD_NAME_SELF_LINK);
 
-        this.host.testStart(toDelete.size());
-        for (URI u : toDelete) {
-            this.host.send(Operation.createDelete(u)
-                    .setBody(new ServiceDocument())
-                    .setCompletion(this.host.getCompletion()));
-        }
-        this.host.testWait();
+        deleteServices(toDelete);
     }
 
     private void validateSortedResults(List<ExampleServiceState> documents, String fieldName) {
@@ -2181,25 +2179,21 @@ public class TestQueryTaskService {
     @Test
     public void paginatedQueries() throws Throwable {
         setUpHost();
+
         int sc = this.serviceCount;
         int numberOfPages = 2;
         int resultLimit = sc / numberOfPages;
 
         // indirect query, many results expected
         QueryTask task = QueryTask.create(new QuerySpecification()).setDirect(false);
+        task.documentExpirationTimeMicros = Utils.getNowMicrosUtc() + TimeUnit.DAYS.toMicros(1);
 
         List<URI> pageServiceURIs = new ArrayList<>();
         List<URI> targetServiceURIs = new ArrayList<>();
-        doPaginatedQueryTest(task, sc, resultLimit, pageServiceURIs, targetServiceURIs);
+        verifyPaginatedQueryWithSearcherRefresh(sc, resultLimit, task, pageServiceURIs,
+                targetServiceURIs);
 
-        // delete target services before doing next query to verify deleted documents are excluded
-        this.host.testStart(targetServiceURIs.size());
-        for (URI u : targetServiceURIs) {
-            this.host.send(Operation.createDelete(u)
-                    .setBody(new ServiceDocument())
-                    .setCompletion(this.host.getCompletion()));
-        }
-        this.host.testWait();
+        deleteServices(targetServiceURIs);
 
         sc = 1;
         // direct query, single result expected, plus verify all previously deleted and created
@@ -2212,13 +2206,7 @@ public class TestQueryTaskService {
         assertNotNull(nextPageLink);
 
         // delete target services before doing next query to verify deleted documents are excluded
-        this.host.testStart(targetServiceURIs.size());
-        for (URI u : targetServiceURIs) {
-            this.host.send(Operation.createDelete(u)
-                    .setBody(new ServiceDocument())
-                    .setCompletion(this.host.getCompletion()));
-        }
-        this.host.testWait();
+        deleteServices(targetServiceURIs);
 
         sc = 0;
 
@@ -2227,6 +2215,61 @@ public class TestQueryTaskService {
         pageServiceURIs = new ArrayList<>();
         targetServiceURIs = new ArrayList<>();
         doPaginatedQueryTest(task, sc, resultLimit, pageServiceURIs, targetServiceURIs);
+    }
+
+    private void deleteServices(List<URI> targetServiceURIs) throws Throwable {
+        this.host.testStart(targetServiceURIs.size());
+        for (URI u : targetServiceURIs) {
+            this.host.send(Operation.createDelete(u)
+                    .setBody(new ServiceDocument())
+                    .setCompletion(this.host.getCompletion()));
+        }
+        this.host.testWait();
+    }
+
+    private void verifyPaginatedQueryWithSearcherRefresh(int sc, int resultLimit, QueryTask task,
+            List<URI> pageServiceURIs, List<URI> targetServiceURIs)
+            throws Throwable {
+
+        try {
+            // set some aggressive grooming limits on searchers and files
+            LuceneDocumentIndexService.setSearcherCountThreshold(1);
+            LuceneDocumentIndexService.setIndexFileCountThresholdForWriterRefresh(10);
+
+            doPaginatedQueryTest(task, sc, resultLimit, pageServiceURIs, targetServiceURIs);
+            // do some un related updates to force the index to create new index searchers
+            putStateOnQueryTargetServices(targetServiceURIs, 10);
+            // create some new index searchers by doing a query
+            this.throughputSimpleQuery();
+
+            // verify first page is still valid
+            this.host.testStart(pageServiceURIs.size());
+            boolean isFirstPage = true;
+            for (URI u : pageServiceURIs) {
+
+                Operation get = Operation.createGet(u);
+                if (isFirstPage) {
+                    // First page should succeed either because grooming has not closed the writer yet
+                    // or because of the retry. Over many runs, this will prove the recovery code in
+                    // LuceneQueryPageService works
+                    get.setCompletion(this.host.getCompletion());
+                } else {
+                    // request to remaining pages might or not fail. Its nearly impossible to avoid
+                    // false negatives in this test since it depends on when the maintenance handler
+                    // runs for the lucene service and grooms the searcher.
+                    get.setCompletion((o, e) -> {
+                        this.host.completeIteration();
+                    });
+                }
+                this.host.send(get);
+                isFirstPage = false;
+            }
+            this.host.testWait();
+        } finally {
+            // restore large numbers for remainder
+            LuceneDocumentIndexService.setSearcherCountThreshold(1000);
+            LuceneDocumentIndexService.setIndexFileCountThresholdForWriterRefresh(10000);
+        }
     }
 
     @Test
@@ -2290,6 +2333,7 @@ public class TestQueryTaskService {
 
                         QueryTask page = o.getBody(QueryTask.class);
                         int nlinks = page.results.documentLinks.size();
+                        this.host.log("page: %s", Utils.toJsonHtml(page));
                         assertTrue(nlinks <= resultLimit);
                         verifyLinks(nextPageLink, serviceURIs, page);
 
@@ -2622,8 +2666,8 @@ public class TestQueryTaskService {
     @Test
     public void testQueryBuilderShouldOccur() throws Throwable {
         setUpHost();
-        URI exampleFactoryUri = UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK);
-        URI tenantFactoryUri = UriUtils.buildUri(this.host, TenantFactoryService.SELF_LINK);
+        URI exampleFactoryUri = UriUtils.buildFactoryUri(this.host, ExampleService.class);
+        URI tenantFactoryUri = UriUtils.buildUri(this.host, TenantService.FACTORY_LINK);
         this.host.testStart(2);
 
         ExampleServiceState exampleServiceState = new ExampleServiceState();

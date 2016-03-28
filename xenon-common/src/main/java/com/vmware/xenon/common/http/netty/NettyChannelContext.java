@@ -26,6 +26,7 @@ import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.SocketContext;
 
 public class NettyChannelContext extends SocketContext {
+
     // For HTTP/1.1 channels, this stores the operation associated with the channel
     static final AttributeKey<Operation> OPERATION_KEY = AttributeKey
             .<Operation> valueOf("operation");
@@ -46,6 +47,7 @@ public class NettyChannelContext extends SocketContext {
     public static final int MAX_HEADER_SIZE = 65536;
     public static final int MAX_CHUNK_SIZE = 65536;
     public static final int MAX_HTTP2_FRAME_SIZE = 65536;
+    public static final int INITIAL_HTTP2_WINDOW_SIZE = 65536;
 
     // An HTTP/2 connection uses a unique stream for each request/response
     // The stream ID is 31 bits longs and the client can only use odd-numbered
@@ -53,9 +55,7 @@ public class NettyChannelContext extends SocketContext {
     // before we have to close and reopen the connection
     public static final int DEFAULT_MAX_STREAM_ID = Integer.MAX_VALUE - 1;
 
-    // This is exposed for testing purposes, to validate we do the right thing
-    // when running out of streams.
-    public static int maxStreamId = DEFAULT_MAX_STREAM_ID;
+    private static int maxStreamId = DEFAULT_MAX_STREAM_ID;
 
     // Indicates if this is being used for HTTP/1.2 or HTTP/2
     public enum Protocol {
@@ -77,11 +77,11 @@ public class NettyChannelContext extends SocketContext {
     String host;
     private Channel channel;
     private final String key;
-    Protocol protocol;
+    private Protocol protocol;
 
     // An HTTP/2 connection may have multiple simultaneous operations. This map
     // Will associate each stream with the operation happening on the stream
-    public Map<Integer, Operation> streamIdMap;
+    public final Map<Integer, Operation> streamIdMap;
 
     // We need to know if an HTTP/2 connection is being opened so that we can queue
     // pending operations instead of adding a new HTTP/2 connection
@@ -94,15 +94,24 @@ public class NettyChannelContext extends SocketContext {
         this.host = host;
         this.port = port;
         this.key = key;
+        this.protocol = protocol;
         if (protocol == Protocol.HTTP2) {
             this.streamIdMap = new HashMap<Integer, Operation>();
-            this.protocol = protocol;
+        } else {
+            this.streamIdMap = null;
         }
     }
 
     public NettyChannelContext setChannel(Channel c) {
         this.channel = c;
         return this;
+    }
+
+    /**
+     * Infrastructure use only: for testing purposes
+     */
+    public static void setMaxStreamId(int max) {
+        maxStreamId = max;
     }
 
     public NettyChannelContext setOperation(Operation request) {
@@ -151,9 +160,15 @@ public class NettyChannelContext extends SocketContext {
         }
     }
 
-    public boolean haveStreamsInUse() {
+    public boolean hasActiveStreams() {
         synchronized (this.streamIdMap) {
             return !this.streamIdMap.isEmpty();
+        }
+    }
+
+    public int getActiveStreamCount() {
+        synchronized (this.streamIdMap) {
+            return this.streamIdMap.size();
         }
     }
 
@@ -173,6 +188,10 @@ public class NettyChannelContext extends SocketContext {
         this.openInProgress.set(inProgress);
     }
 
+    public Protocol getProtocol() {
+        return this.protocol;
+    }
+
     /**
      * Returns true if we can't allocate any more streams. Used by NettyChannelPool
      * to decide when it's time to close the connection and open a new one.
@@ -184,10 +203,14 @@ public class NettyChannelContext extends SocketContext {
         } else {
             boolean isExhausted;
             synchronized (this.streamIdMap) {
-                isExhausted = this.largestStreamId > NettyChannelContext.maxStreamId;
+                isExhausted = this.largestStreamId >= NettyChannelContext.maxStreamId;
             }
             return !isExhausted;
         }
+    }
+
+    public int getLargestStreamId() {
+        return this.largestStreamId;
     }
 
     @Override

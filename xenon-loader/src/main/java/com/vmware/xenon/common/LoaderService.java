@@ -42,8 +42,6 @@ public class LoaderService extends StatefulService {
         public Map<String, String> serviceClasses = new HashMap<String, String>();
     }
 
-    private ClassLoader cl = null;
-
     public static class LoaderServiceState extends ServiceDocument {
         public LoaderType loaderType;
         public String path;
@@ -233,21 +231,30 @@ public class LoaderService extends StatefulService {
             }
         }
 
-        this.cl = new URLClassLoader(urls);
+        URLClassLoader cl = null;
+        try {
+            cl = new URLClassLoader(urls);
 
-        for (LoaderServiceInfo packageInfo : services.values()) {
-            logFine("Processing package %s", packageInfo.name);
-            for (String serviceClass : packageInfo.serviceClasses.keySet()) {
-                Class<?> clazz = this.cl.loadClass(serviceClass);
+            for (LoaderServiceInfo packageInfo : services.values()) {
+                logFine("Processing package %s", packageInfo.name);
+                for (String serviceClass : packageInfo.serviceClasses.keySet()) {
+                    Class<?> clazz = cl.loadClass(serviceClass);
 
-                if (isValidDynamicService(clazz)) {
-                    Service service = (Service) clazz.newInstance();
-                    getHost().startService(
-                            Operation.createPost(UriUtils.buildUri(getHost(),
-                                    service.getClass())), service);
-                    packageInfo.serviceClasses.put(serviceClass, service.getSelfLink());
-                    logInfo("Started service "
-                            + service.getSelfLink());
+                    if (isValidDynamicService(clazz)) {
+                        Service service = (Service) clazz.newInstance();
+                        getHost().startService(
+                                Operation.createPost(UriUtils.buildUri(getHost(),
+                                        service.getClass())), service);
+                        packageInfo.serviceClasses.put(serviceClass, service.getSelfLink());
+                        logInfo("Started service " + service.getSelfLink());
+                    }
+                }
+            }
+        } finally {
+            if (cl != null) {
+                try {
+                    cl.close();
+                } catch (IOException e) {
                 }
             }
         }
@@ -273,10 +280,14 @@ public class LoaderService extends StatefulService {
     private Map<String, LoaderServiceInfo> discoverServices(File libDir,
             Map<String, LoaderServiceInfo> existingPackages) {
         logFine("Checking for updates in " + libDir.toURI());
-        Map<String, LoaderServiceInfo> discoveredPackages = new HashMap<String, LoaderService.LoaderServiceInfo>();
+        Map<String, LoaderServiceInfo> discoveredPackages = new HashMap<>();
 
         boolean updated = false;
-        for (File file : libDir.listFiles()) {
+        File[] files = libDir.listFiles();
+        if (files == null) {
+            return null;
+        }
+        for (File file : files) {
             if (!file.getName().endsWith(".jar")) {
                 continue;
             }

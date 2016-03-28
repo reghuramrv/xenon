@@ -17,10 +17,12 @@ import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.io.UnsupportedEncodingException;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
@@ -40,7 +42,6 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
-import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 import com.esotericsoftware.kryo.Kryo;
@@ -58,6 +59,7 @@ import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
+import com.vmware.xenon.common.logging.StackAwareLogRecord;
 import com.vmware.xenon.common.serialization.BufferThreadLocal;
 import com.vmware.xenon.common.serialization.JsonMapper;
 import com.vmware.xenon.common.serialization.KryoSerializers.KryoForDocumentThreadLocal;
@@ -77,6 +79,7 @@ class DigestThreadLocal extends ThreadLocal<MessageDigest> {
 public class Utils {
     private static final int BUFFER_INITIAL_CAPACITY = 1 * 1024;
     private static final String CHARSET_UTF_8 = "UTF-8";
+    public static final String PROPERTY_NAME_PREFIX = "xenon.";
     public static final String CHARSET = CHARSET_UTF_8;
     public static final String UI_DIRECTORY_NAME = "ui";
 
@@ -177,15 +180,20 @@ public class Utils {
 
             Object fieldValue = ReflectionUtils.getPropertyValue(pd, s);
             if (pd.typeName == TypeName.COLLECTION || pd.typeName == TypeName.MAP
-                    || pd.typeName == TypeName.PODO || pd.typeName == TypeName.ARRAY
-                    || pd.typeName == TypeName.BYTES) {
-                position = Utils.toBytes(fieldValue, buffer, position);
+                    || pd.typeName == TypeName.PODO || pd.typeName == TypeName.ARRAY) {
+                String content = Utils.toJson(fieldValue);
+                position = Utils.toBytes(content, buffer, position);
             } else if (fieldValue != null) {
                 position = Utils.toBytes(fieldValue, buffer, position);
             }
         }
 
         return computeHash(buffer, 0, position);
+    }
+
+    private static void appendJson(Object obj, Appendable buf) {
+        JsonMapper mapper = getJsonMapperFor(obj);
+        mapper.toJson(obj, buf);
     }
 
     public static byte[] getBuffer(int capacity) {
@@ -251,11 +259,6 @@ public class Utils {
         return Utils.toHexString(hash);
     }
 
-    private static void appendJson(Object obj, Appendable buf) {
-        JsonMapper mapper = getJsonMapperFor(obj);
-        mapper.toJson(obj, buf);
-    }
-
     public static String toJson(Object body) {
         if (body instanceof String) {
             return (String) body;
@@ -297,7 +300,7 @@ public class Utils {
 
     public static String toString(Throwable t) {
         StringWriter writer = new StringWriter();
-        try (PrintWriter printer = new PrintWriter(writer);) {
+        try (PrintWriter printer = new PrintWriter(writer)) {
             t.printStackTrace(printer);
         }
 
@@ -306,7 +309,7 @@ public class Utils {
 
     public static String toString(Map<?, Throwable> exceptions) {
         StringWriter writer = new StringWriter();
-        try (PrintWriter printer = new PrintWriter(writer);) {
+        try (PrintWriter printer = new PrintWriter(writer)) {
             for (Throwable t : exceptions.values()) {
                 t.printStackTrace(printer);
             }
@@ -353,13 +356,16 @@ public class Utils {
             return;
         }
 
-        LogRecord lr = new LogRecord(level, String.format(fmt, args));
+        StackAwareLogRecord lr = new StackAwareLogRecord(level, String.format(fmt, args));
         Exception e = new Exception();
-        StackTraceElement[] stack = e.getStackTrace();
-        if (stack.length > nestingLevel) {
-            lr.setSourceMethodName(stack[nestingLevel].getMethodName());
+        StackTraceElement[] stacks = e.getStackTrace();
+        if (stacks.length > nestingLevel) {
+            StackTraceElement stack = stacks[nestingLevel];
+            lr.setStackElement(stack);
+            lr.setSourceMethodName(stack.getMethodName());
         }
         lr.setSourceClassName(classOrUri);
+        lr.setLoggerName(lg.getName());
         lg.log(lr);
     }
 
@@ -471,7 +477,7 @@ public class Utils {
     }
 
     public static Object setJsonProperty(Object body, String fieldName, String fieldValue) {
-        JsonObject jo = null;
+        JsonObject jo;
         if (body instanceof JsonObject) {
             jo = (JsonObject) body;
         } else {
@@ -493,17 +499,14 @@ public class Utils {
         return timeComparisonEpsilonMicros;
     }
 
-    public static String validateServiceOption(EnumSet<ServiceOption> options, ServiceOption option) {
+    public static String validateServiceOption(EnumSet<ServiceOption> options,
+            ServiceOption option) {
         EnumSet<ServiceOption> reqs = null;
         EnumSet<ServiceOption> antiReqs = null;
         switch (option) {
         case CONCURRENT_UPDATE_HANDLING:
-            antiReqs = EnumSet.of(ServiceOption.ENFORCE_QUORUM, ServiceOption.OWNER_SELECTION,
+            antiReqs = EnumSet.of(ServiceOption.OWNER_SELECTION,
                     ServiceOption.STRICT_UPDATE_CHECKING);
-            break;
-        case ENFORCE_QUORUM:
-            reqs = EnumSet.of(ServiceOption.REPLICATION, ServiceOption.OWNER_SELECTION);
-            antiReqs = EnumSet.of(ServiceOption.CONCURRENT_UPDATE_HANDLING);
             break;
         case OWNER_SELECTION:
             reqs = EnumSet.of(ServiceOption.REPLICATION);
@@ -511,6 +514,9 @@ public class Utils {
             break;
         case STRICT_UPDATE_CHECKING:
             antiReqs = EnumSet.of(ServiceOption.CONCURRENT_UPDATE_HANDLING);
+            break;
+        case URI_NAMESPACE_OWNER:
+            antiReqs = EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.REPLICATION);
             break;
         case PERIODIC_MAINTENANCE:
             break;
@@ -563,18 +569,16 @@ public class Utils {
             }
         }
 
-        if (antiReqs != null) {
-            EnumSet<ServiceOption> conflictReqs = EnumSet.noneOf(ServiceOption.class);
-            for (ServiceOption r : antiReqs) {
-                if (options.contains(r)) {
-                    conflictReqs.add(r);
-                }
+        EnumSet<ServiceOption> conflictReqs = EnumSet.noneOf(ServiceOption.class);
+        for (ServiceOption r : antiReqs) {
+            if (options.contains(r)) {
+                conflictReqs.add(r);
             }
+        }
 
-            if (!conflictReqs.isEmpty()) {
-                String error = String.format("%s conflicts with options: %s", option, conflictReqs);
-                return error;
-            }
+        if (!conflictReqs.isEmpty()) {
+            String error = String.format("%s conflicts with options: %s", option, conflictReqs);
+            return error;
         }
 
         return null;
@@ -621,7 +625,7 @@ public class Utils {
                     "-n", "1",
                     "-w", Long.toString(timeoutMs),
                     getNormalizedHostAddress(systemInfo, addr))
-                    .start();
+                            .start();
             boolean completed = process.waitFor(
                     PING_LAUNCH_TOLERANCE_MS + timeoutMs,
                     TimeUnit.MILLISECONDS);
@@ -686,8 +690,9 @@ public class Utils {
         }
 
         if (data == null) {
-            if (contentType == null || contentType.contains(Operation.MEDIA_TYPE_APPLICATION_JSON)) {
-                String encodedBody = null;
+            if (contentType == null
+                    || contentType.contains(Operation.MEDIA_TYPE_APPLICATION_JSON)) {
+                String encodedBody;
                 if (op.getAction() == Action.GET) {
                     encodedBody = Utils.toJsonHtml(body);
                 } else {
@@ -703,13 +708,10 @@ public class Utils {
             }
         }
 
-
         return data;
     }
 
     public static void decodeBody(Operation op, ByteBuffer buffer) {
-        Object body = null;
-
         if (op.getContentLength() == 0) {
             op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON).complete();
             return;
@@ -717,7 +719,7 @@ public class Utils {
 
         try {
             String contentType = op.getContentType();
-            body = decodeIfText(buffer, contentType);
+            Object body = decodeIfText(buffer, contentType);
             if (body == null) {
                 // unrecognized or binary body, use the raw bytes
                 byte[] data = new byte[(int) op.getContentLength()];
@@ -752,6 +754,13 @@ public class Utils {
                 || contentType.contains("html")
                 || contentType.contains("xml")) {
             body = Charset.forName(Utils.CHARSET).newDecoder().decode(buffer).toString();
+        } else if (contentType.contains(Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED)) {
+            body = Charset.forName(Utils.CHARSET).newDecoder().decode(buffer).toString();
+            try {
+                body = URLDecoder.decode(body, Utils.CHARSET);
+            } catch (UnsupportedEncodingException e) {
+                throw new RuntimeException(e);
+            }
         }
 
         return body;
@@ -860,8 +869,9 @@ public class Utils {
      * @param isAscOrder  Whether the document links are sorted in ascending order.
      * @return The merging result.
      */
-    public static ServiceDocumentQueryResult mergeQueryResults(List<ServiceDocumentQueryResult> dataSources,
-                                                               boolean isAscOrder) {
+    public static ServiceDocumentQueryResult mergeQueryResults(
+            List<ServiceDocumentQueryResult> dataSources,
+            boolean isAscOrder) {
 
         // To hold the merge result.
         ServiceDocumentQueryResult result = new ServiceDocumentQueryResult();
@@ -880,7 +890,7 @@ public class Utils {
 
             // Ties could happen among the lists. That is, multiple elements could be picked in one iteration,
             // and the lists where they locate need to be recorded so that their pointers could be adjusted accordingly.
-            List<Integer>sourcesPicked = new ArrayList<>();
+            List<Integer> sourcesPicked = new ArrayList<>();
 
             // In each iteration, the current elements in all lists need to be compared to pick the winners.
             for (int i = 0; i < dataSources.size(); i++) {
@@ -911,8 +921,11 @@ public class Utils {
             if (documentLinkPicked != null) {
                 // Save the winner to the result.
                 result.documentLinks.add(documentLinkPicked);
-                result.documents.put(documentLinkPicked,
-                        dataSources.get(sourcesPicked.get(0)).documents.get(documentLinkPicked));
+                ServiceDocumentQueryResult partialResult = dataSources.get(sourcesPicked.get(0));
+                if (partialResult.documents != null) {
+                    result.documents.put(documentLinkPicked,
+                            partialResult.documents.get(documentLinkPicked));
+                }
                 result.documentCount++;
 
                 // Move the pointer of the lists where the winners locate.
@@ -928,4 +941,5 @@ public class Utils {
 
         return result;
     }
+
 }

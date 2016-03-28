@@ -21,12 +21,16 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 
+import com.vmware.xenon.common.Utils;
+
 /**
  * A helper that serializes/deserializes service documents to/from JSON. The implementation uses a
  * pair of {@link Gson} instances: one for compact printing; the other for pretty-printed,
  * HTML-friendly output.
  */
 public class JsonMapper {
+
+    private static final int MAX_SERIALIZATION_ATTEMPTS = 100;
 
     private final Gson compact;
     private final Gson pretty;
@@ -65,7 +69,14 @@ public class JsonMapper {
         if (body instanceof String) {
             return (String) body;
         }
-        return this.compact.toJson(body);
+
+        for (int i = 1;; i++) {
+            try {
+                return this.compact.toJson(body);
+            } catch (IllegalStateException e) {
+                handleIllegalStateException(e, i);
+            }
+        }
     }
 
     public void toJson(Object body, Appendable appendable) {
@@ -74,15 +85,51 @@ public class JsonMapper {
                 appendable.append(body.toString());
             } catch (IOException ignore) {
             }
+            return;
         }
-        this.compact.toJson(body, appendable);
+
+        for (int i = 1;; i++) {
+            try {
+                this.compact.toJson(body, appendable);
+                return;
+            } catch (IllegalStateException e) {
+                handleIllegalStateException(e, i);
+            }
+        }
     }
 
     /**
      * Outputs a JSON representation of the given object in pretty-printed, HTML-friendly JSON.
      */
     public String toJsonHtml(Object body) {
-        return this.pretty.toJson(body);
+        for (int i = 1;; i++) {
+            try {
+                return this.pretty.toJson(body);
+            } catch (IllegalStateException e) {
+                handleIllegalStateException(e, i);
+            }
+        }
+    }
+
+    private void handleIllegalStateException(IllegalStateException e, int i) {
+        if (e.getMessage() == null) {
+            Utils.logWarning("Failure serializing body because of GSON race (attempt %d)", i);
+            if (i >= MAX_SERIALIZATION_ATTEMPTS) {
+                throw e;
+            }
+
+            // This error may happen when two threads try to serialize a recursive
+            // type for the very first time concurrently. Type caching logic in GSON
+            // doesn't deal well with recursive types being generated concurrently.
+            // Also see: https://github.com/google/gson/issues/764
+            try {
+                Thread.sleep(0, 1000 * i);
+            } catch (InterruptedException ignored) {
+            }
+            return;
+        }
+
+        throw e;
     }
 
     /**

@@ -91,11 +91,14 @@ public class ReliableSubscriptionService extends StatelessService {
                     NodeSelectorState nss = o.getBody(NodeSelectorState.class);
                     getHost().startSubscriptionService(
                             Operation.createPost(this, nss.nodeGroupLink).setReferer(getUri()),
-                            (notifyOp) -> {
-                                handleNodeGroupNotification(notifyOp);
-                            });
+                            this::handleNodeGroupNotification);
                     startPost.complete();
                 }));
+    }
+
+    @Override
+    public void authorizeRequest(Operation op) {
+        op.complete();
     }
 
     @Override

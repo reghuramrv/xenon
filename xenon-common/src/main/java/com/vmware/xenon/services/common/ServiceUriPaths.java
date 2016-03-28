@@ -37,6 +37,8 @@ public class ServiceUriPaths {
     public static final String GO_PROCESS_LOG = CORE_MANAGEMENT + "/go-dcp-process-log";
     public static final String SYSTEM_LOG = CORE_MANAGEMENT + "/system-log";
 
+    public static final String CORE_PROCESSES = CORE + "/processes";
+
     public static final String COORDINATED_UPDATE_FACTORY = CORE + "/coordinated-updates";
     public static final String NODE_GROUP_FACTORY = CORE + "/node-groups";
     public static final String DEFAULT_NODE_GROUP_NAME = "default";
@@ -52,6 +54,7 @@ public class ServiceUriPaths {
             + SHA1_NODE_SELECTOR_NAME + "-3x";
 
     public static final String CORE_AUTH = CORE + "/auth";
+    public static final String CORE_CREDENTIALS = CORE_AUTH + "/credentials";
 
     public static final String CORE_DOCUMENT_INDEX = ServiceUriPaths.CORE + "/document-index";
     public static final String CORE_OPERATION_INDEX = ServiceUriPaths.CORE + "/operation-index";
@@ -95,13 +98,19 @@ public class ServiceUriPaths {
 
     public static final String UI_RESOURCE_DEFAULT_FILE = "index.html";
     public static final String UI_SERVICE_CORE_PATH = ServiceUriPaths.CORE + "/ui/default";
-    public static final String UI_SERVICE_BASE_URL = UI_SERVICE_CORE_PATH + "#";
+    public static final String UI_SERVICE_BASE_URL = UI_SERVICE_CORE_PATH + "/#";
     public static final String UI_SERVICE_HOME = "/home";
     public static final String CUSTOM_UI_BASE_URL = ServiceUriPaths.CORE + "/ui/custom";
     public static final String SAMPLES = "/samples";
+    public static final String DNS = CORE + "/dns";
 
     public static final String WS_SERVICE_LIB_JS = "/ws-service-lib.js";
     public static final String WS_SERVICE_LIB_JS_PATH =
             Utils.buildUiResourceUriPrefixPath(WebSocketService.class) + "/ws-service-lib.js";
 
+    /**
+     * Swagger discovery service is started on this URI.
+     * @see com.vmware.xenon.swagger.SwaggerDescriptorService
+     */
+    public static final String SWAGGER = "/discovery/swagger";
 }

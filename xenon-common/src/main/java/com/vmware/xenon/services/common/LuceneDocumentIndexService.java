@@ -24,13 +24,14 @@ import java.util.Date;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -114,7 +115,26 @@ public class LuceneDocumentIndexService extends StatelessService {
 
     private String indexDirectory;
 
-    public static final int INDEX_FILE_COUNT_THRESHOLD_FOR_REOPEN = 1000;
+
+    private static final int DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH = 10000;
+
+    private static final int DEFAULT_INDEX_SEARCHER_COUNT_THRESHOLD = 200;
+
+    private static int INDEX_SEARCHER_COUNT_THRESHOLD = DEFAULT_INDEX_SEARCHER_COUNT_THRESHOLD;
+
+    private static int INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH = DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH;
+
+    public static void setSearcherCountThreshold(int count) {
+        INDEX_SEARCHER_COUNT_THRESHOLD = count;
+    }
+
+    public static void setIndexFileCountThresholdForWriterRefresh(int count) {
+        INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH = count;
+    }
+
+    public static int getIndexFileCountThresholdForWriterRefresh() {
+        return INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH;
+    }
 
     private static final String LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE = "binarySerializedState";
 
@@ -156,9 +176,8 @@ public class LuceneDocumentIndexService extends StatelessService {
 
     protected static final int QUERY_THREAD_COUNT = 2;
 
-    private static final String DELETE_ACTION = Action.DELETE.toString().intern();
-
     protected final Object searchSync = new Object();
+    protected Queue<IndexSearcher> searchersPendingClose = new ConcurrentLinkedQueue<>();
     protected IndexSearcher searcher = null;
     protected IndexWriter writer = null;
     protected final Semaphore writerAvailable = new Semaphore(
@@ -172,8 +191,9 @@ public class LuceneDocumentIndexService extends StatelessService {
 
     private long indexWriterCreationTimeMicros;
 
-    private final ConcurrentSkipListMap<String, Long> linkAccessTimes = new ConcurrentSkipListMap<>();
-    private final ConcurrentSkipListMap<String, Long> linkDocumentRetentionEstimates = new ConcurrentSkipListMap<>();
+    private final Map<String, Long> linkAccessTimes = new HashMap<>();
+    private final Map<String, Long> linkDocumentRetentionEstimates = new HashMap<>();
+    private long linkAccessMemoryLimitMB;
 
     private Sort versionSort;
 
@@ -265,24 +285,27 @@ public class LuceneDocumentIndexService extends StatelessService {
     }
 
     public IndexWriter createWriter(File directory, boolean doUpgrade) throws Exception {
-        Directory dir = MMapDirectory.open(directory.toPath());
         Analyzer analyzer = new SimpleAnalyzer();
+        IndexWriterConfig iwc = new IndexWriterConfig(analyzer);
+        Long totalMBs = getHost().getServiceMemoryLimitMB(getSelfLink(), MemoryLimitType.EXACT);
+        if (totalMBs != null) {
+            long cacheSizeMB = (totalMBs * 3) / 4;
+            cacheSizeMB = Math.max(1, cacheSizeMB);
+            iwc.setRAMBufferSizeMB(cacheSizeMB);
+            this.linkAccessMemoryLimitMB = totalMBs / 4;
+        }
+
+        Directory dir = MMapDirectory.open(directory.toPath());
 
         // Upgrade the index in place if necessary.
         if (doUpgrade && DirectoryReader.indexExists(dir)) {
             upgradeIndex(dir);
         }
 
-        IndexWriterConfig iwc = new IndexWriterConfig(analyzer);
         iwc.setOpenMode(OpenMode.CREATE_OR_APPEND);
         iwc.setIndexDeletionPolicy(new SnapshotDeletionPolicy(
                 new KeepOnlyLastCommitDeletionPolicy()));
-        Long totalMBs = getHost().getServiceMemoryLimitMB(getSelfLink(), MemoryLimitType.EXACT);
-        if (totalMBs != null) {
-            // give half to the index, the other half we keep for service caching context
-            totalMBs = Math.max(1, totalMBs / 2);
-            iwc.setRAMBufferSizeMB(totalMBs);
-        }
+
 
         this.writer = new IndexWriter(dir, iwc);
         this.writer.commit();
@@ -319,7 +342,7 @@ public class LuceneDocumentIndexService extends StatelessService {
     }
 
     private void archiveCorruptIndexFiles(File directory) {
-        File newDirectory = new File(new File(getHost().getStorageSandbox()), FILE_PATH_LUCENE
+        File newDirectory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory
                 + "." + Utils.getNowMicrosUtc());
         try {
             Files.createDirectory(newDirectory.toPath());
@@ -355,7 +378,7 @@ public class LuceneDocumentIndexService extends StatelessService {
             commit = snapshotter.snapshot();
 
             String indexDirectory = UriUtils.buildUriPath(getHost().getStorageSandbox().getPath(),
-                    FILE_PATH_LUCENE);
+                    this.indexDirectory);
 
             // Add the files in the commit to a zip file.
             List<URI> fileList = FileUtils.filesToUris(indexDirectory, commit.getFileNames());
@@ -390,9 +413,14 @@ public class LuceneDocumentIndexService extends StatelessService {
 
             File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
             // Copy whatever was there out just in case.
-            if (directory.exists() && directory.listFiles().length > 0) {
-                this.logInfo("archiving existing index %s", directory);
-                archiveCorruptIndexFiles(directory);
+            if (directory.exists()) {
+                // We know the file list won't be null because directory.exists() returned true,
+                // but Findbugs doesn't know that, so we make it happy.
+                File[] files = directory.listFiles();
+                if (files != null && files.length > 0) {
+                    this.logInfo("archiving existing index %s", directory);
+                    archiveCorruptIndexFiles(directory);
+                }
             }
 
             this.logInfo("restoring index %s from %s md5sum(%s)", directory, req.backupFile,
@@ -402,12 +430,17 @@ public class LuceneDocumentIndexService extends StatelessService {
             createWriter(directory, true);
             op.complete();
             this.logInfo("restore complete");
-        } catch (Exception e) {
-            this.logSevere(e);
+        } catch (Throwable e) {
+            logSevere(e);
             op.fail(e);
         } finally {
             this.writerAvailable.release(semaphoreCount);
         }
+    }
+
+    @Override
+    public void authorizeRequest(Operation op) {
+        op.complete();
     }
 
     @Override
@@ -478,52 +511,47 @@ public class LuceneDocumentIndexService extends StatelessService {
         });
     }
 
-    private void handleQueryTaskPatch(Operation op, QueryTask task) {
-        try {
-            QueryTask.QuerySpecification qs = task.querySpec;
+    private void handleQueryTaskPatch(Operation op, QueryTask task) throws Throwable {
+        QueryTask.QuerySpecification qs = task.querySpec;
 
-            Query luceneQuery = (Query) qs.context.nativeQuery;
-            Sort luceneSort = (Sort) qs.context.nativeSort;
-            LuceneQueryPage lucenePage = (LuceneQueryPage) qs.context.nativePage;
-            IndexSearcher s = (IndexSearcher) qs.context.nativeSearcher;
-            ServiceDocumentQueryResult rsp = new ServiceDocumentQueryResult();
+        Query luceneQuery = (Query) qs.context.nativeQuery;
+        Sort luceneSort = (Sort) qs.context.nativeSort;
+        LuceneQueryPage lucenePage = (LuceneQueryPage) qs.context.nativePage;
+        IndexSearcher s = (IndexSearcher) qs.context.nativeSearcher;
+        ServiceDocumentQueryResult rsp = new ServiceDocumentQueryResult();
 
-            if (qs.options.contains(QueryOption.CONTINUOUS)) {
-                switch (task.taskInfo.stage) {
-                case CREATED:
-                    logWarning("Task %s is in invalid state: %s", task.taskInfo.stage);
-                    op.fail(new IllegalStateException("Stage not supported"));
-                    return;
-                case STARTED:
-                    QueryTask clonedTask = new QueryTask();
-                    clonedTask.documentSelfLink = task.documentSelfLink;
-                    clonedTask.querySpec = task.querySpec;
-                    clonedTask.querySpec.context.filter = QueryFilter.create(qs.query);
-                    this.activeQueries.put(task.documentSelfLink, clonedTask);
-                    this.setStat(STAT_NAME_ACTIVE_QUERY_FILTERS, this.activeQueries.size());
-                    logInfo("Activated continuous query task: %s", task.documentSelfLink);
-                    break;
-                case CANCELLED:
-                case FAILED:
-                case FINISHED:
-                    this.activeQueries.remove(task.documentSelfLink);
-                    this.setStat(STAT_NAME_ACTIVE_QUERY_FILTERS, this.activeQueries.size());
-                    op.complete();
-                    return;
-                default:
-                    break;
+        if (qs.options.contains(QueryOption.CONTINUOUS)) {
+            switch (task.taskInfo.stage) {
+            case CREATED:
+                logWarning("Task %s is in invalid state: %s", task.taskInfo.stage);
+                op.fail(new IllegalStateException("Stage not supported"));
+                return;
+            case STARTED:
+                QueryTask clonedTask = new QueryTask();
+                clonedTask.documentSelfLink = task.documentSelfLink;
+                clonedTask.querySpec = task.querySpec;
+                clonedTask.querySpec.context.filter = QueryFilter.create(qs.query);
+                this.activeQueries.put(task.documentSelfLink, clonedTask);
+                this.setStat(STAT_NAME_ACTIVE_QUERY_FILTERS, this.activeQueries.size());
+                logInfo("Activated continuous query task: %s", task.documentSelfLink);
+                break;
+            case CANCELLED:
+            case FAILED:
+            case FINISHED:
+                this.activeQueries.remove(task.documentSelfLink);
+                this.setStat(STAT_NAME_ACTIVE_QUERY_FILTERS, this.activeQueries.size());
+                op.complete();
+                return;
+            default:
+                break;
 
-                }
             }
+        }
 
-            if (!queryIndex(s, op, null, qs.options, luceneQuery, luceneSort, lucenePage,
-                    qs.resultLimit,
-                    task.documentExpirationTimeMicros, task.indexLink, rsp)) {
-                op.setBodyNoCloning(rsp).complete();
-            }
-        } catch (Throwable e) {
-            logSevere(e);
-            op.fail(e);
+        if (!queryIndex(s, op, null, qs.options, luceneQuery, luceneSort, lucenePage,
+                qs.resultLimit,
+                task.documentExpirationTimeMicros, task.indexLink, rsp)) {
+            op.setBodyNoCloning(rsp).complete();
         }
     }
 
@@ -548,6 +576,9 @@ public class LuceneDocumentIndexService extends StatelessService {
 
         String selfLink = params.get(ServiceDocument.FIELD_NAME_SELF_LINK);
         String fieldToExpand = params.get(UriUtils.URI_PARAM_ODATA_EXPAND);
+        if (fieldToExpand == null) {
+            fieldToExpand = params.get(UriUtils.URI_PARAM_ODATA_EXPAND_NO_DOLLAR_SIGN);
+        }
         if (fieldToExpand != null
                 && fieldToExpand.equals(ServiceDocumentQueryResult.FIELD_NAME_DOCUMENT_LINKS)) {
             options.add(QueryOption.EXPAND_CONTENT);
@@ -811,10 +842,10 @@ public class LuceneDocumentIndexService extends StatelessService {
         // If the resource query in the authorization context is unspecified,
         // use a Lucene query that doesn't return any documents so that every
         // result will be empty.
-        if (ctx.getResourceQuery() == null) {
+        if (ctx.getResourceQuery(Action.GET) == null) {
             rq = new MatchNoDocsQuery();
         } else {
-            rq = LuceneQueryConverter.convertToLuceneQuery(ctx.getResourceQuery());
+            rq = LuceneQueryConverter.convertToLuceneQuery(ctx.getResourceQuery(Action.GET));
         }
 
         BooleanQuery.Builder builder = new BooleanQuery.Builder()
@@ -844,7 +875,7 @@ public class LuceneDocumentIndexService extends StatelessService {
         if (hasPage) {
             // For example, via GET of QueryTask.nextPageLink
             after = page.after;
-            rsp.prevPageLink = page.link;
+            rsp.prevPageLink = page.previousPageLink;
         } else if (isPaginatedQuery) {
             // QueryTask.resultLimit was set, but we don't have a page param yet,
             // which means this is the initial POST to create the QueryTask.
@@ -875,7 +906,7 @@ public class LuceneDocumentIndexService extends StatelessService {
 
             long queryTime = end - start;
 
-            rsp.documentCount = Long.valueOf(0);
+            rsp.documentCount = 0L;
             rsp.queryTimeMicros += queryTime;
             ScoreDoc bottom = null;
             if (shouldProcessResults) {
@@ -1033,13 +1064,16 @@ public class LuceneDocumentIndexService extends StatelessService {
                 latestVersions.put(link, latestVersion);
             }
 
-            boolean isDeleted = DELETE_ACTION.equals(d
+            boolean isDeleted = Action.DELETE.toString().equals(d
                     .get(ServiceDocument.FIELD_NAME_UPDATE_ACTION));
 
             if (isDeleted && !options.contains(QueryOption.INCLUDE_DELETED)) {
                 // ignore a document if its marked deleted and it has the latest version
                 if (documentVersion >= latestVersion) {
                     uniques.remove(link);
+                    if (rsp.documents != null) {
+                        rsp.documents.remove(link);
+                    }
                 }
                 continue;
             }
@@ -1087,11 +1121,11 @@ public class LuceneDocumentIndexService extends StatelessService {
         }
 
         if (hasCountOption) {
-            rsp.documentCount = Long.valueOf(uniques.size());
+            rsp.documentCount = (long) uniques.size();
         } else {
             rsp.documentLinks.clear();
             rsp.documentLinks.addAll(uniques);
-            rsp.documentCount = Long.valueOf(rsp.documentLinks.size());
+            rsp.documentCount = (long) rsp.documentLinks.size();
         }
 
         return lastDocVisited;
@@ -1381,11 +1415,7 @@ public class LuceneDocumentIndexService extends StatelessService {
                         v.toString()));
             }
         } else if (pd.typeName.equals(TypeName.LONG)) {
-            if (v instanceof Integer) {
-                int i = (int) v;
-                v = i * 1L;
-            }
-            luceneField = new LongField(fieldName, (long) v,
+            luceneField = new LongField(fieldName, ((Number) v).longValue(),
                     fsv == Store.NO ? this.longUnStoredField : this.longStoredField);
         } else if (pd.typeName.equals(TypeName.DATE)) {
             // Index as microseconds since UNIX epoch
@@ -1393,7 +1423,7 @@ public class LuceneDocumentIndexService extends StatelessService {
             luceneField = new LongField(fieldName, dt.getTime() * 1000,
                     fsv == Store.NO ? this.longUnStoredField : this.longStoredField);
         } else if (pd.typeName.equals(TypeName.DOUBLE)) {
-            luceneField = new DoubleField(fieldName, (double) v,
+            luceneField = new DoubleField(fieldName, ((Number) v).doubleValue(),
                     fsv == Store.NO ? this.doubleUnStoredField : this.doubleStoredField);
         } else if (pd.typeName.equals(TypeName.BOOLEAN)) {
             String booleanValue = QuerySpecification.toMatchValue((boolean) v);
@@ -1531,17 +1561,19 @@ public class LuceneDocumentIndexService extends StatelessService {
 
     private void checkDocumentRetentionLimit(ServiceDocument state,
             ServiceDocumentDescription desc) {
-        if (this.linkDocumentRetentionEstimates.containsKey(state.documentSelfLink)) {
-            return;
-        }
+        synchronized (this.linkDocumentRetentionEstimates) {
+            if (this.linkDocumentRetentionEstimates.containsKey(state.documentSelfLink)) {
+                return;
+            }
 
-        long limit = Math.max(1, desc.versionRetentionLimit);
-        if (state.documentVersion < limit) {
-            return;
-        }
+            long limit = Math.max(1, desc.versionRetentionLimit);
+            if (state.documentVersion < limit) {
+                return;
+            }
 
-        // schedule this self link for retention policy: it might have exceeded the version limit
-        this.linkDocumentRetentionEstimates.put(state.documentSelfLink, limit);
+            // schedule this self link for retention policy: it might have exceeded the version limit
+            this.linkDocumentRetentionEstimates.put(state.documentSelfLink, limit);
+        }
     }
 
     /**
@@ -1549,10 +1581,10 @@ public class LuceneDocumentIndexService extends StatelessService {
      * assumes the caller has acquired the writer semaphore
      */
     private void checkFailureAndRecover(Throwable e) {
-        if (this.writer != null) {
-            logSevere(e);
-        }
         if (!(e instanceof AlreadyClosedException)) {
+            if (this.writer != null && !getHost().isStopping()) {
+                logSevere(e);
+            }
             return;
         }
 
@@ -1761,6 +1793,7 @@ public class LuceneDocumentIndexService extends StatelessService {
         }
 
         synchronized (this.searchSync) {
+            this.searchersPendingClose.add(s);
             if (this.searcherUpdateTimeMicros < now) {
                 this.searcher = s;
                 this.searcherUpdateTimeMicros = now;
@@ -1791,8 +1824,6 @@ public class LuceneDocumentIndexService extends StatelessService {
     }
 
     private void handleMaintenanceImpl(boolean forceMerge) throws Throwable {
-
-        int count = 0;
         try {
             long start = Utils.getNowMicrosUtc();
 
@@ -1813,11 +1844,9 @@ public class LuceneDocumentIndexService extends StatelessService {
 
             applyMemoryLimit();
 
-            File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
-            String[] list = directory.list();
-            count = list == null ? 0 : list.length;
+            boolean reOpenWriter = applyIndexFileLimit();
 
-            if (!forceMerge && count < INDEX_FILE_COUNT_THRESHOLD_FOR_REOPEN) {
+            if (!forceMerge && !reOpenWriter) {
                 return;
             }
             reOpenWriterSynchronously();
@@ -1826,6 +1855,60 @@ public class LuceneDocumentIndexService extends StatelessService {
             reOpenWriterSynchronously();
             throw e;
         }
+    }
+
+    private boolean applyIndexFileLimit() {
+        File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
+        String[] list = directory.list();
+        int count = list == null ? 0 : list.length;
+
+        boolean reOpenWriter = count >= INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH;
+
+        int searcherCount = this.searchersPendingClose.size();
+        if (searcherCount < INDEX_SEARCHER_COUNT_THRESHOLD && !reOpenWriter) {
+            return reOpenWriter;
+        }
+
+        // We always close index searchers before re-opening the index writer, otherwise we risk
+        // loosing pending commits on writer re-open. Notice this code executes if we either have
+        // too many index files on disk, thus we need to re-open the writer to consolidate, or
+        // when we have too many pending searchers
+
+        final int acquireReleaseCount = QUERY_THREAD_COUNT + UPDATE_THREAD_COUNT;
+        try {
+            if (getHost().isStopping()) {
+                return false;
+            }
+
+            this.writerAvailable.release();
+            this.writerAvailable.acquire(acquireReleaseCount);
+            this.searcher = null;
+
+            logInfo("Closing %d pending searchers, index file count: %d", searcherCount, count);
+
+            for (IndexSearcher s : this.searchersPendingClose) {
+                try {
+                    s.getIndexReader().close();
+                } catch (Throwable e) {
+                }
+            }
+            this.searchersPendingClose.clear();
+            IndexWriter w = this.writer;
+            if (w != null) {
+                try {
+                    w.deleteUnusedFiles();
+                } catch (Throwable e) {
+                }
+            }
+
+        } catch (InterruptedException e1) {
+            logSevere(e1);
+        } finally {
+            // release all but one, so we stay owning one reference to the semaphore
+            this.writerAvailable.release(acquireReleaseCount - 1);
+        }
+
+        return reOpenWriter;
     }
 
     private void reOpenWriterSynchronously() {
@@ -1852,20 +1935,15 @@ public class LuceneDocumentIndexService extends StatelessService {
             }
 
             File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
-            String[] list = directory.list();
-            int count = list == null ? 0 : list.length;
             try {
                 if (w != null) {
-                    logInfo("Before: File count: %d, document count: %d", count, w.maxDoc());
                     w.close();
                 }
             } catch (Throwable e) {
             }
 
             w = createWriter(directory, false);
-            list = directory.list();
-            count = list == null ? 0 : list.length;
-            logInfo("After: File count: %d, document count: %d", count, w.maxDoc());
+            logInfo("Reopened writer, document count: %d", w.maxDoc());
         } catch (Throwable e) {
             // If we fail to re-open we should stop the host, since we can not recover.
             logSevere(e);
@@ -1886,50 +1964,65 @@ public class LuceneDocumentIndexService extends StatelessService {
             return;
         }
 
-        IndexSearcher s = this.searcher;
+        Operation dummyDelete = Operation.createDelete(null);
+        int count = 0;
+        Map<String, Long> links = new HashMap<>();
+        synchronized (this.linkDocumentRetentionEstimates) {
+            links.putAll(this.linkDocumentRetentionEstimates);
+            this.linkDocumentRetentionEstimates.clear();
+        }
+
+        IndexSearcher s = updateSearcher(null, Integer.MAX_VALUE, wr);
         if (s == null) {
             return;
         }
 
-        Operation dummyDelete = Operation.createDelete(null);
-        int count = 0;
-        Iterator<Entry<String, Long>> it = this.linkDocumentRetentionEstimates.entrySet()
-                .iterator();
-        while (it.hasNext()) {
-            Entry<String, Long> e = it.next();
+        for (Entry<String, Long> e : links.entrySet()) {
             Query linkQuery = new TermQuery(new Term(ServiceDocument.FIELD_NAME_SELF_LINK,
                     e.getKey()));
             int documentCount = s.count(linkQuery);
+
             int pastRetentionLimitVersions = (int) (documentCount - e.getValue());
             if (pastRetentionLimitVersions <= 0) {
                 continue;
             }
 
-            it.remove();
             // trim durable index for this link
             deleteDocumentsFromIndex(dummyDelete, e.getKey(), e.getValue());
             count++;
         }
 
-        if (!this.linkDocumentRetentionEstimates.isEmpty()) {
+        if (!links.isEmpty()) {
             logInfo("Applied retention policy to %d links", count);
         }
     }
 
-    private void applyMemoryLimit() throws InterruptedException, IOException {
+    private void applyMemoryLimit() {
         if (getHost().isStopping()) {
             return;
         }
 
+        long memThresholdBytes = this.linkAccessMemoryLimitMB * 1024 * 1024;
+        final int bytesPerLinkEstimate = 256;
+        int count = 0;
         synchronized (this.searchSync) {
             if (this.linkAccessTimes.isEmpty()) {
                 return;
             }
-            this.linkAccessTimes.clear();
-            // refresh the searcher, since we cleared the link access map
-            this.searcher = null;
+            if (memThresholdBytes < this.linkAccessTimes.size() * bytesPerLinkEstimate) {
+                count = this.linkAccessTimes.size();
+                this.linkAccessTimes.clear();
+                // force searcher update next time updateSearcher is called
+                if (this.searcher != null) {
+                    this.searchersPendingClose.add(this.searcher);
+                }
+                this.searcher = null;
+            }
         }
-        updateSearcher(null, Integer.MAX_VALUE, this.writer);
+
+        if (count > 0) {
+            logInfo("Cleared %d link access times", count);
+        }
     }
 
     private void applyDocumentExpirationPolicy(IndexWriter w) throws Throwable {

@@ -15,7 +15,10 @@ package com.vmware.xenon.services.common.authn;
 
 import java.net.URI;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.Map;
+
+import static org.junit.Assert.assertEquals;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -25,9 +28,9 @@ import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.http.netty.CookieJar;
 import com.vmware.xenon.common.test.VerificationHost;
-import com.vmware.xenon.services.common.AuthCredentialsFactoryService;
+import com.vmware.xenon.services.common.AuthCredentialsService;
 import com.vmware.xenon.services.common.AuthCredentialsService.AuthCredentialsServiceState;
-import com.vmware.xenon.services.common.UserFactoryService;
+import com.vmware.xenon.services.common.UserService;
 import com.vmware.xenon.services.common.UserService.UserState;
 import com.vmware.xenon.services.common.authn.AuthenticationRequest.AuthenticationRequestType;
 
@@ -40,6 +43,8 @@ public class TestBasicAuthenticationService extends BasicTestCase {
     private static final String BASIC_AUTH_USER_SEPERATOR = ":";
     private static final String SET_COOKIE_HEADER = "Set-Cookie";
 
+    private String credentialsServiceStateSelfLink;
+
     @Override
     public void beforeHostStart(VerificationHost h) {
         h.setAuthorizationEnabled(true);
@@ -49,9 +54,9 @@ public class TestBasicAuthenticationService extends BasicTestCase {
     public void setUp() throws Exception {
         try {
             this.host.setSystemAuthorizationContext();
-            this.host.waitForServiceAvailable(AuthCredentialsFactoryService.SELF_LINK);
+            this.host.waitForServiceAvailable(AuthCredentialsService.FACTORY_LINK);
             this.host.waitForServiceAvailable(BasicAuthenticationService.SELF_LINK);
-            this.host.waitForServiceAvailable(UserFactoryService.SELF_LINK);
+            this.host.waitForServiceAvailable(UserService.FACTORY_LINK);
 
             // initialize users
             UserState state = new UserState();
@@ -60,7 +65,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
             authServiceState.userEmail = USER;
             authServiceState.privateKey = PASSWORD;
 
-            URI userUri = UriUtils.buildUri(this.host, UserFactoryService.SELF_LINK);
+            URI userUri = UriUtils.buildUri(this.host, UserService.FACTORY_LINK);
             Operation userOp = Operation.createPost(userUri)
                     .setBody(state)
                     .setCompletion((o, e) -> {
@@ -70,7 +75,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                         }
                         this.host.completeIteration();
                     });
-            URI authUri = UriUtils.buildUri(this.host, AuthCredentialsFactoryService.SELF_LINK);
+            URI authUri = UriUtils.buildUri(this.host, AuthCredentialsService.FACTORY_LINK);
             Operation authOp = Operation.createPost(authUri)
                     .setBody(authServiceState)
                     .setCompletion((o, e) -> {
@@ -78,13 +83,13 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                             this.host.failIteration(e);
                             return;
                         }
+                        this.credentialsServiceStateSelfLink = o.getBody(AuthCredentialsServiceState.class).documentSelfLink;
                         this.host.completeIteration();
                     });
             this.host.testStart(2);
             this.host.send(userOp);
             this.host.send(authOp);
             this.host.testWait();
-            this.host.resetAuthorizationContext();
         } catch (Throwable e) {
             throw new Exception(e);
         }
@@ -92,7 +97,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
 
     @Test
     public void testAuth() throws Throwable {
-
+        this.host.resetAuthorizationContext();
         URI authServiceUri = UriUtils.buildUri(this.host, BasicAuthenticationService.SELF_LINK);
         // send a request with no authentication header
         this.host.testStart(1);
@@ -203,7 +208,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                         }));
         this.host.testWait();
 
-        // finally send a valid request
+        // Next send a valid request
         userPassStr = new String(Base64.getEncoder().encode(
                 new StringBuffer(USER).append(BASIC_AUTH_USER_SEPERATOR).append(PASSWORD)
                         .toString().getBytes()));
@@ -264,6 +269,112 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                         this.host.send(logoutOp);
                     }));
         this.host.testWait();
+
+        // Finally, send a valid remote request, and validate the cookie & auth token
+        this.host.testStart(1);
+        this.host.send(Operation
+                .createPost(authServiceUri)
+                .setBody(new Object())
+                .forceRemote()
+                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME, headerVal)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+                            if (o.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Invalid status code returned"));
+                                return;
+                            }
+                            if (!validateAuthToken(o)) {
+                                return;
+                            }
+                            this.host.completeIteration();
+                        }));
+        this.host.testWait();
+
     }
 
+    @Test
+    public void testCustomProperties() throws Throwable {
+        String firstProperty = "Property1";
+        String firstValue = "Value1";
+        String secondProperty = "Property2";
+        String secondValue = "Value2";
+        String updatedValue = "UpdatedValue";
+
+        // add custom property
+        URI authUri = UriUtils.buildUri(this.host, this.credentialsServiceStateSelfLink);
+        AuthCredentialsServiceState authServiceState = new AuthCredentialsServiceState();
+        Map<String, String> customProperties = new HashMap<String, String>();
+        customProperties.put(firstProperty, firstValue);
+        authServiceState.customProperties = customProperties;
+        Operation addProperty = Operation.createPatch(authUri)
+                .setBody(authServiceState)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.failIteration(e);
+                        return;
+                    }
+                    AuthCredentialsServiceState state = o.getBody(AuthCredentialsServiceState.class);
+                    assertEquals("There should be only one custom property", state.customProperties.size(), 1);
+                    assertEquals(state.customProperties.get(firstProperty), firstValue);
+                    this.host.completeIteration();
+                });
+        this.host.testStart(1);
+        this.host.send(addProperty);
+        this.host.testWait();
+
+        // update custom properties
+
+        customProperties.put(firstProperty, updatedValue);
+        customProperties.put(secondProperty, secondValue);
+        authServiceState.customProperties = customProperties;
+        Operation updateProperies = Operation.createPatch(authUri)
+                .setBody(authServiceState)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.failIteration(e);
+                        return;
+                    }
+                    AuthCredentialsServiceState state = o.getBody(AuthCredentialsServiceState.class);
+                    assertEquals("There should be two custom properties", state.customProperties.size(), 2);
+                    assertEquals(state.customProperties.get(firstProperty), updatedValue);
+                    assertEquals(state.customProperties.get(secondProperty), secondValue);
+                    this.host.completeIteration();
+                });
+        this.host.testStart(1);
+        this.host.send(updateProperies);
+        this.host.testWait();
+    }
+
+    private boolean validateAuthToken(Operation op) {
+        String cookieHeader = op.getResponseHeader(SET_COOKIE_HEADER);
+        if (cookieHeader == null) {
+            this.host.failIteration(new IllegalStateException("Missing cookie header"));
+            return false;
+        }
+
+        Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
+        if (!cookieElements.containsKey(AuthenticationConstants.XENON_JWT_COOKIE)) {
+            this.host.failIteration(new IllegalStateException("Missing auth cookie"));
+            return false;
+        }
+
+        if (op.getResponseHeader(Operation.REQUEST_AUTH_TOKEN_HEADER) == null) {
+            this.host.failIteration(new IllegalStateException("Missing auth token"));
+            return false;
+        }
+
+        String authCookie = cookieElements.get(AuthenticationConstants.XENON_JWT_COOKIE);
+        String authToken = op.getResponseHeader(Operation.REQUEST_AUTH_TOKEN_HEADER);
+
+        if (!authCookie.equals(authToken)) {
+            this.host.failIteration(new IllegalStateException("Auth token and auth cookie don't match"));
+            return false;
+        }
+        return true;
+    }
 }

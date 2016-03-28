@@ -14,11 +14,15 @@
 package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.math.RoundingMode;
+import java.net.URLEncoder;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
@@ -28,6 +32,7 @@ import java.util.Arrays;
 import java.util.Calendar;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -38,19 +43,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import com.google.gson.reflect.TypeToken;
-
 import org.junit.Assert;
 import org.junit.Test;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
+import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
+import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.QueryTask.NumericRange;
 import com.vmware.xenon.services.common.QueryValidationTestService.QueryValidationServiceState;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+
 
 public class TestUtils {
 
@@ -58,10 +66,23 @@ public class TestUtils {
 
     public static final Integer SOME_INT_VALUE = 100;
     public static final Integer SOME_OTHER_INT_VALUE = 200;
+    public static final long SOME_EXPIRATION_VALUE = Utils.getNowMicrosUtc();
     public static final String SOME_STRING_VALUE = "some value";
     public static final String SOME_OTHER_STRING_VALUE = "some other value";
     public static final String SOME_IGNORE_VALUE = "ignore me";
     public static final String SOME_OTHER_IGNORE_VALUE = "ignore me please";
+    public static final long SOME_OTHER_EXPIRATION_VALUE =
+            Utils.getNowMicrosUtc() + TimeUnit.MINUTES.toMicros(5);
+
+    private static class Range {
+        public final int from;
+        public final int to;
+
+        public Range(int from, int to) {
+            this.from = from;
+            this.to = to;
+        }
+    }
 
     @Test
     public void toHexString() {
@@ -222,6 +243,8 @@ public class TestUtils {
         document.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
         document.documentAuthPrincipalLink = UUID.randomUUID().toString();
         document.documentUpdateAction = UUID.randomUUID().toString();
+        document.mapOfStrings = new LinkedHashMap<String, String>();
+        document.mapOfStrings.put("key1", "value1");
 
         QueryValidationServiceState original = Utils.clone(document);
 
@@ -237,9 +260,6 @@ public class TestUtils {
         assertTrue(ServiceDocument.equals(desc, original, document));
 
         document.documentOwner = UUID.randomUUID().toString();
-        assertTrue(ServiceDocument.equals(desc, original, document));
-
-        document.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
         assertTrue(ServiceDocument.equals(desc, original, document));
 
         document.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
@@ -260,11 +280,17 @@ public class TestUtils {
         assertTrue(ServiceDocument.equals(desc, original, document));
 
         // now change derived fields and expect the signature to change
-        document.stringValue = UUID.randomUUID().toString();
-        assertTrue(false == ServiceDocument.equals(desc, original, document));
+        QueryValidationServiceState changed = Utils.clone(original);
+        changed.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
+        assertTrue(false == ServiceDocument.equals(desc, original, changed));
 
-        document.mapOfStrings.put(UUID.randomUUID().toString(), UUID.randomUUID().toString());
-        assertTrue(false == ServiceDocument.equals(desc, original, document));
+        changed = Utils.clone(original);
+        changed.stringValue = UUID.randomUUID().toString();
+        assertTrue(false == ServiceDocument.equals(desc, original, changed));
+
+        changed = Utils.clone(original);
+        changed.mapOfStrings.put(UUID.randomUUID().toString(), UUID.randomUUID().toString());
+        assertTrue(false == ServiceDocument.equals(desc, original, changed));
 
         // finally do a simple throughput test
         logThroughput(this.iterationCount, useBinary, desc, original);
@@ -284,7 +310,7 @@ public class TestUtils {
 
     public void logThroughput(int count, boolean useBinary, ServiceDocumentDescription desc,
             ServiceDocument original)
-            throws Throwable {
+                    throws Throwable {
 
         long s = Utils.getNowMicrosUtc();
         long length = 0;
@@ -315,7 +341,7 @@ public class TestUtils {
 
     public QueryValidationServiceState serializedAndCompareDocuments(
             boolean useBinary, QueryValidationServiceState original)
-            throws Throwable {
+                    throws Throwable {
         QueryValidationServiceState originalDeserializedWithSig = null;
         if (useBinary) {
             byte[] serializedDocument = new byte[4096];
@@ -342,8 +368,8 @@ public class TestUtils {
 
         // exclude in indexing / signature
         if (excludeFieldName != null) {
-            desc.propertyDescriptions.get(excludeFieldName).indexingOptions =
-                    EnumSet.of(PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE);
+            desc.propertyDescriptions.get(excludeFieldName).indexingOptions = EnumSet
+                    .of(PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE);
         }
 
         return desc;
@@ -428,10 +454,7 @@ public class TestUtils {
     public void validateServiceOption() {
         // positive tests
         EnumSet<ServiceOption> options = EnumSet.of(ServiceOption.REPLICATION,
-                ServiceOption.ENFORCE_QUORUM, ServiceOption.OWNER_SELECTION);
-        checkOptions(options);
-
-        options = EnumSet.of(ServiceOption.REPLICATION, ServiceOption.OWNER_SELECTION);
+                ServiceOption.OWNER_SELECTION);
         checkOptions(options);
 
         options = EnumSet.of(ServiceOption.REPLICATION, ServiceOption.OWNER_SELECTION,
@@ -446,23 +469,21 @@ public class TestUtils {
                 ServiceOption.OWNER_SELECTION);
         checkOptions(options);
 
-        options = EnumSet.of(ServiceOption.REPLICATION, ServiceOption.STRICT_UPDATE_CHECKING,
-                ServiceOption.OWNER_SELECTION, ServiceOption.ENFORCE_QUORUM);
-        checkOptions(options);
-
         // negative tests
 
         options = EnumSet.of(ServiceOption.CONCURRENT_UPDATE_HANDLING,
                 ServiceOption.STRICT_UPDATE_CHECKING);
         checkOptions(options, true);
 
-        options = EnumSet.of(ServiceOption.ENFORCE_QUORUM);
+        options = EnumSet.of(ServiceOption.REPLICATION,
+                ServiceOption.URI_NAMESPACE_OWNER);
         checkOptions(options, true);
 
-        options = EnumSet.of(ServiceOption.ENFORCE_QUORUM, ServiceOption.REPLICATION);
+        options = EnumSet.of(ServiceOption.PERSISTENCE,
+                ServiceOption.URI_NAMESPACE_OWNER);
         checkOptions(options, true);
 
-        options = EnumSet.of(ServiceOption.ENFORCE_QUORUM, ServiceOption.REPLICATION,
+        options = EnumSet.of(ServiceOption.OWNER_SELECTION, ServiceOption.REPLICATION,
                 ServiceOption.CONCURRENT_UPDATE_HANDLING);
         checkOptions(options, true);
 
@@ -628,16 +649,21 @@ public class TestUtils {
         source.s = SOME_STRING_VALUE;
         source.x = SOME_INT_VALUE;
         source.ignore = SOME_IGNORE_VALUE;
+        source.documentExpirationTimeMicros = SOME_EXPIRATION_VALUE;
         MergeTest patch = new MergeTest();
         patch.s = SOME_OTHER_STRING_VALUE;
         patch.x = SOME_OTHER_INT_VALUE;
         patch.ignore = SOME_OTHER_IGNORE_VALUE;
+        patch.documentExpirationTimeMicros = SOME_OTHER_EXPIRATION_VALUE;
+
         ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
                 .buildDescription(MergeTest.class);
         Assert.assertTrue("There should be changes", Utils.mergeWithState(d, source, patch));
         Assert.assertEquals("Annotated s field", source.s, SOME_OTHER_STRING_VALUE);
         Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
         Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
+        Assert.assertEquals("Auto-annotated expiration field", source.documentExpirationTimeMicros,
+                SOME_OTHER_EXPIRATION_VALUE);
     }
 
     /**
@@ -656,6 +682,15 @@ public class TestUtils {
         Assert.assertEquals("Annotated s field", source.s, SOME_OTHER_STRING_VALUE);
         Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
         Assert.assertNull("Non-annotated ignore field", source.ignore);
+    }
+
+    @Test
+    public void testSerializeClassesWithoutDefaultConstructor() {
+        Range range = new Range(0, 100);
+        // clone uses kryo serialization
+        Range clone = Utils.clone(range);
+        assertEquals(range.from, clone.from);
+        assertEquals(range.to, clone.to);
     }
 
     /**
@@ -716,6 +751,46 @@ public class TestUtils {
         Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
     }
 
+    @Test
+    public void testComputeSignatureChanged() {
+        ServiceDocumentDescription description = ServiceDocumentDescription.Builder.create()
+                .buildDescription(QueryValidationServiceState.class);
+
+        QueryValidationServiceState document = new QueryValidationServiceState();
+        document.documentSelfLink = "testComputeSignatureChange";
+        document.stringValue = "valueA";
+        document.documentExpirationTimeMicros = 1;
+        String initialSignature = Utils.computeSignature(document, description);
+
+        document.stringValue = "valueB";
+        String valueChangedSignature = Utils.computeSignature(document, description);
+
+        assertNotEquals(initialSignature, valueChangedSignature);
+
+        document.documentExpirationTimeMicros = 2;
+        String expirationChangedSignature = Utils.computeSignature(document, description);
+
+        assertNotEquals(initialSignature, expirationChangedSignature);
+        assertNotEquals(valueChangedSignature, expirationChangedSignature);
+    }
+
+    @Test
+    public void testComputeSignatureUnchanged() {
+        ServiceDocumentDescription description = ServiceDocumentDescription.Builder.create()
+                .buildDescription(QueryValidationServiceState.class);
+
+        QueryValidationServiceState document = new QueryValidationServiceState();
+        document.documentSelfLink = "testComputeSignatureChange";
+        document.stringValue = "valueA";
+        document.documentUpdateTimeMicros = 1;
+        String initialSignature = Utils.computeSignature(document, description);
+
+        document.documentUpdateTimeMicros = 2;
+        String updateChangedSignature = Utils.computeSignature(document, description);
+
+        assertEquals(initialSignature, updateChangedSignature);
+    }
+
     /**
      * Test service document.
      */
@@ -726,6 +801,30 @@ public class TestUtils {
         @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
         public String s;
         public String ignore;
+    }
+
+
+    @ServiceDocument.IndexingParameters(serializedStateSize = 8, versionRetention = 44)
+    private static class AnnotatedDoc extends ServiceDocument {
+        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
+        @PropertyOptions(indexing = PropertyIndexingOption.STORE_ONLY)
+        @Documentation(description = "desc", exampleString = "example")
+        public String opt;
+
+        @UsageOption(option = PropertyUsageOption.ID)
+        @PropertyOptions(
+                indexing = {
+                    PropertyIndexingOption.SORT,
+                    PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE},
+                usage = {
+                    PropertyUsageOption.OPTIONAL})
+        public String opts;
+
+        @PropertyOptions(indexing = PropertyIndexingOption.EXPAND)
+        public Range nestedPodo;
+
+        @UsageOption(option = PropertyUsageOption.OPTIONAL)
+        public RoundingMode someEnum;
     }
 
     private static class TestKeyObjectValueHolder {
@@ -750,45 +849,100 @@ public class TestUtils {
     public void testMergeQueryResultsWithSameData() {
 
         ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] {1, 10, 2, 3, 4, 5, 6, 7, 8, 9});
+                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
         ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] {1, 10, 2, 3, 4, 5, 6, 7, 8, 9});
+                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
         ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] {1, 10, 2, 3, 4, 5, 6, 7, 8, 9});
+                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
 
         List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
 
         ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
 
-        assertTrue(verifyMergeResult(mergeResult, new int[]{1, 10, 2, 3, 4, 5, 6, 7, 8, 9}));
+        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
+    }
+
+    @Test
+    public void testAnnotationOnFields() {
+        Builder builder = ServiceDocumentDescription.Builder.create();
+        ServiceDocumentDescription desc = builder.buildDescription(AnnotatedDoc.class);
+        assertEquals(8, desc.serializedStateSizeLimit);
+        assertEquals(44, desc.versionRetentionLimit);
+
+        PropertyDescription optDesc = desc.propertyDescriptions.get("opt");
+        assertEquals(optDesc.usageOptions, EnumSet.of(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL));
+        assertEquals(optDesc.indexingOptions, EnumSet.of(PropertyIndexingOption.STORE_ONLY));
+        assertEquals(optDesc.exampleValue, "example");
+        assertEquals(optDesc.propertyDocumentation, "desc");
+
+        PropertyDescription optsDesc = desc.propertyDescriptions.get("opts");
+        assertEquals(optsDesc.usageOptions, EnumSet.of(PropertyUsageOption.ID, PropertyUsageOption.OPTIONAL));
+        assertEquals(optsDesc.indexingOptions, EnumSet.of(PropertyIndexingOption.SORT, PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE));
+    }
+
+    @Test
+    public void testNestedPodosAreAssignedKinds() {
+        ServiceDocumentDescription desc = ServiceDocumentDescription.Builder.create()
+                .buildDescription(AnnotatedDoc.class);
+        PropertyDescription nestedPodo = desc.propertyDescriptions.get("nestedPodo");
+        assertEquals(Utils.buildKind(Range.class), nestedPodo.kind);
+
+        // primitives don't have a kind
+        PropertyDescription opt = desc.propertyDescriptions.get("opt");
+        assertNull(opt.kind);
+    }
+
+    @Test
+    public void testEnumValuesArePopulated() {
+        ServiceDocumentDescription desc = ServiceDocumentDescription.Builder.create()
+                .buildDescription(AnnotatedDoc.class);
+        PropertyDescription someEnum = desc.propertyDescriptions.get("someEnum");
+        PropertyDescription nestedPodo = desc.propertyDescriptions.get("nestedPodo");
+
+        assertEquals(RoundingMode.values().length, someEnum.enumValues.length);
+        assertNull(nestedPodo.enumValues);
+    }
+
+    @Test
+    public void testNumberFieldsCoercedToDouble() {
+        PropertyDescription desc = ServiceDocumentDescription.Builder
+                .create()
+                .buildPodoPropertyDescription(NumericRange.class);
+        assertEquals(TypeName.DOUBLE, desc.fieldDescriptions.get("min").typeName);
+        assertEquals(TypeName.DOUBLE, desc.fieldDescriptions.get("max").typeName);
     }
 
     @Test
     public void testMergeQueryResultsWithDifferentData() {
 
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(new int[] {1, 3, 4, 5, 7, 9});
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(new int[] {10, 2, 3, 4, 5, 6, 9});
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {1, 10, 2, 3, 4, 8});
+        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
+                new int[] { 1, 3, 4, 5, 7, 9 });
+        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
+                new int[] { 10, 2, 3, 4, 5, 6, 9 });
+        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
+                new int[] { 1, 10, 2, 3, 4, 8 });
 
         List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
 
         ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
 
-        assertTrue(verifyMergeResult(mergeResult, new int[] {1, 10, 2, 3, 4, 5, 6, 7, 8, 9}));
+        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
     }
 
     @Test
     public void testMergeQueryResultsWithEmptySet() {
 
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(new int[] {1, 3, 4, 5, 7, 8, 9});
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(new int[] {10, 2, 3, 4, 5, 6, 9});
+        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
+                new int[] { 1, 3, 4, 5, 7, 8, 9 });
+        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
+                new int[] { 10, 2, 3, 4, 5, 6, 9 });
         ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {});
 
         List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
 
         ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
 
-        assertTrue(verifyMergeResult(mergeResult, new int[] {1, 10, 2, 3, 4, 5, 6, 7, 8, 9}));
+        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
     }
 
     @Test
@@ -807,21 +961,24 @@ public class TestUtils {
 
     @Test
     public void testMergeQueryResultsInDescOrder() {
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(new int[] {9, 7, 5, 4, 3, 1});
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(new int[] {9, 6, 5, 4, 3, 2, 10});
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {8, 4, 3, 2, 10, 1});
+        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
+                new int[] { 9, 7, 5, 4, 3, 1 });
+        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
+                new int[] { 9, 6, 5, 4, 3, 2, 10 });
+        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
+                new int[] { 8, 4, 3, 2, 10, 1 });
 
         List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
 
         ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, false);
 
-        assertTrue(verifyMergeResult(mergeResult, new int[] {9, 8, 7, 6, 5, 4, 3, 2, 10, 1}));
+        assertTrue(verifyMergeResult(mergeResult, new int[] { 9, 8, 7, 6, 5, 4, 3, 2, 10, 1 }));
     }
 
     private ServiceDocumentQueryResult createServiceDocumentQueryResult(int[] documentIndices) {
 
         ServiceDocumentQueryResult result = new ServiceDocumentQueryResult();
-        result.documentCount = (long)documentIndices.length;
+        result.documentCount = (long) documentIndices.length;
         result.documents = new HashMap<>();
 
         for (int index : documentIndices) {
@@ -833,18 +990,32 @@ public class TestUtils {
         return result;
     }
 
-    private boolean verifyMergeResult(ServiceDocumentQueryResult mergeResult, int[] expectedSequence) {
+    private boolean verifyMergeResult(ServiceDocumentQueryResult mergeResult,
+            int[] expectedSequence) {
         if (mergeResult.documentCount != expectedSequence.length) {
             return false;
         }
 
         for (int i = 0; i < expectedSequence.length; i++) {
-            String expectedLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document" + expectedSequence[i];
+            String expectedLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document"
+                    + expectedSequence[i];
             if (!expectedLink.equals(mergeResult.documentLinks.get(i))) {
                 return false;
             }
         }
 
         return true;
+    }
+
+    @Test
+    public void testDecodeUrlEncodedText() throws Throwable {
+
+        String textPlain = "param1=value1&param2=value 2&param3=value три";
+        byte[] textEncoded = URLEncoder.encode(textPlain, Utils.CHARSET).getBytes(Utils.CHARSET);
+
+        String textDecoded = Utils.decodeIfText(ByteBuffer.wrap(textEncoded),
+                Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED);
+
+        Assert.assertEquals(textPlain, textDecoded);
     }
 }

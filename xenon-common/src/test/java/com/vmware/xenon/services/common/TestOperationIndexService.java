@@ -22,13 +22,13 @@ import java.util.concurrent.TimeoutException;
 
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import com.vmware.xenon.common.BasicReusableHostTestCase;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
-import com.vmware.xenon.services.common.ExampleFactoryService;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.ServiceUriPaths;
@@ -61,6 +61,7 @@ public class TestOperationIndexService extends BasicReusableHostTestCase {
         this.host.toggleOperationTracing(this.host.getUri(), true);
     }
 
+    @Ignore("https://www.pivotaltracker.com/story/show/116147825")
     @Test
     public void testPost() throws Throwable {
         this.host.testStart(this.updateCount);
@@ -75,7 +76,7 @@ public class TestOperationIndexService extends BasicReusableHostTestCase {
             stateCountMap.put(state.name, 0);
 
             Operation op = Operation
-                    .createPost(UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK))
+                    .createPost(UriUtils.buildFactoryUri(this.host, ExampleService.class))
                     .setBody(state)
                     .setCompletion(this.host.getCompletion())
                     .setReferer(this.host.getReferer());
@@ -93,7 +94,7 @@ public class TestOperationIndexService extends BasicReusableHostTestCase {
         q.taskInfo.isDirect = true;
 
         q.querySpec.query.setTermPropertyName("path");
-        q.querySpec.query.setTermMatchValue(ExampleFactoryService.SELF_LINK);
+        q.querySpec.query.setTermMatchValue(ExampleService.FACTORY_LINK);
         q.indexLink = ServiceUriPaths.CORE_OPERATION_INDEX;
 
         // We need to poll even when testWait tells us the POST is done.
@@ -196,6 +197,9 @@ public class TestOperationIndexService extends BasicReusableHostTestCase {
                         // too many documents in the index (thereby verifying the blacklist is working as intended).
                         // Use 10% of updateCount as the fudge factor.  Anything greater than that just sounds unreasonable.
                         if (query.results.documentLinks.size() > (this.updateCount * 2 + (this.updateCount / 10))) {
+                            for (Object l : query.results.documents.values()) {
+                                this.host.log("%s", l);
+                            }
                             throw new IllegalStateException("too many operations found");
                         }
 

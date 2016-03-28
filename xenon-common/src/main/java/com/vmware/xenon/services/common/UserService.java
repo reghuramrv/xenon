@@ -13,11 +13,19 @@
 
 package com.vmware.xenon.services.common;
 
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.StatefulService;
 
 public class UserService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_USERS;
+
+    public static Service createFactory() {
+        return FactoryService.createIdempotent(UserService.class);
+    }
+
     /**
      * The {@link UserState} represents a single user's identity.
      */
@@ -43,6 +51,28 @@ public class UserService extends StatefulService {
         UserState state = op.getBody(UserState.class);
         if (!validate(op, state)) {
             return;
+        }
+
+        op.complete();
+    }
+
+    @Override
+    public void handlePut(Operation op) {
+        if (!op.hasBody()) {
+            op.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+
+        UserState newState = op.getBody(UserState.class);
+        if (!validate(op, newState)) {
+            return;
+        }
+
+        UserState currentState = getState(op);
+        if (currentState.email.equals(newState.email)) {
+            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
+        } else {
+            setState(op, newState);
         }
 
         op.complete();

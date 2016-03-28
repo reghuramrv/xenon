@@ -14,20 +14,32 @@
 package com.vmware.xenon.services.common;
 
 import java.net.URI;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 
+import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.StatefulService;
 
 /**
  * Describes the authentication credentials to authenticate with internal/external APIs.
  */
 public class AuthCredentialsService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE_CREDENTIALS;
+
+    public static Service createFactory() {
+        return FactoryService.createIdempotent(AuthCredentialsService.class);
+    }
+
     public static class AuthCredentialsServiceState extends ServiceDocument {
 
         public static final String FIELD_NAME_EMAIL = "userEmail";
         public static final String FIELD_NAME_PRIVATE_KEY = "privateKey";
+        public static final String FIELD_NAME_CUSTOM_PROPERTIES = "customProperties";
 
         /** Client ID. */
         public String userLink;
@@ -35,13 +47,28 @@ public class AuthCredentialsService extends StatefulService {
         /** Client email. */
         public String userEmail;
 
-        /** Service Account private key */
+        /**
+         * Service Account private key.
+         *
+         * When using the BasicAuthenticationService, this is the user password. Other
+         * authentication services may use it differently.
+         */
         public String privateKey;
 
-        /** Service Account private key id */
+        /**
+         * Service Account private key id
+         *
+         * When using the BasicAuthenticationService, this is not used. Other authentication services
+         * may use it.
+         */
         public String privateKeyId;
 
-        /** Service Account public key */
+        /**
+         * Service Account public key
+         *
+         * When using the BasicAuthenticationService, this is
+         * not used. Other authentication services may use it.
+         */
         public String publicKey;
 
         /** Token server URI. */
@@ -54,6 +81,11 @@ public class AuthCredentialsService extends StatefulService {
          * A list of tenant links which can access this service.
          */
         public List<String> tenantLinks;
+
+        /**
+         * Custom properties.
+         */
+        public Map<String, String> customProperties;
 
     }
 
@@ -102,5 +134,31 @@ public class AuthCredentialsService extends StatefulService {
         if (newState.type != null) {
             currentState.type = newState.type;
         }
+
+        if (newState.customProperties != null && !newState.customProperties.isEmpty()) {
+            if (currentState.customProperties == null || currentState.customProperties.isEmpty()) {
+                currentState.customProperties = newState.customProperties;
+            } else {
+                for (Map.Entry<String, String> e : newState.customProperties.entrySet()) {
+                    currentState.customProperties.put(e.getKey(), e.getValue());
+                }
+            }
+        }
+    }
+
+    @Override
+    public ServiceDocument getDocumentTemplate() {
+        ServiceDocument td = super.getDocumentTemplate();
+
+        // enable indexing of custom properties map.
+        ServiceDocumentDescription.PropertyDescription pdCustomProperties = td.documentDescription.propertyDescriptions
+                .get(AuthCredentialsServiceState.FIELD_NAME_CUSTOM_PROPERTIES);
+        pdCustomProperties.indexingOptions = EnumSet
+                .of(ServiceDocumentDescription.PropertyIndexingOption.EXPAND);
+
+        ServiceDocumentDescription.expandTenantLinks(td.documentDescription);
+
+        AuthCredentialsServiceState template = (AuthCredentialsServiceState) td;
+        return template;
     }
 }

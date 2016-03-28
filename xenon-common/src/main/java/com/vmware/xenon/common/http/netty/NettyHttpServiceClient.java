@@ -28,16 +28,17 @@ import javax.net.ssl.SSLContext;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import io.netty.handler.codec.http.ClientCookieDecoder;
-import io.netty.handler.codec.http.Cookie;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.cookie.ClientCookieDecoder;
+import io.netty.handler.codec.http.cookie.Cookie;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.OperationContext;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceClient;
 import com.vmware.xenon.common.ServiceErrorResponse;
@@ -59,7 +60,7 @@ public class NettyHttpServiceClient implements ServiceClient {
     public static final int DEFAULT_CONNECTIONS_PER_HOST = 128;
 
     /**
-     * Netty defaults to allowing 2^32 concurrent streams, which feels likea  bit much.
+     * Netty defaults to allowing 2^32 concurrent streams, which feels like a  bit much.
      * We set it to a smaller amount: we'll tune it as we get experience with it. It may
      * be reasonable to make it much larger than 1024.
      */
@@ -146,6 +147,7 @@ public class NettyHttpServiceClient implements ServiceClient {
 
         if (this.sslContext != null) {
             this.sslChannelPool = new NettyChannelPool(this.executor);
+            this.sslChannelPool.setConnectionLimitPerHost(getConnectionLimitPerHost());
             this.sslChannelPool.setThreadTag(buildThreadTag());
             this.sslChannelPool.setThreadCount(DEFAULT_EVENT_LOOP_THREAD_COUNT);
             this.sslChannelPool.setSSLContext(this.sslContext);
@@ -176,7 +178,10 @@ public class NettyHttpServiceClient implements ServiceClient {
         if (this.http2ChannelPool != null) {
             this.http2ChannelPool.stop();
         }
-        this.isStarted = false;
+        // In practice, it's safe not to synchornize here, but this make Findbugs happy.
+        synchronized (this) {
+            this.isStarted = false;
+        }
 
         if (this.host != null) {
             this.host.stopService(this.callbackService);
@@ -190,7 +195,7 @@ public class NettyHttpServiceClient implements ServiceClient {
 
     @Override
     public void send(Operation op) {
-        sendSingleRequest(op);
+        this.sendRequest(op);
     }
 
     private void sendSingleRequest(Operation op) {
@@ -199,18 +204,58 @@ public class NettyHttpServiceClient implements ServiceClient {
             return;
         }
 
+        setExpiration(clone);
+
         setCookies(clone);
 
-        // Try to deliver operation to in-process service host
-        if (!op.isRemote()) {
-            if (this.host != null && this.host.handleRequest(clone)) {
-                return;
-            }
+        // if operation has a context id, set it on the local thread, otherwise, set the
+        // context id from thread, on the operation
+        if (op.getContextId() != null) {
+            OperationContext.setContextId(op.getContextId());
+        } else {
+            clone.setContextId(OperationContext.getContextId());
         }
 
-        addAuthorizationContextHeader(clone);
+        OperationContext ctx = OperationContext.getOperationContext();
 
-        sendRemote(clone);
+        try {
+            // First attempt in process delivery to co-located host
+            if (!op.isRemote()) {
+                if (this.host != null && this.host.handleRequest(clone)) {
+                    return;
+                }
+            }
+            addAuthorizationContextHeader(clone);
+            addContextIdHeader(clone);
+            addTransactionIdHeader(clone);
+            sendRemote(clone);
+        } finally {
+            // we must restore the operation context after each send, since
+            // it can be reset by the host, depending on queuing and dispatching behavior
+            OperationContext.restoreOperationContext(ctx);
+        }
+    }
+
+    private void setExpiration(Operation op) {
+        if (op.getExpirationMicrosUtc() == 0) {
+            long defaultTimeoutMicros = ServiceHost.ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS;
+            if (this.host != null) {
+                defaultTimeoutMicros = this.host.getOperationTimeoutMicros();
+            }
+            op.setExpiration(Utils.getNowMicrosUtc() + defaultTimeoutMicros);
+        }
+    }
+
+    private void addContextIdHeader(Operation op) {
+        if (op.getContextId() != null) {
+            op.addRequestHeader(Operation.CONTEXT_ID_HEADER, op.getContextId());
+        }
+    }
+
+    private void addTransactionIdHeader(Operation op) {
+        if (op.getTransactionId() != null) {
+            op.addRequestHeader(Operation.TRANSACTION_ID_HEADER, op.getTransactionId());
+        }
     }
 
     private void addAuthorizationContextHeader(Operation op) {
@@ -252,15 +297,13 @@ public class NettyHttpServiceClient implements ServiceClient {
     }
 
     private void sendWithCallbackSingleRequest(Operation req) {
-        if (req.getExpirationMicrosUtc() == 0) {
-            req.setExpiration(Utils.getNowMicrosUtc()
-                    + this.host.getOperationTimeoutMicros());
-        }
-
         Operation op = clone(req);
         if (op == null) {
             return;
         }
+
+        setExpiration(op);
+
         if (!req.isRemote() && this.host != null && this.host.handleRequest(op)) {
             // request was accepted by an in-process service host
             return;
@@ -312,7 +355,7 @@ public class NettyHttpServiceClient implements ServiceClient {
             return;
         }
 
-        Cookie cookie = ClientCookieDecoder.decode(value);
+        Cookie cookie = ClientCookieDecoder.LAX.decode(value);
         if (cookie == null) {
             return;
         }
@@ -321,6 +364,16 @@ public class NettyHttpServiceClient implements ServiceClient {
     }
 
     private void connect(Operation op) {
+        final Object originalBody = op.getBodyRaw();
+
+        // We know the URI is not null, because it was checked in clone()
+        if (op.getUri().getHost() == null) {
+            op.setRetryCount(0);
+            fail(new IllegalArgumentException("Missing host in URI"),
+                    op, originalBody);
+            return;
+        }
+
         URI uri = this.httpProxy == null ? op.getUri() : this.httpProxy;
         if (op.getUri().getHost().equals(ServiceHost.LOCAL_HOST)) {
             uri = op.getUri();
@@ -330,10 +383,10 @@ public class NettyHttpServiceClient implements ServiceClient {
             if (e != null) {
                 op.setBody(ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST,
                         EnumSet.of(ErrorDetail.SHOULD_RETRY)));
-                fail(e, op);
+                fail(e, op, originalBody);
                 return;
             }
-            sendRequest(op);
+            doSendRequest(op);
         });
 
         int port = uri.getPort();
@@ -354,27 +407,35 @@ public class NettyHttpServiceClient implements ServiceClient {
             pool = this.sslChannelPool;
 
             if (this.getSSLContext() == null || pool == null) {
+                op.setRetryCount(0);
                 fail(new IllegalArgumentException(
                         "HTTPS not enabled, set SSL context before starting client:"
                                 + op.getUri().getScheme()),
-                        op);
+                        op, originalBody);
                 return;
             }
         } else {
+            op.setRetryCount(0);
             fail(new IllegalArgumentException(
-                    "Scheme is not supported: " + op.getUri().getScheme()), op);
+                    "Scheme is not supported: " + op.getUri().getScheme()), op, originalBody);
             return;
         }
 
         pool.connectOrReuse(uri.getHost(), port, op);
     }
 
-    private void sendRequest(Operation op) {
+    @Override
+    public void sendRequest(Operation op) {
+        sendSingleRequest(op);
+    }
+
+    private void doSendRequest(Operation op) {
+        final Object originalBody = op.getBodyRaw();
         try {
             byte[] body = Utils.encodeBody(op);
             String pathAndQuery;
             String path = op.getUri().getPath();
-            String query = op.getUri().getQuery();
+            String query = op.getUri().getRawQuery();
             path = path == null || path.isEmpty() ? "/" : path;
             if (query != null) {
                 pathAndQuery = path + "?" + query;
@@ -419,10 +480,6 @@ public class NettyHttpServiceClient implements ServiceClient {
             request.headers().set(HttpHeaderNames.CONTENT_TYPE, op.getContentType());
             request.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
 
-            if (op.getContextId() != null) {
-                request.headers().set(Operation.CONTEXT_ID_HEADER, op.getContextId());
-            }
-
             if (op.getReferer() != null) {
                 request.headers().set(HttpHeaderNames.REFERER, op.getReferer().toString());
             }
@@ -433,20 +490,21 @@ public class NettyHttpServiceClient implements ServiceClient {
             }
 
             request.headers().set(HttpHeaderNames.USER_AGENT, this.userAgent);
-            request.headers().set(HttpHeaderNames.ACCEPT, "*/*");
-            // The Netty HTTP/2 code in 5.0-alpha that converts the Host header assumes
-            // that the Host is a URI (unlike HTTP1.1, when it is just a hostname) so that it
-            // can create the :scheme pseudo-header. If it's not a URI, it throws an exception
-            // we we put "http://" in front.
-            request.headers().set(
-                    HttpHeaderNames.HOST,
-                    (useHttp2 ? op.getUri().getScheme() + "://" : "")
-                            + op.getUri().getHost()
-                            + ((op.getUri().getPort() != -1) ? (":" + op.getUri().getPort()) : ""));
+            if (!op.getRequestHeaders().containsKey(Operation.ACCEPT_HEADER)) {
+                request.headers().set(HttpHeaderNames.ACCEPT,
+                        Operation.MEDIA_TYPE_EVERYTHING_WILDCARDS);
+            }
+
+            request.headers().set(HttpHeaderNames.HOST, op.getUri().getHost());
+
+            // The Netty HTTP/2 code uses the URI to create the :scheme pseudo-header.
+            if (useHttp2) {
+                request.setUri(op.getUri().toString());
+            }
 
             op.nestCompletion((o, e) -> {
                 if (e != null) {
-                    fail(e, op);
+                    fail(e, op, originalBody);
                     return;
                 }
                 // After request is sent control is transferred to the
@@ -459,12 +517,11 @@ public class NettyHttpServiceClient implements ServiceClient {
         } catch (Throwable e) {
             op.setBody(ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST,
                     EnumSet.of(ErrorDetail.SHOULD_RETRY)));
-            fail(e, op);
+            fail(e, op, originalBody);
         }
     }
 
-    private void fail(Throwable e, Operation op) {
-        boolean isRetryRequested = op.getRetryCount() > 0 && op.decrementRetriesRemaining() >= 0;
+    private void fail(Throwable e, Operation op, Object originalBody) {
 
         NettyChannelContext ctx = (NettyChannelContext) op.getSocketContext();
         NettyChannelPool pool = this.channelPool;
@@ -473,16 +530,33 @@ public class NettyHttpServiceClient implements ServiceClient {
             pool = this.sslChannelPool;
         }
 
-        op.setSocketContext(null);
-        pool.returnOrClose(ctx, !op.isKeepAlive());
+        if (ctx != null && ctx.getProtocol() == NettyChannelContext.Protocol.HTTP2) {
+            // For HTTP/2, we multiple streams so we don't close the connection.
+            pool = this.http2ChannelPool;
+            pool.returnOrClose(ctx, false);
+        } else {
+            // for HTTP/1.1, we close the stream to ensure we don't use a bad connection
+            op.setSocketContext(null);
+            pool.returnOrClose(ctx, !op.isKeepAlive());
+        }
 
         if (this.scheduledExecutor.isShutdown()) {
             op.fail(new CancellationException());
             return;
         }
 
-        if (op.getStatusCode() >= Operation.STATUS_CODE_SERVER_FAILURE_THRESHOLD) {
-            isRetryRequested = false;
+        boolean isRetryRequested = op.getRetryCount() > 0 && op.decrementRetriesRemaining() >= 0;
+
+        if (isRetryRequested) {
+            if (op.getStatusCode() >= Operation.STATUS_CODE_SERVER_FAILURE_THRESHOLD) {
+                isRetryRequested = false;
+            } else if (op.getStatusCode() == Operation.STATUS_CODE_CONFLICT) {
+                isRetryRequested = false;
+            } else if (op.getStatusCode() == Operation.STATUS_CODE_UNAUTHORIZED) {
+                isRetryRequested = false;
+            } else if (op.getStatusCode() == Operation.STATUS_CODE_NOT_FOUND) {
+                isRetryRequested = false;
+            }
         }
 
         if (!isRetryRequested) {
@@ -500,7 +574,10 @@ public class NettyHttpServiceClient implements ServiceClient {
 
         int delaySeconds = op.getRetryCount() - op.getRetriesRemaining();
 
-        op.setStatusCode(Operation.STATUS_CODE_OK);
+        // restore status code and body, then restart send state machine
+        // (connect, encode, write to channel)
+        op.setStatusCode(Operation.STATUS_CODE_OK).setBodyNoCloning(originalBody);
+
         this.scheduledExecutor.schedule(() -> {
             connect(op);
         } , delaySeconds, TimeUnit.SECONDS);
@@ -528,11 +605,10 @@ public class NettyHttpServiceClient implements ServiceClient {
         }
 
         boolean needsBody = op.getAction() != Action.GET && op.getAction() != Action.DELETE &&
-                op.getAction() != Action.POST;
+                op.getAction() != Action.POST && op.getAction() != Action.OPTIONS;
 
         if (!op.hasBody() && needsBody) {
-            e = new IllegalArgumentException(
-                    "Body is required");
+            e = new IllegalArgumentException("Body is required");
         }
 
         if (e != null) {
@@ -593,4 +669,45 @@ public class NettyHttpServiceClient implements ServiceClient {
         return this.sslContext;
     }
 
+    public NettyChannelPool getChannelPool() {
+        return this.channelPool;
+    }
+
+    public NettyChannelPool getHttp2ChannelPool() {
+        return this.http2ChannelPool;
+    }
+
+    public NettyChannelPool getSslChannelPool() {
+        return this.sslChannelPool;
+    }
+
+    /**
+     * Find the HTTP/2 context that is currently being used to talk to a given host.
+     * This is intended for infrastructure test purposes.
+     */
+    public NettyChannelContext getCurrentHttp2Context(String host, int port) {
+        if (this.http2ChannelPool == null) {
+            throw new IllegalStateException("Internal error: no HTTP/2 channel pool");
+        }
+        return this.http2ChannelPool.getFirstValidHttp2Context(host, port);
+    }
+
+    /**
+     * Count how many HTTP/2 contexts we have. There may be more than one if we have
+     * an exhausted connection that hasn't been cleaned up yet.
+     * This is intended for infrastructure test purposes.
+     */
+    public int countHttp2Contexts(String host, int port) {
+        if (this.http2ChannelPool == null) {
+            throw new IllegalStateException("Internal error: no HTTP/2 channel pool");
+        }
+        return this.http2ChannelPool.getHttp2ActiveContextCount(host, port);
+    }
+
+    /**
+     * Infrastructure testing use only: do not use this in production
+     */
+    public void clearCookieJar() {
+        this.cookieJar = new CookieJar();
+    }
 }

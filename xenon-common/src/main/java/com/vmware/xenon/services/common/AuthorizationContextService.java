@@ -85,10 +85,9 @@ public class AuthorizationContextService extends StatelessService {
         }
     }
 
-    public static String SELF_LINK = ServiceUriPaths.CORE_AUTHZ_VERIFICATION;
+    public static final String SELF_LINK = ServiceUriPaths.CORE_AUTHZ_VERIFICATION;
 
-    private Map<String, Collection<Operation>> pendingOperationsBySubject =
-            new HashMap<>();
+    private final Map<String, Collection<Operation>> pendingOperationsBySubject = new HashMap<>();
 
     /**
      * The service host will invoke this method to allow a service to handle
@@ -124,7 +123,7 @@ public class AuthorizationContextService extends StatelessService {
         }
 
         // Check whether or not the operation already has a processed context.
-        if (ctx.getResourceQueryFilter() != null) {
+        if (ctx.getResourceQueryFilter(op.getAction()) != null) {
             op.complete();
             return true;
         }
@@ -372,26 +371,42 @@ public class AuthorizationContextService extends StatelessService {
         builder.setToken(ctx.getToken());
 
         if (!roles.isEmpty()) {
-            Query q = new Query();
-            q.occurance = Occurance.MUST_OCCUR;
+            Map<Action, Collection<Role>> roleListByAction = new HashMap<>(Action.values().length);
             for (Role role : roles) {
-                Query resourceGroupQuery = role.resourceGroupState.query;
-                resourceGroupQuery.occurance = Occurance.SHOULD_OCCUR;
-                q.addBooleanClause(resourceGroupQuery);
+                for (Action action : role.roleState.verbs) {
+                    Collection<Role> roleList = roleListByAction.get(action);
+                    if (roleList == null) {
+                        roleList = new LinkedList<>();
+                        roleListByAction.put(action, roleList);
+                    }
+
+                    roleList.add(role);
+                }
             }
 
-            builder.setResourceQuery(q);
+            Map<Action, QueryFilter> queryFilterByAction = new HashMap<>(Action.values().length);
+            Map<Action, Query> queryByAction = new HashMap<>(Action.values().length);
+            for (Map.Entry<Action, Collection<Role>> entry : roleListByAction.entrySet()) {
+                Query q = new Query();
+                q.occurance = Occurance.MUST_OCCUR;
+                for (Role role : entry.getValue()) {
+                    Query resourceGroupQuery = role.resourceGroupState.query;
+                    resourceGroupQuery.occurance = Occurance.SHOULD_OCCUR;
+                    q.addBooleanClause(resourceGroupQuery);
+                }
 
-            try {
-                builder.setResourceQueryFilter(QueryFilter.create(q));
-            } catch (QueryFilterException qfe) {
-                logWarning("Error creating query filter: %s", qfe.toString());
-                failThrowable(claims.getSubject(), qfe);
-                return;
+                try {
+                    queryFilterByAction.put(entry.getKey(), QueryFilter.create(q));
+                    queryByAction.put(entry.getKey(), q);
+                } catch (QueryFilterException qfe) {
+                    logWarning("Error creating query filter: %s", qfe.toString());
+                    failThrowable(claims.getSubject(), qfe);
+                    return;
+                }
             }
-        } else {
-            // No applicable roles; don't allow access
-            builder.setResourceQueryFilter(QueryFilter.FALSE);
+
+            builder.setResourceQueryMap(queryByAction);
+            builder.setResourceQueryFilterMap(queryFilterByAction);
         }
 
         AuthorizationContext newContext = builder.getResult();

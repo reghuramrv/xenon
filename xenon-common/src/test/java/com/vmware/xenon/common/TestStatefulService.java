@@ -13,6 +13,9 @@
 
 package com.vmware.xenon.common;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
 import java.net.URI;
 import java.util.Date;
 import java.util.EnumSet;
@@ -26,12 +29,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
 
+import com.vmware.xenon.common.DefaultHandlerTestService.DefaultHandlerState;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 import com.vmware.xenon.common.test.TestProperty;
-import com.vmware.xenon.services.common.ExampleFactoryService;
+import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.MinimalTestService;
 import com.vmware.xenon.services.common.ServiceUriPaths;
@@ -46,7 +50,7 @@ class DeleteVerificationTestService extends StatefulService {
     }
 
     @Override
-    public void handleDelete(Operation delete) {
+    public void handleStop(Operation delete) {
         if (!delete.hasBody()) {
             delete.fail(new IllegalStateException("Expected service state in expiration DELETE"));
             return;
@@ -88,7 +92,127 @@ class DeleteVerificationTestFactoryService extends FactoryService {
     }
 }
 
+/**
+ * This is basically _the minimum_ test service (but "minimum" is already taken) since it uses
+ * and tests the _default_ handlers (e.g., PUT, GET).
+ */
+class DefaultHandlerTestService extends StatefulService {
+    /**
+     * The state includes both a reference and a primitive type so as to test both.
+     */
+    public static class DefaultHandlerState extends ServiceDocument {
+        public int stateInt;
+        public String stateString;
+    }
+
+    public DefaultHandlerTestService() {
+        super(DefaultHandlerState.class);
+    }
+
+    @Override
+    public void handleStart(Operation startPost) {
+        if (startPost.hasBody()) {
+            DefaultHandlerState s = startPost.getBody(DefaultHandlerState.class);
+            logFine("Initial state is %s", Utils.toJsonHtml(s));
+        }
+        startPost.complete();
+    }
+}
+
 public class TestStatefulService extends BasicReusableHostTestCase {
+
+    @Test
+    public void optionsValidation() throws Throwable {
+        ExampleServiceState body = new ExampleServiceState();
+        body.name = UUID.randomUUID().toString();
+        body.documentSelfLink = UUID.randomUUID().toString();
+        Operation post = Operation
+                .createPost(UriUtils.buildFactoryUri(this.host, ExampleService.class))
+                .setCompletion(this.host.getCompletion())
+                .setBody(body);
+        this.host.testStart(1);
+        this.host.send(post);
+        this.host.testWait();
+        URI childServiceUri = UriUtils.buildUri(this.host.getUri(),
+                ExampleService.FACTORY_LINK, body.documentSelfLink);
+        // get service options, verify they make sense
+        URI configUri = UriUtils.buildConfigUri(childServiceUri);
+        ServiceConfiguration cfg = this.host.getServiceState(null, ServiceConfiguration.class,
+                configUri);
+        assertTrue(cfg.options.contains(ServiceOption.CONCURRENT_GET_HANDLING));
+
+        // now verify a stateful but not persisted service
+        childServiceUri = UriUtils.buildUri(this.host, UUID.randomUUID().toString());
+        this.host.startService(Operation.createPost(childServiceUri),
+                new DefaultHandlerTestService());
+        String uriPath = childServiceUri.getPath();
+        this.host.waitForServiceAvailable(uriPath);
+
+        configUri = UriUtils.buildConfigUri(childServiceUri);
+        cfg = this.host.getServiceState(null, ServiceConfiguration.class,
+                configUri);
+        assertTrue(!cfg.options.contains(ServiceOption.CONCURRENT_GET_HANDLING));
+
+    }
+
+    @Test
+    public void testBaseHelperMethods() throws Throwable {
+        MinimalTestServiceState body = new MinimalTestServiceState();
+        body.id = UUID.randomUUID().toString();
+        MinimalTestService s = new MinimalTestService();
+        s = (MinimalTestService) this.host.startServiceAndWait(s,
+                "some/" + body.id, body);
+
+        assertEquals(body.id, s.getSelfId());
+        assertEquals(body.id, Service.getId(s.getSelfId()));
+
+        Operation op = Operation.createPatch(s.getUri()).setBody(body);
+        MinimalTestServiceState bodyFromHelper = s.getBody(op);
+        assertEquals(bodyFromHelper.id, body.id);
+
+        assertTrue(s.checkForBody(op));
+        op.setBody(null);
+        assertTrue(!s.checkForBody(op));
+        assertEquals(Operation.STATUS_CODE_BAD_REQUEST, op.getStatusCode());
+    }
+
+    @Test
+    public void testDefaultPUT() throws Throwable {
+        URI uri = UriUtils.buildUri(this.host, "testHandlersInstance");
+        this.host.startService(Operation.createPost(uri), new DefaultHandlerTestService());
+        String uriPath = uri.getPath();
+        this.host.waitForServiceAvailable(uriPath);
+
+        this.host.testStart(1);
+        // Now send do a PUT
+        DefaultHandlerState newState = new DefaultHandlerState();
+        newState.stateString = "State One";
+        newState.stateInt = 1;
+        Operation createPut = Operation
+                .createPut(uri)
+                .setBody(newState)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
+                                if (rsp.message == null || rsp.message.isEmpty()) {
+                                    this.host.failIteration(new IllegalStateException(
+                                            "Missing error response"));
+                                    return;
+                                }
+                            }
+                            this.host.completeIteration();
+                        });
+        this.host.send(createPut);
+        host.testWait();
+
+        // Make sure the default PUT worked
+        DefaultHandlerState currentState = this.host.getServiceState(null,
+                DefaultHandlerState.class, uri);
+        assertEquals(currentState.stateInt, newState.stateInt);
+        assertEquals(currentState.stateString, newState.stateString);
+    }
+
     @Test
     public void throughputInMemoryServicePutConcurrentSend()
             throws Throwable {
@@ -284,7 +408,7 @@ public class TestStatefulService extends BasicReusableHostTestCase {
     public void serviceStopWithInflightRequests() throws Throwable {
         long c = 100;
 
-        this.host.waitForServiceAvailable(ExampleFactoryService.SELF_LINK);
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
 
         List<Service> services = this.host.doThroughputServiceStart(c,
                 MinimalTestService.class,

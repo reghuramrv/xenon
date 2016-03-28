@@ -494,6 +494,19 @@ public class QueryFilter {
                 String key = term.propertyParts.get(depth);
                 Object value = map.get(key);
                 return evaluateTerm(term, value, pd.elementDescription, depth + 1);
+            } else if (pd.typeName == TypeName.PODO) {
+                if (depth >= term.propertyParts.size()) {
+                    return term.negate;
+                }
+
+                String propertyName = term.propertyParts.get(depth);
+                PropertyDescription fd = pd.fieldDescriptions.get(propertyName);
+                if (fd == null) {
+                    return term.negate;
+                }
+
+                Object value = ReflectionUtils.getPropertyValue(fd, o);
+                return evaluateTerm(term, value, fd, depth + 1);
             } else {
                 // Not supported yet...
                 return false;
@@ -729,7 +742,7 @@ public class QueryFilter {
         }
 
         // Convert values to array and sort by count
-        Elem[] elements = elemByProperty.values().toArray(new Elem[0]);
+        Elem[] elements = elemByProperty.values().toArray(new Elem[elemByProperty.size()]);
         Arrays.sort(elements, new ElemComparator());
         return elements[elements.length - 1].name;
     }

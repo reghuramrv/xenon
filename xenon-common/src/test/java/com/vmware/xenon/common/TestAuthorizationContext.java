@@ -21,6 +21,8 @@ import java.security.GeneralSecurityException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.Test;
@@ -50,6 +52,11 @@ public class TestAuthorizationContext extends BasicTestCase {
 
     public static class ClaimsVerificationService extends StatelessService {
         public static final String SELF_LINK = "/claims-verification";
+
+        @Override
+        public void authorizeRequest(Operation op) {
+            op.complete();
+        }
 
         @Override
         public void handleStart(Operation op) {
@@ -154,6 +161,11 @@ public class TestAuthorizationContext extends BasicTestCase {
     public static class SetAuthorizationContextTestService extends StatelessService {
         public static final String SELF_LINK = "/set-authorization-context-test";
         public static final String EXPECT_USER_CONTEXT = "expectUserContext";
+
+        @Override
+        public void authorizeRequest(Operation op) {
+            op.complete();
+        }
 
         @Override
         public void handleRequest(Operation op) {
@@ -279,7 +291,7 @@ public class TestAuthorizationContext extends BasicTestCase {
 
         Claims.Builder builder = new Claims.Builder();
         builder.setSubject("test-subject");
-        builder.setExpirationTime(new Long(0));
+        builder.setExpirationTime(0L);
         Claims expected = builder.getResult();
 
         // Post to create an expired auth context
@@ -311,6 +323,11 @@ public class TestAuthorizationContext extends BasicTestCase {
 
     public static class WhitelistAuthorizationContextTestService extends StatelessService {
         public static final String SELF_LINK = "/whitelist-authorization-context-test";
+
+        @Override
+        public void authorizeRequest(Operation op) {
+            op.complete();
+        }
 
         @Override
         public void handleGet(Operation op) {
@@ -534,5 +551,23 @@ public class TestAuthorizationContext extends BasicTestCase {
         joinOpWithHandler.sendWith(this.host);
         this.host.testWait();
         this.host.resetSystemAuthorizationContext();
+    }
+
+    @Test
+    public void testAuthPropForThreadPool() throws Throwable {
+        ExecutorService threadPool = Executors.newFixedThreadPool(2);
+        String user1 = "user1@test.com";
+        AuthorizationContext context = createAuthorizationContext(user1, this.host);
+        OperationContext.setAuthorizationContext(context);
+        this.host.testStart(1);
+        this.host.run(threadPool, () -> {
+            String subject = OperationContext.getAuthorizationContext().getClaims().getSubject();
+            if (subject.endsWith(user1)) {
+                this.host.completeIteration();
+            } else {
+                this.host.failIteration(new Exception("expected subject for " + user1 + ", received " + subject));
+            }
+        });
+        this.host.testWait();
     }
 }

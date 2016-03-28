@@ -19,7 +19,9 @@ import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
 import java.security.GeneralSecurityException;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -27,7 +29,9 @@ import java.util.LinkedList;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
 import org.junit.After;
@@ -35,24 +39,33 @@ import org.junit.Before;
 import org.junit.Test;
 
 import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service.Action;
+import com.vmware.xenon.common.test.AuthorizationHelper;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.AuthorizationContextService;
-import com.vmware.xenon.services.common.ExampleFactoryService;
+import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.GuestUserService;
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.Query.Builder;
-import com.vmware.xenon.services.common.ResourceGroupService.ResourceGroupState;
-import com.vmware.xenon.services.common.RoleService.Policy;
-import com.vmware.xenon.services.common.RoleService.RoleState;
-import com.vmware.xenon.services.common.ServiceUriPaths;
-import com.vmware.xenon.services.common.UserGroupService.UserGroupState;
 
 public class TestAuthorization extends BasicTestCase {
 
-    String userServicePath;
+    public static class AuthzStatelessService extends StatelessService {
+        public void handleRequest(Operation op) {
+            if (op.getAction() == Action.PATCH) {
+                op.complete();
+                return;
+            }
+            super.handleRequest(op);
+        }
+    }
+
+    private String userServicePath;
+    private AuthorizationHelper authHelper;
+    private int serviceCount = 10;
 
     @Override
     public void beforeHostStart(VerificationHost host) {
@@ -74,22 +87,145 @@ public class TestAuthorization extends BasicTestCase {
 
     @Before
     public void setupRoles() throws Throwable {
-        OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
-        this.userServicePath = this.host.createUserService("jane@doe.com");
-        createRoles();
-        OperationContext.setAuthorizationContext(null);
+        this.host.setSystemAuthorizationContext();
+        this.authHelper = new AuthorizationHelper(this.host);
+        this.userServicePath = this.authHelper.createUserService(this.host, "jane@doe.com");
+        this.authHelper.createRoles(this.host);
+        this.host.resetAuthorizationContext();
     }
 
     @Test
-    public void testAuthPrincipalQuery() throws Throwable {
+    public void statelessServiceAuthorization() throws Throwable {
+        // assume system identity so we can create roles
+        this.host.setSystemAuthorizationContext();
+
+        String serviceLink = UUID.randomUUID().toString();
+        // the helper uses the verification host's latch, so we need to
+        // start a test, with count 2 to create the resource group and role
+        this.host.testStart(2);
+
+        // create a specific role for a stateless service
+        String resourceGroupLink = this.authHelper.createResourceGroup(this.host,
+                "stateless-service-group", Builder.create()
+                        .addFieldClause(
+                                ServiceDocument.FIELD_NAME_SELF_LINK,
+                                UriUtils.URI_PATH_CHAR + serviceLink)
+                        .build());
+        this.authHelper.createRole(this.host, this.authHelper.getUserGroupLink(),
+                resourceGroupLink,
+                new HashSet<>(Arrays.asList(Action.GET, Action.POST, Action.PATCH, Action.DELETE)));
+        this.host.testWait();
+        this.host.resetAuthorizationContext();
+
+        CompletionHandler ch = (o, e) -> {
+            if (e == null || o.getStatusCode() != Operation.STATUS_CODE_FORBIDDEN) {
+                this.host.failIteration(new IllegalStateException(
+                        "Operation did not fail with proper status code"));
+                return;
+            }
+            this.host.completeIteration();
+        };
+
+        // assume authorized user identity
+        this.host.assumeIdentity(this.userServicePath, null);
+
+        // Verify startService
+        Operation post = Operation.createPost(UriUtils.buildUri(this.host, serviceLink));
+        // do not supply a body, authorization should still be applied
+        this.host.testStart(1);
+        post.setCompletion(this.host.getCompletion());
+        this.host.startService(post, new AuthzStatelessService());
+        this.host.testWait();
+
+        // stop service so we can attempt restart
+        this.host.testStart(1);
+        Operation delete = Operation.createDelete(post.getUri())
+                .setCompletion(this.host.getCompletion());
+        this.host.send(delete);
+        this.host.testWait();
+
+        // Verify DENY startService
+        this.host.resetAuthorizationContext();
+        this.host.testStart(1);
+        post = Operation.createPost(UriUtils.buildUri(this.host, serviceLink));
+        post.setCompletion(ch);
+        this.host.startService(post, new AuthzStatelessService());
+        this.host.testWait();
+
+        // assume authorized user identity
+        this.host.assumeIdentity(this.userServicePath, null);
+
+        // restart service
+        post = Operation.createPost(UriUtils.buildUri(this.host, serviceLink));
+        // do not supply a body, authorization should still be applied
+        this.host.testStart(1);
+        post.setCompletion(this.host.getCompletion());
+        this.host.startService(post, new AuthzStatelessService());
+        this.host.testWait();
+
+        // Verify PATCH
+        Operation patch = Operation.createPatch(UriUtils.buildUri(this.host, serviceLink));
+        patch.setBody(new ServiceDocument());
+        this.host.testStart(1);
+        patch.setCompletion(this.host.getCompletion());
+        this.host.send(patch);
+        this.host.testWait();
+
+        // Verify DENY PATCH
+        this.host.resetAuthorizationContext();
+        patch = Operation.createPatch(UriUtils.buildUri(this.host, serviceLink));
+        patch.setBody(new ServiceDocument());
+        this.host.testStart(1);
+        patch.setCompletion(ch);
+        this.host.send(patch);
+        this.host.testWait();
+    }
+
+    @Test
+    public void queryWithDocumentAuthPrincipal() throws Throwable {
         this.host.assumeIdentity(this.userServicePath, null);
         createExampleServices("jane");
+
+        // do a direct, simple query first
         this.host.createAndWaitSimpleDirectQuery(ServiceDocument.FIELD_NAME_AUTH_PRINCIPAL_LINK,
-                this.userServicePath, 2, 2);
+                this.userServicePath, this.serviceCount, this.serviceCount);
+
+        // now do a paginated query to verify we can get to paged results with authz enabled
+        QueryTask qt = QueryTask.Builder.create().setResultLimit(this.serviceCount / 2)
+                .build();
+        qt.querySpec.query = Query.Builder.create()
+                .addFieldClause(ServiceDocument.FIELD_NAME_AUTH_PRINCIPAL_LINK,
+                        this.userServicePath)
+                .build();
+
+        URI taskUri = this.host.createQueryTaskService(qt);
+        Date exp = this.host.getTestExpiration();
+        while (new Date().before(exp)) {
+
+            qt = this.host.getServiceState(null, QueryTask.class, taskUri);
+            if (TaskState.isFailed(qt.taskInfo)) {
+                throw new IllegalStateException("task failed");
+            }
+            if (TaskState.isFinished(qt.taskInfo)) {
+                break;
+            }
+            this.host.log("Task not finished");
+            Thread.sleep(100);
+        }
+
+        if (new Date().after(exp)) {
+            throw new TimeoutException();
+        }
+
+        this.host.testStart(1);
+        Operation get = Operation.createGet(UriUtils.buildUri(this.host, qt.results.nextPageLink))
+                .setCompletion(this.host.getCompletion());
+        this.host.send(get);
+        this.host.testWait();
     }
 
     @Test
-    public void testScheduleAndRunContext() throws Throwable {
+    public void contextPropagationOnScheduleAndRunContext() throws Throwable {
         this.host.assumeIdentity(this.userServicePath, null);
 
         AuthorizationContext callerAuthContext = OperationContext.getAuthorizationContext();
@@ -111,14 +247,14 @@ public class TestAuthorization extends BasicTestCase {
     }
 
     @Test
-    public void testGuestAuthorization() throws Throwable {
+    public void guestAuthorization() throws Throwable {
         OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
 
         this.host.testStart(3);
 
         // Create user group for guest user
         String userGroupLink =
-                createUserGroup("guest-user-group", Builder.create()
+                this.authHelper.createUserGroup(this.host, "guest-user-group", Builder.create()
                         .addFieldClause(
                                 ServiceDocument.FIELD_NAME_SELF_LINK,
                                 GuestUserService.SELF_LINK)
@@ -126,7 +262,7 @@ public class TestAuthorization extends BasicTestCase {
 
         // Create resource group for example service state
         String exampleServiceResourceGroupLink =
-                createResourceGroup("guest-resource-group", Builder.create()
+                this.authHelper.createResourceGroup(this.host, "guest-resource-group", Builder.create()
                         .addFieldClause(
                                 ExampleServiceState.FIELD_NAME_KIND,
                                 Utils.buildKind(ExampleServiceState.class))
@@ -136,7 +272,8 @@ public class TestAuthorization extends BasicTestCase {
                         .build());
 
         // Create roles tying these together
-        createRole(userGroupLink, exampleServiceResourceGroupLink);
+        this.authHelper.createRole(this.host, userGroupLink, exampleServiceResourceGroupLink,
+                new HashSet<>(Arrays.asList(Action.GET, Action.POST)));
 
         this.host.testWait();
 
@@ -149,7 +286,8 @@ public class TestAuthorization extends BasicTestCase {
 
         // Execute get on factory trying to get all example services
         final ServiceDocumentQueryResult[] factoryGetResult = new ServiceDocumentQueryResult[1];
-        Operation getFactory = Operation.createGet(UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK))
+        Operation getFactory = Operation.createGet(
+                UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK))
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         this.host.failIteration(e);
@@ -166,20 +304,91 @@ public class TestAuthorization extends BasicTestCase {
 
         // Make sure only the authorized services were returned
         assertAuthorizedServicesInResult("guest", exampleServices, factoryGetResult[0]);
+
     }
 
     @Test
-    public void exampleAuthorization() throws Throwable {
+    public void actionBasedAuthorization() throws Throwable {
+
+        // Assume Jane's identity
+        this.host.assumeIdentity(this.userServicePath, null);
+
+        // add docs accessible by jane
+        Map<URI, ExampleServiceState> exampleServices = createExampleServices("jane");
+
+        // Execute get on factory trying to get all example services
+        final ServiceDocumentQueryResult[] factoryGetResult = new ServiceDocumentQueryResult[1];
+        Operation getFactory = Operation.createGet(
+                UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK))
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.failIteration(e);
+                        return;
+                    }
+
+                    factoryGetResult[0] = o.getBody(ServiceDocumentQueryResult.class);
+                    this.host.completeIteration();
+                });
+
+        this.host.testStart(1);
+        this.host.send(getFactory);
+        this.host.testWait();
+
+        // DELETE operation should be denied
+        Set<String> selfLinks = new HashSet<>(factoryGetResult[0].documentLinks);
+        for (String selfLink : selfLinks) {
+            Operation deleteOperation =
+                    Operation.createDelete(UriUtils.buildUri(this.host, selfLink))
+                            .setCompletion((o, e) -> {
+                                if (o.getStatusCode() != Operation.STATUS_CODE_FORBIDDEN) {
+                                    String message = String.format("Expected %d, got %s",
+                                            Operation.STATUS_CODE_FORBIDDEN,
+                                            o.getStatusCode());
+                                    this.host.failIteration(new IllegalStateException(message));
+                                    return;
+                                }
+
+                                this.host.completeIteration();
+                            });
+            this.host.testStart(1);
+            this.host.send(deleteOperation);
+            this.host.testWait();
+        }
+
+        // PATCH operation should be allowed
+        for (String selfLink : selfLinks) {
+            Operation patchOperation =
+                    Operation.createPatch(UriUtils.buildUri(this.host, selfLink))
+                        .setBody(exampleServices.get(selfLink))
+                        .setCompletion((o, e) -> {
+                            if (o.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                String message = String.format("Expected %d, got %s",
+                                        Operation.STATUS_CODE_OK,
+                                        o.getStatusCode());
+                                this.host.failIteration(new IllegalStateException(message));
+                                return;
+                            }
+
+                            this.host.completeIteration();
+                        });
+            this.host.testStart(1);
+            this.host.send(patchOperation);
+            this.host.testWait();
+        }
+    }
+
+    @Test
+    public void statefulServiceAuthorization() throws Throwable {
         // Create example services not accessible by jane (as the system user)
         OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
         Map<URI, ExampleServiceState> exampleServices = createExampleServices("john");
 
         // try to create services with no user context set; we should get a 403
         OperationContext.setAuthorizationContext(null);
-        ExampleServiceState state = exampleServiceState("jane", new Long("100"));
+        ExampleServiceState state = createExampleServiceState("jane", new Long("100"));
         this.host.testStart(1);
         this.host.send(
-                Operation.createPost(UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK))
+                Operation.createPost(UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK))
                         .setBody(state)
                         .setCompletion((o, e) -> {
                             if (o.getStatusCode() != Operation.STATUS_CODE_FORBIDDEN) {
@@ -197,7 +406,7 @@ public class TestAuthorization extends BasicTestCase {
         // issue a GET on a factory with no auth context, no documents should be returned
         this.host.testStart(1);
         this.host.send(
-                Operation.createGet(UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK))
+                Operation.createGet(UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK))
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         this.host.failIteration(new IllegalStateException(e));
@@ -225,7 +434,8 @@ public class TestAuthorization extends BasicTestCase {
 
         // Execute get on factory trying to get all example services
         final ServiceDocumentQueryResult[] factoryGetResult = new ServiceDocumentQueryResult[1];
-        Operation getFactory = Operation.createGet(UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK))
+        Operation getFactory = Operation.createGet(
+                UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK))
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         this.host.failIteration(e);
@@ -326,93 +536,6 @@ public class TestAuthorization extends BasicTestCase {
         }
     }
 
-    private void createRoles() throws Throwable {
-        this.host.testStart(5);
-
-        // Create user group for jane@doe.com
-        String userGroupLink =
-                createUserGroup("janes-user-group", Builder.create()
-                        .addFieldClause(
-                                "email",
-                                "jane@doe.com")
-                        .build());
-
-        // Create resource group for example service state
-        String exampleServiceResourceGroupLink =
-                createResourceGroup("janes-resource-group", Builder.create()
-                        .addFieldClause(
-                                ExampleServiceState.FIELD_NAME_KIND,
-                                Utils.buildKind(ExampleServiceState.class))
-                        .addFieldClause(
-                                ExampleServiceState.FIELD_NAME_NAME,
-                                "jane")
-                        .build());
-
-        // Create resource group to allow GETs on ALL query tasks
-        String queryTaskResourceGroupLink =
-                createResourceGroup("any-query-task-resource-group", Builder.create()
-                        .addFieldClause(
-                                ExampleServiceState.FIELD_NAME_KIND,
-                                Utils.buildKind(QueryTask.class))
-                        .build());
-
-        // Create roles tying these together
-        createRole(userGroupLink, exampleServiceResourceGroupLink);
-        createRole(userGroupLink, queryTaskResourceGroupLink);
-
-        this.host.testWait();
-    }
-
-    private String createUserGroup(String name, Query q) {
-        URI postUserGroupsUri =
-                UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
-        String selfLink =
-                UriUtils.extendUri(postUserGroupsUri, name).getPath();
-
-        // Create user group
-        UserGroupState userGroupState = new UserGroupState();
-        userGroupState.documentSelfLink = selfLink;
-        userGroupState.query = q;
-
-        this.host.send(Operation
-                .createPost(postUserGroupsUri)
-                .setBody(userGroupState)
-                .setCompletion(this.host.getCompletion()));
-        return selfLink;
-    }
-
-    private String createResourceGroup(String name, Query q) {
-        URI postResourceGroupsUri =
-                UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
-        String selfLink =
-                UriUtils.extendUri(postResourceGroupsUri, name).getPath();
-
-        ResourceGroupState resourceGroupState = new ResourceGroupState();
-        resourceGroupState.documentSelfLink = selfLink;
-        resourceGroupState.query = q;
-
-        this.host.send(Operation
-                .createPost(postResourceGroupsUri)
-                .setBody(resourceGroupState)
-                .setCompletion(this.host.getCompletion()));
-        return selfLink;
-    }
-
-    private void createRole(String userGroupLink, String resourceGroupLink) {
-        RoleState roleState = new RoleState();
-        roleState.userGroupLink = userGroupLink;
-        roleState.resourceGroupLink = resourceGroupLink;
-        roleState.verbs = new HashSet<>();
-        roleState.verbs.add(Action.GET);
-        roleState.verbs.add(Action.POST);
-        roleState.policy = Policy.ALLOW;
-
-        this.host.send(Operation
-                .createPost(UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_ROLES))
-                .setBody(roleState)
-                .setCompletion(this.host.getCompletion()));
-    }
-
     private String generateAuthToken(String userServicePath) throws GeneralSecurityException {
         Claims.Builder builder = new Claims.Builder();
         builder.setSubject(userServicePath);
@@ -420,7 +543,7 @@ public class TestAuthorization extends BasicTestCase {
         return this.host.getTokenSigner().sign(claims);
     }
 
-    private ExampleServiceState exampleServiceState(String name, Long counter) {
+    private ExampleServiceState createExampleServiceState(String name, Long counter) {
         ExampleServiceState state = new ExampleServiceState();
         state.name = name;
         state.counter = counter;
@@ -430,8 +553,9 @@ public class TestAuthorization extends BasicTestCase {
 
     private Map<URI, ExampleServiceState> createExampleServices(String userName) throws Throwable {
         Collection<ExampleServiceState> bodies = new LinkedList<>();
-        bodies.add(exampleServiceState(userName, new Long(1)));
-        bodies.add(exampleServiceState(userName, new Long(2)));
+        for (int i = 0; i < this.serviceCount; i++) {
+            bodies.add(createExampleServiceState(userName, 1L));
+        }
 
         Iterator<ExampleServiceState> it = bodies.iterator();
         Consumer<Operation> bodySetter = (o) -> {
@@ -443,7 +567,7 @@ public class TestAuthorization extends BasicTestCase {
                 bodies.size(),
                 ExampleServiceState.class,
                 bodySetter,
-                UriUtils.buildUri(this.host, ExampleFactoryService.SELF_LINK));
+                UriUtils.buildFactoryUri(this.host, ExampleService.class));
 
         return states;
     }

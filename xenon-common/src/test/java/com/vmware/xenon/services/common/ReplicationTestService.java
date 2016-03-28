@@ -15,6 +15,7 @@ package com.vmware.xenon.services.common;
 
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceDocument;
@@ -30,9 +31,11 @@ import com.vmware.xenon.services.common.QueryTask.QuerySpecification;
  * Test service used to validate document queries
  */
 public class ReplicationTestService extends StatefulService {
+    public static final String STRING_MARKER_FAIL_WITH_CONFLICT_CODE = "fail request withconflict error code, verify no retry";
     public static final String ERROR_MESSAGE_STRING_FIELD_IS_REQUIRED = "stringField is required";
     public static final String STAT_NAME_MISSING_SERVICE_OPTION_TOGGLE_COUNT = "missingDocumentOwnerToggleCount";
     public static final String STAT_NAME_SERVICE_OPTION_TOGGLE_COUNT = "documentOwnerToggleCount";
+    public static final String STAT_NAME_HANDLE_NODE_GROUP_MAINTENANCE_COUNT = "handleNodeGroupMaintenanceCount";
 
     public static class ReplicationTestServiceState extends ServiceDocument {
         public static final String CLIENT_PATCH_HINT = "client-";
@@ -121,9 +124,31 @@ public class ReplicationTestService extends StatefulService {
         }
     }
 
+    private String retryRequestContextId;
+    public AtomicInteger retryCount = new AtomicInteger();
+
+    @Override
+    public void handlePut(Operation put) {
+        ReplicationTestServiceState body = getBody(put);
+        if (body.stringField.equals(STRING_MARKER_FAIL_WITH_CONFLICT_CODE)) {
+            if (this.retryRequestContextId != null
+                    && this.retryRequestContextId.equals(put.getContextId())) {
+                // the runtime retried the request, same context id, that is not expected
+                this.retryCount.incrementAndGet();
+            }
+            this.retryRequestContextId = put.getContextId();
+
+            // fail request with a status code that should induce a retry
+            put.setStatusCode(Operation.STATUS_CODE_CONFLICT)
+                    .fail(new IllegalStateException("failing intentionally with conflict error"));
+        } else {
+            super.handlePut(put);
+        }
+    }
+
     @Override
     public void handlePatch(Operation patch) {
-        ReplicationTestServiceState body = patch.getBody(ReplicationTestServiceState.class);
+        ReplicationTestServiceState body = getBody(patch);
         ReplicationTestServiceState state = getState(patch);
 
         if (body.stringField == null) {
@@ -190,9 +215,8 @@ public class ReplicationTestService extends StatefulService {
     @Override
     public void handleMaintenance(Operation maintOp) {
         ServiceMaintenanceRequest body = maintOp.getBody(ServiceMaintenanceRequest.class);
-        maintOp.complete();
-
-        logInfo("%s", body.reasons);
+        // call super method to make sure handleNodeGroupMaintenance is called
+        super.handleMaintenance(maintOp);
         if (!body.reasons.contains(MaintenanceReason.SERVICE_OPTION_TOGGLE)) {
             return;
         }
@@ -204,6 +228,18 @@ public class ReplicationTestService extends StatefulService {
             adjustStat(STAT_NAME_SERVICE_OPTION_TOGGLE_COUNT, 1);
         }
 
+    }
+
+    @Override
+    public void handleNodeGroupMaintenance(Operation post) {
+        ServiceMaintenanceRequest request = post.getBody(ServiceMaintenanceRequest.class);
+        if (!request.reasons.contains(MaintenanceReason.NODE_GROUP_CHANGE)) {
+            post.fail(new IllegalArgumentException("expected NODE_GROUP_CHANGE reason"));
+            return;
+        }
+
+        post.complete();
+        adjustStat(STAT_NAME_HANDLE_NODE_GROUP_MAINTENANCE_COUNT, 1);
     }
 
 }

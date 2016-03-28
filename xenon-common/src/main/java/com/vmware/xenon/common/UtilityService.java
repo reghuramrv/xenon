@@ -31,6 +31,8 @@ import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.ServiceSubscriptionState.ServiceSubscriber;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.UiContentService;
+
 
 /**
  * Utility service managing the various URI control REST APIs for each service instance. A single
@@ -41,6 +43,7 @@ public class UtilityService implements Service {
     private transient Service parent;
     private ServiceStats stats;
     private ServiceSubscriptionState subscriptions;
+    private UiContentService uiService;
 
     public UtilityService() {
     }
@@ -51,30 +54,86 @@ public class UtilityService implements Service {
     }
 
     @Override
+    public void authorizeRequest(Operation op) {
+        op.complete();
+    }
+
+    @Override
     public void handleRequest(Operation op) {
-        if (op.getUri().getPath()
-                .endsWith(ServiceHost.SERVICE_URI_SUFFIX_STATS)) {
-            handleStatsRequest(op);
-        } else if (op.getUri().getPath()
-                .endsWith(ServiceHost.SERVICE_URI_SUFFIX_SUBSCRIPTIONS)) {
-            handleSubscriptionsRequest(op);
-        } else if (op.getUri().getPath()
-                .endsWith(ServiceHost.SERVICE_URI_SUFFIX_TEMPLATE)) {
-            handleDocumentTemplateRequest(op);
-        } else if (op.getUri().getPath()
-                .endsWith(ServiceHost.SERVICE_URI_SUFFIX_CONFIG)) {
-            this.parent.handleConfigurationRequest(op);
-        } else if (op.getUri().getPath()
-                .endsWith(ServiceHost.SERVICE_URI_SUFFIX_UI)) {
+        String uriPrefix = this.parent.getSelfLink() + ServiceHost.SERVICE_URI_SUFFIX_UI;
+
+        if (op.getUri().getPath().startsWith(uriPrefix)) {
+            // startsWith catches all /factory/instance/ui/some-script.js
             handleUiRequest(op);
+        } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_STATS)) {
+            handleStatsRequest(op);
+        } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_SUBSCRIPTIONS)) {
+            handleSubscriptionsRequest(op);
+        } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_TEMPLATE)) {
+            handleDocumentTemplateRequest(op);
+        } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_CONFIG)) {
+            this.parent.handleConfigurationRequest(op);
+        } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_AVAILABLE)) {
+            handleAvailableRequest(op);
         } else {
             op.fail(new UnknownHostException());
         }
     }
 
     @Override
+    public void handleCreate(Operation post) {
+        post.complete();
+    }
+
+    @Override
+    public void handleStart(Operation startPost) {
+        startPost.complete();
+    }
+
+    @Override
+    public void handleStop(Operation op) {
+        op.complete();
+    }
+
+    @Override
     public void handleRequest(Operation op, OperationProcessingStage opProcessingStage) {
         handleRequest(op);
+    }
+
+    private void handleAvailableRequest(Operation op) {
+        if (op.getAction() == Action.GET) {
+            if (this.parent.getProcessingStage() != ProcessingStage.PAUSED
+                    && this.parent.getProcessingStage() != ProcessingStage.AVAILABLE) {
+                // processing stage takes precedence over isAvailable statistic
+                op.fail(Operation.STATUS_CODE_UNAVAILABLE);
+                return;
+            }
+            if (this.stats == null) {
+                op.complete();
+                return;
+            }
+            ServiceStat st = this.getStat(STAT_NAME_AVAILABLE, false);
+            if (st == null || st.latestValue == 1.0) {
+                op.complete();
+                return;
+            }
+            op.fail(Operation.STATUS_CODE_UNAVAILABLE);
+        } else if (op.getAction() == Action.PATCH || op.getAction() == Action.PUT) {
+            if (!op.hasBody()) {
+                op.fail(new IllegalArgumentException("body is required"));
+                return;
+            }
+            ServiceStat st = op.getBody(ServiceStat.class);
+            if (!STAT_NAME_AVAILABLE.equals(st.name)) {
+                op.fail(new IllegalArgumentException(
+                        "body must be of type ServiceStat and name must be "
+                                + STAT_NAME_AVAILABLE));
+                return;
+            }
+            handleStatsRequest(op);
+        } else {
+            getHost().failRequestActionNotSupported(op);
+        }
     }
 
     private void handleSubscriptionsRequest(Operation op) {
@@ -115,7 +174,7 @@ public class UtilityService implements Service {
                                 }
                                 Operation putOp = Operation
                                         .createPut(notificationURI)
-                                        .setBody(o.getBody(this.parent.getStateType()))
+                                        .setBodyNoCloning(o.getBody(this.parent.getStateType()))
                                         .addPragmaDirective(
                                                 Operation.PRAGMA_DIRECTIVE_NOTIFICATION)
                                         .setReferer(getUri());
@@ -130,7 +189,7 @@ public class UtilityService implements Service {
             }
             break;
         case GET:
-            ServiceDocument rsp = null;
+            ServiceDocument rsp;
             synchronized (this.subscriptions) {
                 rsp = Utils.clone(this.subscriptions);
             }
@@ -147,7 +206,7 @@ public class UtilityService implements Service {
 
     public void notifySubscribers(Operation op) {
         try {
-            if (this.subscriptions == null) {
+            if (this.subscriptions == null || this.subscriptions.subscribers == null) {
                 return;
             }
 
@@ -271,51 +330,34 @@ public class UtilityService implements Service {
             String defaultHtmlPath = UriUtils.buildUriPath(servicePath.substring(0,
                     servicePath.length() - ServiceUriPaths.UI_PATH_SUFFIX.length()),
                     ServiceUriPaths.UI_SERVICE_HOME);
-            try {
-                redirectGetToHtmlUiResource(op, defaultHtmlPath);
-            } catch (UnsupportedEncodingException e) {
-                op.fail(e);
-            }
+
+            redirectGetToHtmlUiResource(op, defaultHtmlPath);
             return;
         }
 
-        // The entry point to the UI resource rendering is a HTML file named the same as the service
-        // class.
-        // E.g com.vmware.ExampleService -> com/vmware/ExampleService/index.html
-        String serviceUiResourcePath;
-        if (this.parent.getDocumentTemplate().documentDescription != null &&
-                this.parent.getDocumentTemplate().documentDescription.userInterfaceResourcePath
-                    != null) {
-            serviceUiResourcePath = Utils.buildCustomUiResourceUriPrefixPath(this.parent);
-        } else {
-            serviceUiResourcePath = Utils.buildUiResourceUriPrefixPath(this.parent);
+        if (this.uiService == null) {
+            this.uiService = new UiContentService() {
+            };
+            this.uiService.setHost(this.parent.getHost());
         }
-        serviceUiResourcePath += "/" + ServiceUriPaths.UI_RESOURCE_DEFAULT_FILE;
-        proxyGetToCustomHtmlUiResource(op, serviceUiResourcePath);
+
+        // simulate a full service deployed at the utility endpoint /service/ui
+        String selfLink = this.parent.getSelfLink() + ServiceHost.SERVICE_URI_SUFFIX_UI;
+        this.uiService.handleUiGet(selfLink, this.parent, op);
     }
 
-    public void redirectGetToHtmlUiResource(Operation op, String htmlResourcePath)
-            throws UnsupportedEncodingException {
-        op.addResponseHeader(Operation.LOCATION_HEADER,
-                URLDecoder.decode(UriUtils.buildUri(getHost(), htmlResourcePath).toString(),
-                        Utils.CHARSET));
+    public void redirectGetToHtmlUiResource(Operation op, String htmlResourcePath) {
+        // redirect using relative url without host:port
+        // not so much optimization as handling the case of port forwarding/containers
+        try {
+            op.addResponseHeader(Operation.LOCATION_HEADER,
+                    URLDecoder.decode(htmlResourcePath, Utils.CHARSET));
+        } catch (UnsupportedEncodingException e) {
+            throw new IllegalStateException(e);
+        }
+
         op.setStatusCode(Operation.STATUS_CODE_MOVED_TEMP);
-        op.setContentType(Operation.MEDIA_TYPE_TEXT_HTML);
         op.complete();
-    }
-
-    public void proxyGetToCustomHtmlUiResource(Operation op, String htmlResourcePath) {
-        Operation get = op.clone();
-        get.setUri(UriUtils.buildUri(getHost(), htmlResourcePath))
-                .setReferer(op.getReferer())
-                .setCompletion((o, e) -> {
-                    op.setBody(o.getBodyRaw())
-                            .setContentType(o.getContentType())
-                            .complete();
-                });
-
-        getHost().sendRequest(get);
-        return;
     }
 
     private void handleStatsRequest(Operation op) {
@@ -386,7 +428,7 @@ public class UtilityService implements Service {
                 populateDocumentProperties(s);
                 op.setBody(s).complete();
             } else {
-                ServiceDocument rsp = null;
+                ServiceDocument rsp;
                 synchronized (this.stats) {
                     rsp = populateDocumentProperties(this.stats);
                     rsp = Utils.clone(rsp);
@@ -423,6 +465,7 @@ public class UtilityService implements Service {
         op.setBody(serializedTemplate).complete();
     }
 
+    @Override
     public void handleConfigurationRequest(Operation op) {
         this.parent.handleConfigurationRequest(op);
     }
@@ -579,11 +622,6 @@ public class UtilityService implements Service {
         }
         this.stats = new ServiceStats();
         return true;
-    }
-
-    @Override
-    public void handleStart(Operation startPost) {
-        startPost.complete();
     }
 
     @Override

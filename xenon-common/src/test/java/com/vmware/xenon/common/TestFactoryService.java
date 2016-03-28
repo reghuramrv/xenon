@@ -23,17 +23,24 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestProperty;
+import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.MinimalFactoryTestService;
 import com.vmware.xenon.services.common.MinimalTestService;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 
 class TypeMismatchTestFactoryService extends FactoryService {
 
@@ -50,15 +57,173 @@ class TypeMismatchTestFactoryService extends FactoryService {
     }
 }
 
+class SynchTestFactoryService extends FactoryService {
+    private static final int MAINTENANCE_DELAY_HANDLE_MICROS = 50;
+    public static final String TEST_FACTORY_PATH = "/subpath/testfactory";
+    public static final String TEST_SERVICE_PATH = TEST_FACTORY_PATH + "/instanceX";
+
+    public static final String SELF_LINK = TEST_FACTORY_PATH;
+
+    private Runnable pendingTask;
+
+    public void setTaskToRunOnNextMaintenance(Runnable r) {
+        synchronized (this.options) {
+            this.pendingTask = r;
+        }
+    }
+
+    SynchTestFactoryService() {
+        super(ExampleServiceState.class);
+        toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+        toggleOption(ServiceOption.PERSISTENCE, true);
+        toggleOption(ServiceOption.REPLICATION, true);
+    }
+
+    @Override
+    public Service createServiceInstance() throws Throwable {
+        return new ExampleService();
+    }
+
+    @Override
+    public void handleNodeGroupMaintenance(Operation post) {
+        Runnable task = null;
+        // use a local instance field to make sure the task is reset atomically
+        synchronized (this.options) {
+            if (this.pendingTask != null) {
+                task = this.pendingTask;
+                this.pendingTask = null;
+            }
+        }
+
+        if (task != null) {
+            getHost().schedule(task, MAINTENANCE_DELAY_HANDLE_MICROS,
+                    TimeUnit.MICROSECONDS);
+        }
+        super.handleNodeGroupMaintenance(post);
+    }
+}
+
 public class TestFactoryService extends BasicReusableHostTestCase {
 
     public static final String FAC_PATH = "/subpath/fff";
 
+    public int hostRestartCount = 10;
+
     private URI factoryUri;
+
+    private SynchTestFactoryService factoryService;
 
     @Before
     public void setup() throws Throwable {
         this.factoryUri = UriUtils.buildUri(this.host, SomeFactoryService.class);
+        CommandLineArgumentParser.parseFromProperties(this);
+    }
+
+    /**
+    * This tests a very tricky scenario:
+    * Running a node group maintenance of factory service with REPLICATION and PERSISTENCE.
+    * When running maintenance, and at the same time a child service was deleted and short after created with API's DELETE and POST,
+    * the maintenance will try to re-create the deleted (and stopped) child service.
+    * Test verifies that with such race condition no issues should happen.
+    */
+    @Test
+    public void synchronizationWithIdempotentPostAndDelete() throws Throwable {
+        for (int i = 0; i < this.hostRestartCount; i++) {
+            this.host.log("iteration %s", i);
+            createHostAndServicePostDeletePost();
+        }
+    }
+
+    private void createHostAndServicePostDeletePost() throws Throwable {
+        TemporaryFolder tmp = new TemporaryFolder();
+        tmp.create();
+        ServiceHost.Arguments args = new ServiceHost.Arguments();
+        args.port = 0;
+        args.sandbox = tmp.getRoot().toPath();
+        VerificationHost h = VerificationHost.create(args);
+        try {
+            h.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(50));
+            h.setTemporaryFolder(tmp);
+            // we will kick of synchronization to avoid a race: if maintenance handler is called
+            // before we set the task below, the test will timeout/hang
+            h.setPeerSynchronizationEnabled(false);
+            h.start();
+
+            this.factoryUri = UriUtils.buildUri(h, SynchTestFactoryService.class);
+            this.factoryService = startSynchFactoryService(h);
+
+            ExampleServiceState doc = new ExampleServiceState();
+            doc.documentSelfLink = SynchTestFactoryService.TEST_SERVICE_PATH;
+            doc.name = doc.documentSelfLink;
+            TestContext ctx = testCreate(1);
+            doPost(h, doc, (e) -> {
+                if (e != null) {
+                    ctx.failIteration(e);
+                    return;
+                }
+                this.factoryService.setTaskToRunOnNextMaintenance(() -> {
+                    doDelete(h, doc.documentSelfLink, (e1) -> {
+
+                        if (e1 != null) {
+                            ctx.failIteration(e1);
+                            return;
+                        }
+
+                        doPost(h, doc, (e2) -> {
+                            if (e2 != null) {
+                                ctx.failIteration(e2);
+                                return;
+                            }
+                            ctx.completeIteration();
+                        });
+                    });
+                });
+                // trigger maintenance
+                h.scheduleNodeGroupChangeMaintenance(ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+            });
+
+            testWait(ctx);
+        } finally {
+            h.tearDown();
+        }
+    }
+
+    private void doPost(VerificationHost h, ExampleServiceState doc, Consumer<Throwable> callback) {
+        h.send(Operation
+                .createPost(this.factoryUri)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
+                .setBody(doc)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        callback.accept(e);
+                    } else {
+                        callback.accept(null);
+                    }
+                }));
+    }
+
+    private void doDelete(VerificationHost h, String documentSelfLink, Consumer<Throwable> callback) {
+        this.host.send(Operation.createDelete(
+                UriUtils.buildUri(h, documentSelfLink))
+                .setBody(new ExampleServiceState())
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                callback.accept(e);
+                            } else {
+                                callback.accept(null);
+                            }
+                        }));
+    }
+
+    private SynchTestFactoryService startSynchFactoryService(VerificationHost h) throws Throwable {
+        SynchTestFactoryService factoryService = new SynchTestFactoryService();
+
+        h.startService(
+                Operation.createPost(this.factoryUri), factoryService);
+        h.waitForServiceAvailable(SynchTestFactoryService.SELF_LINK);
+
+        return factoryService;
     }
 
     @Test
@@ -266,8 +431,9 @@ public class TestFactoryService extends BasicReusableHostTestCase {
             for (Object d : res.documents.values()) {
                 MinimalTestServiceState expandedState = Utils.fromJson(d,
                         MinimalTestServiceState.class);
-                childServiceStates.put(UriUtils.buildUri(factoryUri.getHost(),
-                        factoryUri.getPort(), expandedState.documentSelfLink, null), expandedState);
+                childServiceStates.put(
+                        UriUtils.buildUri(factoryUri, expandedState.documentSelfLink),
+                        expandedState);
             }
 
             validateBeforeAfterServiceStates(caps, count, factoryUri.getPath(),
@@ -374,6 +540,9 @@ public class TestFactoryService extends BasicReusableHostTestCase {
             URI[] childUris,
             Map<URI, MinimalTestServiceState> childServiceStates,
             int patchCount) throws Throwable {
+
+        this.host.waitForServiceAvailable(factoryUri, null);
+
         // since we stopped AND marked each child service state deleted, the
         // factory should have not re-created any service. Confirm.
 
@@ -404,24 +573,16 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         // associated with the same document history
         // create a start service POST with an initial state
         this.host.testStart(childServiceStates.size());
-        int i = 0;
         for (URI u : childServiceStates.keySet()) {
             MinimalTestServiceState newState = (MinimalTestServiceState) this.host
                     .buildMinimalTestState();
             String selfLink = u.getPath();
             newState.documentSelfLink = selfLink.substring(selfLink
                     .lastIndexOf(UriUtils.URI_PATH_CHAR));
-            // request version check on deleted document, on every other POST
-            boolean doVersionCheck = i++ % 2 == 0;
-            if (doVersionCheck) {
-                // if version check is requested version must be higher than previously deleted version
-                newState.documentVersion = patchCount * 2;
-            }
+            // version must be higher than previously deleted version
+            newState.documentVersion = patchCount * 2;
             Operation post = Operation.createPost(factoryUri).setBody(newState)
                     .setCompletion(this.host.getCompletion());
-            if (doVersionCheck) {
-                post.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERSION_CHECK);
-            }
             this.host.send(post);
         }
         this.host.testWait();
@@ -432,8 +593,7 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         for (MinimalTestServiceState s : childServiceStatesAfterRestart
                 .values()) {
             MinimalTestServiceState beforeRestart = childServiceStates
-                    .get(UriUtils.buildUri(factoryUri.getHost(), factoryUri.getPort(),
-                            s.documentSelfLink, null));
+                    .get(UriUtils.buildUri(factoryUri, s.documentSelfLink));
             // version should be two more than PATCH count:
             // +1 for the DELETE right before shutdown
             // +1 for the new initial state
@@ -486,21 +646,44 @@ public class TestFactoryService extends BasicReusableHostTestCase {
 
     @Test
     public void sendWrongContentType() throws Throwable {
+        startFactoryService();
+
+        this.host.toggleNegativeTestMode(true);
+        // attempt to create service with unrecognized content type and non JSON body
         this.host.testStart(1);
-        // attempt to create service with unrecognized content type
         Operation post = Operation
                 .createPost(this.factoryUri)
                 .setBody("")
-                .setContentType("text/plain")
+                .setContentType(Operation.MEDIA_TYPE_TEXT_PLAIN)
                 .setCompletion(
                         (o, e) -> {
-                            if (e == null || !e.getMessage().contains("Unrecognized Content-Type")) {
+                            if (e == null
+                                    || !e.getMessage().contains("Unrecognized Content-Type")) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Should have rejected request"));
+                            } else {
+                                this.host.completeIteration();
+                            }
+                        });
+        this.host.send(post);
+        this.host.testWait();
+
+        // attempt to create service with proper content type but garbage body
+        this.host.testStart(1);
+        post = Operation
+                .createPost(this.factoryUri)
+                .setBody("")
+                .setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e == null) {
                                 this.host.failIteration(new IllegalStateException(
                                         "Should have rejected request"));
                             } else {
                                 ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
                                 if (rsp.message == null
-                                        || rsp.message.toLowerCase().contains("exception")) {
+                                        || !rsp.message.toLowerCase()
+                                                .contains("body is required")) {
                                     this.host.failIteration(new IllegalStateException(
                                             "Invalid error response"));
                                     return;
@@ -511,10 +694,12 @@ public class TestFactoryService extends BasicReusableHostTestCase {
                         });
         this.host.send(post);
         this.host.testWait();
+        this.host.toggleNegativeTestMode(false);
     }
 
     @Test
     public void sendBadJson() throws Throwable {
+        startFactoryService();
         this.host.testStart(1);
         // attempt to create service with bad content type
         Operation post = Operation
@@ -680,10 +865,7 @@ public class TestFactoryService extends BasicReusableHostTestCase {
 
     @Test
     public void testFactoryPostHandling() throws Throwable {
-        this.host.startService(
-                Operation.createPost(this.factoryUri),
-                new SomeFactoryService());
-        this.host.waitForServiceAvailable(SomeFactoryService.SELF_LINK);
+        startFactoryService();
 
         this.host.testStart(4);
         idempotentPostReturnsUpdatedOpBody();
@@ -693,10 +875,27 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         this.host.testWait();
     }
 
+    private void startFactoryService() throws Throwable {
+        if (this.host.getServiceStage(this.factoryUri.getPath()) != null) {
+            return;
+        }
+        this.host.startService(
+                Operation.createPost(this.factoryUri),
+                new SomeFactoryService());
+        this.host.waitForServiceAvailable(SomeFactoryService.SELF_LINK);
+    }
+
     @Test
     public void postFactoryQueueing() throws Throwable {
         SomeDocument doc = new SomeDocument();
-        doc.documentSelfLink = "/subpath";
+        doc.documentSelfLink = "/subpath-" + UUID.randomUUID().toString();
+
+        if (this.host.checkServiceAvailable(this.factoryUri.getPath())) {
+            this.host.testStart(1);
+            this.host.send(Operation.createDelete(this.factoryUri).setCompletion(
+                    this.host.getCompletion()));
+            this.host.testWait();
+        }
 
         this.host.testStart(1);
         Operation post = Operation
