@@ -13,6 +13,8 @@
 
 package com.vmware.xenon.services.common;
 
+import java.util.Set;
+
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service;
@@ -31,7 +33,9 @@ public class UserService extends StatefulService {
      */
     public static class UserState extends ServiceDocument {
         public static final String FIELD_NAME_EMAIL = "email";
+        public static final String FIELD_NAME_USER_GROUP_LINKS = "userGroupLinks";
         public String email;
+        public Set<String> userGroupLinks;
     }
 
     public UserService() {
@@ -69,12 +73,39 @@ public class UserService extends StatefulService {
         }
 
         UserState currentState = getState(op);
-        if (currentState.email.equals(newState.email)) {
+        // if the email field has not changed and the userGroupsLinks field is either null
+        // or the same in both the current state and the state passed in return a 304
+        // response
+        if (currentState.email.equals(newState.email)
+                && ((currentState.userGroupLinks == null && newState.userGroupLinks == null)
+                || (currentState.userGroupLinks != null && newState.userGroupLinks != null
+                    && currentState.userGroupLinks.equals(newState.userGroupLinks)))) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {
             setState(op, newState);
         }
+        op.complete();
+    }
 
+    @Override
+    public void handlePatch(Operation op) {
+        if (!op.hasBody()) {
+            op.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+        UserState currentState = getState(op);
+        UserState newState = op.getBody(UserState.class);
+        if (newState.email != null) {
+            currentState.email = newState.email;
+        }
+        if (newState.userGroupLinks != null) {
+            if (currentState.userGroupLinks == null) {
+                currentState.userGroupLinks = newState.userGroupLinks;
+            } else {
+                currentState.userGroupLinks.addAll(newState.userGroupLinks);
+            }
+        }
+        op.setBody(currentState);
         op.complete();
     }
 

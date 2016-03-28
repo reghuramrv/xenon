@@ -68,8 +68,7 @@ public class ServiceDocumentDescription {
         InternetAddressV6,
         DATE,
         URI,
-        ENUM,
-        ARRAY,
+        ENUM
     }
 
     public enum PropertyUsageOption {
@@ -444,13 +443,16 @@ public class ServiceDocumentDescription {
                     pd.elementDescription = fd;
                 } else if (Enum.class.isAssignableFrom(clazz)) {
                     pd.typeName = TypeName.ENUM;
-                    pd.enumValues = Arrays
-                            .stream(clazz.getEnumConstants())
-                            .map( o -> ((Enum)o).name())
-                            .collect(Collectors.toList())
-                            .toArray(new String[0]);
+                    Object[] enumConstants = clazz.getEnumConstants();
+                    if (enumConstants != null) {
+                        pd.enumValues = Arrays
+                                .stream(enumConstants)
+                                .map(o -> ((Enum) o).name())
+                                .collect(Collectors.toList())
+                                .toArray(new String[0]);
+                    }
                 } else if (clazz.isArray()) {
-                    pd.typeName = TypeName.ARRAY;
+                    pd.typeName = TypeName.COLLECTION;
 
                     // Extract the component class from type
                     Type componentType = clazz.getComponentType();

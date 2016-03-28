@@ -2,6 +2,10 @@
 
 ## 0.7.6-SNAPSHOT
 
+* Add userGroupLinks as a field in UserService
+
+* Remove TypeName.ARRAY and use TypeName.COLLECTION instead
+
 ## 0.7.5
 
 * New TaskService.java base class to reduce duplicate code when

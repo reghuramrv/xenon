@@ -90,8 +90,6 @@ class ModelRegistry {
 
     private Property makeProperty(PropertyDescription pd) {
         switch (pd.typeName) {
-        case ARRAY:
-            return new ArrayProperty(makeProperty(pd.elementDescription));
         case BOOLEAN:
             return new BooleanProperty();
         case BYTES:
@@ -104,7 +102,9 @@ class ModelRegistry {
             return new DoubleProperty();
         case ENUM:
             StringProperty prop = new StringProperty();
-            prop._enum(Arrays.asList(pd.enumValues));
+            if (pd.enumValues != null) {
+                prop._enum(Arrays.asList(pd.enumValues));
+            }
             return prop;
         case InternetAddressV4:
             return new StringProperty();
