@@ -28,17 +28,20 @@ import java.util.concurrent.atomic.AtomicInteger;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service;
+import com.vmware.xenon.common.ServiceClient;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocument.DocumentRelationship;
 import com.vmware.xenon.common.ServiceDocumentDescription;
+import com.vmware.xenon.common.ServiceDocumentQueryResult;
 import com.vmware.xenon.common.StatelessService;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.config.XenonConfiguration;
+import com.vmware.xenon.services.common.QueryTask.NumericRange;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
+
 
 public class NodeSelectorSynchronizationService extends StatelessService {
-
-    public static final String PROPERTY_NAME_SYNCHRONIZATION_LOGGING = Utils.PROPERTY_NAME_PREFIX
-            + "NodeSelectorSynchronizationService.isDetailedLoggingEnabled";
 
     public static class NodeGroupSynchronizationState extends ServiceDocument {
         public Set<String> inConflictLinks = new HashSet<>();
@@ -53,21 +56,21 @@ public class NodeSelectorSynchronizationService extends StatelessService {
             return r;
         }
 
+        public String indexLink;
         public ServiceDocument state;
         public ServiceDocumentDescription stateDescription;
         public EnumSet<ServiceOption> options;
         public String factoryLink;
-        public boolean wasOwner;
-        public boolean isOwner;
-        public URI ownerNodeReference;
-        public String ownerNodeId;
         public String kind;
     }
 
     private Service parent;
 
-    private boolean isDetailedLoggingEnabled = Boolean
-            .getBoolean(PROPERTY_NAME_SYNCHRONIZATION_LOGGING);
+    private boolean isDetailedLoggingEnabled = XenonConfiguration.bool(
+            NodeSelectorSynchronizationService.class,
+            "isDetailedLoggingEnabled",
+            false
+    );
 
     public NodeSelectorSynchronizationService(Service parent) {
         super(NodeGroupSynchronizationState.class);
@@ -131,33 +134,172 @@ public class NodeSelectorSynchronizationService extends StatelessService {
             return;
         }
 
+        boolean synchHistoricalVersions = post.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_HISTORICAL_VERSIONS);
+        if (synchHistoricalVersions) {
+            QueryTask.Query.Builder queryBuilder = QueryTask.Query.Builder.create()
+                    .addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK, body.state.documentSelfLink);
+            if (body.state.documentVersion > 0) {
+                // fetch historical versions up to latest exclusive
+                queryBuilder.addRangeClause(ServiceDocument.FIELD_NAME_VERSION,
+                        NumericRange.createLongRange(0L, body.state.documentVersion, true, false));
+            }
+            QueryTask.Query query = queryBuilder.build();
+            QueryTask task = QueryTask.Builder.createDirectTask()
+                    .setQuery(query)
+                    .setResultLimit((int) body.stateDescription.versionRetentionLimit)
+                    .addOption(QueryOption.INCLUDE_ALL_VERSIONS)
+                    .addOption(QueryOption.BROADCAST)
+                    .build();
+            task.documentExpirationTimeMicros = post.getExpirationMicrosUtc();
+            task.indexLink = body.indexLink;
+
+            URI localQueryTasksUri = UriUtils.buildUri(getHost(),ServiceUriPaths.CORE_LOCAL_QUERY_TASKS);
+            Operation taskPost = Operation.createPost(localQueryTasksUri)
+                    .setBody(task)
+                    .setReferer(getUri())
+                    .setCompletion((o, e) -> {
+                        if (e != null) {
+                            post.fail(e);
+                            return;
+                        }
+
+                        QueryTask result = o.getBody(QueryTask.class);
+                        handleBroadcastQueryCompletion(result, post, body);
+                    });
+            getHost().sendRequest(taskPost);
+            return;
+        }
+
         // we are going to broadcast a query (GET) to all peers, that should return
         // a document with the specified self link
+        createAndBroadcastGetQuery(post, body, body.state.documentSelfLink);
+    }
 
+    private void handleBroadcastQueryCompletion(QueryTask result, Operation post,
+            SynchronizePeersRequest request) {
+        ServiceDocumentQueryResult queryResult = result.results;
+
+        // allocate hash set to track already fetched versioned documents (as duplicates are expected)
+        Set<String> synchronizedVersionedLinks = new HashSet<>(queryResult.documentCount.intValue());
+
+        String pageLink = queryResult.nextPageLink;
+        synchronizePage(pageLink, post, request, synchronizedVersionedLinks, result.documentSelfLink);
+    }
+
+    private void synchronizePage(String pageLink, Operation post, SynchronizePeersRequest request,
+            Set<String> synchronizedVersionedLinks, String queryTaskLink) {
+        if (pageLink == null || pageLink.isEmpty()) {
+            // all versions have been synchronized - we delete the query to release resources
+            Operation.createDelete(UriUtils.buildUri(getHost(), queryTaskLink)).sendWith(this);
+
+            post.complete();
+            return;
+        }
+
+        Operation getPage = Operation.createGet(UriUtils.buildUri(getHost(), pageLink))
+                .setReferer(getUri()).setCompletion((o, e) -> {
+                    if (e != null) {
+                        post.fail(e);
+                        return;
+                    }
+
+                    ServiceDocumentQueryResult page = o.getBody(QueryTask.class).results;
+                    post.nestCompletion((oo, ee) -> {
+                        if (ee != null) {
+                            post.fail(e);
+                            return;
+                        }
+
+                        synchronizePage(page.nextPageLink, post, request, synchronizedVersionedLinks,
+                                queryTaskLink);
+                    });
+
+                    synchronizeSingleVersion(page.documentLinks, 0, request, post, synchronizedVersionedLinks);
+                });
+        getHost().sendRequest(getPage);
+    }
+
+    private void synchronizeSingleVersion(List<String> documentLinks, int documentLinkIndex,
+            SynchronizePeersRequest request, Operation post,
+            Set<String> synchronizedVersionedLinks) {
+        if (documentLinkIndex >= documentLinks.size()) {
+            post.complete();
+            return;
+        }
+
+        String documentLink = documentLinks.get(documentLinkIndex);
+        if (synchronizedVersionedLinks.contains(documentLink)) {
+            synchronizeSingleVersion(documentLinks, documentLinkIndex + 1, request, post, synchronizedVersionedLinks);
+            return;
+        }
+
+        post.nestCompletion((o, e) -> {
+            if (e != null) {
+                post.fail(e);
+                return;
+            }
+
+            synchronizeSingleVersion(documentLinks, documentLinkIndex + 1, request, post, synchronizedVersionedLinks);
+        });
+
+        synchronizedVersionedLinks.add(documentLink);
+        createAndBroadcastGetQuery(post, request, documentLink);
+    }
+
+    private void createAndBroadcastGetQuery(Operation post, SynchronizePeersRequest body, String documentLink) {
+        // determine if this is a versioned link
+        int queryPos = documentLink.lastIndexOf(UriUtils.URI_QUERY_CHAR);
+        String version = null;
+        Long versionNum = null;
+        String selfLink = documentLink;
+        if (queryPos >= 0) {
+            String query = documentLink.substring(queryPos + 1);
+            Map<String, String> params = UriUtils.parseUriQueryParams(query);
+            version = params.get(ServiceDocument.FIELD_NAME_VERSION);
+            selfLink = documentLink.substring(0, queryPos);
+        }
         URI localQueryUri = UriUtils.buildDocumentQueryUri(
                 getHost(),
-                body.state.documentSelfLink,
+                body.indexLink,
+                selfLink,
                 false,
                 true,
                 body.options);
+        if (version != null) {
+            localQueryUri = UriUtils.extendUriWithQuery(localQueryUri, ServiceDocument.FIELD_NAME_VERSION, version);
+            try {
+                versionNum = Long.parseLong(version);
+            } catch (NumberFormatException ex) {
+                logWarning("DocumentLink %s: Failed to parse version %s as a number: %s",
+                        documentLink, version, ex.getMessage());
+                post.fail(ex);
+                return;
+            }
+        }
 
+        final Long finalVersion = versionNum;
         Operation remoteGet = Operation.createGet(localQueryUri)
                 .setReferer(getUri())
+                .setConnectionSharing(true)
+                .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION)
+                .setExpiration(
+                        Utils.fromNowMicrosUtc(NodeGroupService.PEER_REQUEST_TIMEOUT_MICROS))
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         post.fail(e);
                         return;
                     }
                     NodeGroupBroadcastResponse rsp = o.getBody(NodeGroupBroadcastResponse.class);
-                    handleBroadcastGetCompletion(rsp, post, body);
+                    handleBroadcastGetCompletion(rsp, post, body, finalVersion);
                 });
 
-        getHost().broadcastRequest(this.parent.getSelfLink(), body.state.documentSelfLink, true,
+        boolean excludeThisHostFromBroadcast = version == null;
+        getHost().broadcastRequest(this.parent.getSelfLink(), selfLink, excludeThisHostFromBroadcast,
                 remoteGet);
     }
 
     private void handleBroadcastGetCompletion(NodeGroupBroadcastResponse rsp, Operation post,
-            SynchronizePeersRequest request) {
+            SynchronizePeersRequest request, Long version) {
 
         if (rsp.failures.size() > 0 && rsp.jsonResponses.isEmpty()) {
             post.fail(new IllegalStateException("Failures received: " + Utils.toJsonHtml(rsp)));
@@ -180,6 +322,13 @@ public class NodeSelectorSynchronizationService extends StatelessService {
                 continue;
             }
 
+            if (version != null && !version.equals(peerState.documentVersion)) {
+                logWarning("Invalid state from peer %s: %s. Version mismatch: expected version %s, received %d",
+                        e.getKey(), e.getValue(), version, peerState.documentVersion);
+                post.fail(Operation.STATUS_CODE_INTERNAL_ERROR);
+                return;
+            }
+
             peerStates.put(e.getKey(), peerState);
 
             if (peerState.documentEpoch == null) {
@@ -196,7 +345,8 @@ public class NodeSelectorSynchronizationService extends StatelessService {
         // As part of synchronization we need to detect what peer services do not have the best state.
         // A peer might have been missing this service instance, or it might be unavailable. Either way,
         // when we attempt to broadcast the best state, we will use this map to determine if a peer
-        // should receive the best state we found.
+        // hasn't responded and should therefore receive the best state we found.
+        Set<URI> nonRespondingPeers = new HashSet<>();
         for (URI remotePeerService : rsp.receivers) {
             if (peerStates.containsKey(remotePeerService)) {
                 continue;
@@ -205,10 +355,8 @@ public class NodeSelectorSynchronizationService extends StatelessService {
                 logInfo("No peer response for %s from %s", request.state.documentSelfLink,
                         remotePeerService);
             }
-            peerStates.put(remotePeerService, new ServiceDocument());
+            nonRespondingPeers.add(remotePeerService);
         }
-
-        boolean incrementEpoch = false;
 
         if (!syncRspsPerEpoch.isEmpty()) {
             List<ServiceDocument> statesForHighestEpoch = syncRspsPerEpoch.get(syncRspsPerEpoch
@@ -231,15 +379,31 @@ public class NodeSelectorSynchronizationService extends StatelessService {
         }
 
         EnumSet<DocumentRelationship> results = EnumSet.noneOf(DocumentRelationship.class);
-        if (bestPeerRsp == null) {
-            results.add(DocumentRelationship.PREFERRED);
-        } else if (request.state.documentEpoch.compareTo(bestPeerRsp.documentEpoch) > 0) {
-            // Local state is of higher epoch than all peers
-            results.add(DocumentRelationship.PREFERRED);
-        } else if (request.state.documentEpoch.equals(bestPeerRsp.documentEpoch)) {
-            // compare local state against peers only if they are in the same epoch
-            results = ServiceDocument.compare(request.state,
-                    bestPeerRsp, request.stateDescription, Utils.getTimeComparisonEpsilonMicros());
+
+        if (version == null) {
+            if (bestPeerRsp == null) {
+                results.add(DocumentRelationship.PREFERRED);
+            } else if (request.state.documentEpoch.compareTo(bestPeerRsp.documentEpoch) > 0) {
+                // Local state is of higher epoch than all peers
+                results.add(DocumentRelationship.PREFERRED);
+            } else if (request.state.documentEpoch.equals(bestPeerRsp.documentEpoch)) {
+                // compare local state against peers only if they are in the same epoch
+                results = ServiceDocument.compare(request.state,
+                        bestPeerRsp, request.stateDescription, Utils.getTimeComparisonEpsilonMicros());
+            }
+        }
+
+        if (bestPeerRsp == null && (request.state.documentVersion == -1 || version != null)) {
+            // If we did not find any documents from peers for the provided self-link
+            // and the owner also did not provide a valid document, then we fail
+            // the request with 404 - NOT FOUND error.
+            // Note, documentVersion is set to -1 by the owner in
+            // ServiceSynchronizationTracker to indicate that the owner does not have
+            // a document for the self-link.
+            this.logWarning("Synch failed to find any documents for self-link %s (version: %s)",
+                    request.state.documentSelfLink, version);
+            post.fail(Operation.STATUS_CODE_NOT_FOUND);
+            return;
         }
 
         if (results.contains(DocumentRelationship.IN_CONFLICT)) {
@@ -267,52 +431,34 @@ public class NodeSelectorSynchronizationService extends StatelessService {
             logInfo("Using best peer state %s", Utils.toJson(bestPeerRsp));
         }
 
-        // increment epoch if owner changed
-        if (bestPeerRsp.documentOwner != null) {
-            incrementEpoch = !request.ownerNodeId.equals(bestPeerRsp.documentOwner);
+        if (version == null) {
+            bestPeerRsp.documentOwner = this.getHost().getId();
         }
-        bestPeerRsp.documentOwner = request.ownerNodeId;
 
-        broadcastBestState(rsp.selectedNodes, peerStates, post, request, bestPeerRsp,
-                incrementEpoch);
+        broadcastBestState(rsp.selectedNodes, peerStates, nonRespondingPeers, post, request, bestPeerRsp,
+                version);
     }
 
     private void broadcastBestState(Map<String, URI> selectedNodes,
             Map<URI, ServiceDocument> peerStates,
-            Operation post, SynchronizePeersRequest request,
+            Set<URI> nonRespondingPeers,
+            Operation post,
+            SynchronizePeersRequest request,
             ServiceDocument bestPeerRsp,
-            boolean incrementEpoch) {
+            Long version) {
+
         try {
             post.setBodyNoCloning(null);
-            if (peerStates.isEmpty()) {
+            if (peerStates.isEmpty() && nonRespondingPeers.isEmpty()) {
                 if (this.isDetailedLoggingEnabled) {
-                    logInfo("(isOwner: %s) No peers available for %s", request.isOwner,
-                            bestPeerRsp.documentSelfLink);
+                    logInfo(") No peers available for %s", bestPeerRsp.documentSelfLink);
                 }
                 post.complete();
                 return;
             }
 
-            final ServiceDocument bestState = bestPeerRsp;
-            boolean isServiceDeleted = Action.DELETE.toString().equals(
-                    bestPeerRsp.documentUpdateAction);
-
-            if (isServiceDeleted) {
-                // The caller relies on the body being present to determine if a peer had a better
-                // state than local state. If the body is not present, it assumes all is OK, and proceeds
-                // with either service start, or completing pending requests. If we detect the state is
-                // deleted, we must set the body, so the caller aborts start, thus converging with peers
-                // that already have stopped this service
-                post.setBodyNoCloning(bestPeerRsp);
-            }
-
-            if (peerStates.isEmpty()) {
-                post.complete();
-                return;
-            }
-
-            AtomicInteger remaining = new AtomicInteger(peerStates.size());
-            CompletionHandler c = ((o, e) -> {
+            AtomicInteger remaining = new AtomicInteger(peerStates.size() + nonRespondingPeers.size());
+            CompletionHandler c = (o, e) -> {
                 int r = remaining.decrementAndGet();
                 if (e != null) {
                     logWarning("Peer update to %s:%d for %s failed with %s, remaining %d",
@@ -323,76 +469,118 @@ public class NodeSelectorSynchronizationService extends StatelessService {
                 if (r != 0) {
                     return;
                 }
-                post.complete();
-            });
 
-            if (incrementEpoch) {
-                logInfo("Incrementing epoch from %d to %d for %s", bestPeerRsp.documentEpoch,
-                        bestPeerRsp.documentEpoch + 1, bestPeerRsp.documentSelfLink);
-                bestPeerRsp.documentEpoch += 1;
-                bestPeerRsp.documentVersion++;
-            }
+                post.complete();
+            };
 
             post.setBody(bestPeerRsp);
 
+            boolean isServiceDeleted = Action.DELETE.toString().equals(
+                    bestPeerRsp.documentUpdateAction);
+
             ServiceDocument clonedState = Utils.clone(bestPeerRsp);
+
+            // send synchPost to peers with a different version
             for (Entry<URI, ServiceDocument> entry : peerStates.entrySet()) {
-
                 URI peer = entry.getKey();
+                ServiceDocument peerState = entry.getValue();
 
-                URI targetFactoryUri = UriUtils.buildUri(peer, request.factoryLink);
-                Operation peerOp = Operation.createPost(targetFactoryUri)
-                        .setReferer(post.getReferer()).setExpiration(post.getExpirationMicrosUtc())
-                        .setCompletion(c);
+                Operation peerOp = prepareSynchPostRequest(post, request, bestPeerRsp,
+                        isServiceDeleted, c, clonedState, peer, version);
 
-                // Mark it as replicated so the remote factories do not try to replicate it again
-                peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_REPLICATED);
+                boolean isVersionSame = ServiceDocument
+                        .compare(bestPeerRsp, peerState, request.stateDescription, Utils.getTimeComparisonEpsilonMicros())
+                        .contains(DocumentRelationship.EQUAL_VERSION);
 
-                // Request a version check to prevent restarting/recreating a service that might
-                // have been deleted
-                peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERSION_CHECK);
-
-                // indicate this is a synchronization request.
-                peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH);
-
-                peerOp.addRequestHeader(Operation.REPLICATION_PHASE_HEADER,
-                        Operation.REPLICATION_PHASE_COMMIT);
-
-                //  must get started on peers, regardless if the index has it. Since only one node is doing
-                // synchronization, its responsible for starting the children on ALL nodes. If this is a synchronization
-                // due to a node joining or leaving and some peers have already started the service, the POST will
-                // automatically get converted to a PUT, if the factory is IDEMPOTENT. Otherwise, it will fail
-                clonedState.documentSelfLink = bestState.documentSelfLink.replace(
-                        request.factoryLink, "");
-
-                if (isServiceDeleted) {
-                    peerOp.setAction(Action.DELETE);
+                if (isVersionSame
+                        && bestPeerRsp.getClass().equals(peerState.getClass())
+                        && ServiceDocument.equals(request.stateDescription, bestPeerRsp, peerState)) {
+                    peerOp.complete();
+                    continue;
                 }
 
-                peerOp.setBody(clonedState);
-
-                if (this.isDetailedLoggingEnabled) {
-                    logInfo("(isOwner: %s)(remaining: %d) (last action: %s) Sending %s with best state for %s to %s (e:%d, v:%d)",
-                            request.isOwner,
-                            remaining.get(),
-                            clonedState.documentUpdateAction,
-                            peerOp.getAction(),
-                            clonedState.documentSelfLink,
-                            peerOp.getUri(),
-                            clonedState.documentEpoch,
-                            clonedState.documentVersion);
-                }
-                sendRequest(peerOp);
+                sendSynchPost(peerOp, clonedState, remaining);
             }
-        } catch (Throwable e) {
+
+            // send synchPost to non-responding peers
+            for (URI peer : nonRespondingPeers) {
+                Operation peerOp = prepareSynchPostRequest(post, request, bestPeerRsp,
+                        isServiceDeleted, c, clonedState, peer, version);
+                sendSynchPost(peerOp, clonedState, remaining);
+            }
+        } catch (Exception e) {
             logSevere(e);
             post.fail(e);
         }
+    }
+
+    private void sendSynchPost(Operation peerOp, ServiceDocument clonedState, AtomicInteger remaining) {
+        if (this.isDetailedLoggingEnabled) {
+            logInfo("(remaining: %d) (last action: %s) Sending %s with best state for %s to %s (e:%d, v:%d)",
+                    remaining.get(),
+                    clonedState.documentUpdateAction,
+                    peerOp.getAction(),
+                    clonedState.documentSelfLink,
+                    peerOp.getUri(),
+                    clonedState.documentEpoch,
+                    clonedState.documentVersion);
+        }
+        sendRequest(peerOp);
+    }
+
+    private Operation prepareSynchPostRequest(Operation post, SynchronizePeersRequest request,
+            final ServiceDocument bestState, boolean isServiceDeleted, CompletionHandler c,
+            ServiceDocument clonedState, URI peer, Long version) {
+        URI targetFactoryUri = UriUtils.buildUri(peer, request.factoryLink);
+        Operation peerOp = Operation.createPost(targetFactoryUri)
+                .transferRefererFrom(post)
+                .setCompletion(c);
+
+        peerOp.setRetryCount(0);
+
+        peerOp.setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION);
+
+        // Mark it as replicated so the remote factories do not try to replicate it again
+        peerOp.setFromReplication(true);
+        peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_REPLICATED);
+
+        // Request a version check to prevent restarting/recreating a service that might
+        // have been deleted
+        peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERSION_CHECK);
+
+        // indicate this is a synchronization request.
+        peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER);
+
+        if (version != null) {
+            // indicate this is a synchronization request of a specific version
+            peerOp.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_VERSION);
+        }
+
+        peerOp.addRequestHeader(Operation.REPLICATION_PHASE_HEADER,
+                Operation.REPLICATION_PHASE_COMMIT);
+
+        // must get started on peers, regardless if the index has it. Since only one node is doing
+        // synchronization, its responsible for starting the children on ALL nodes. If this is a synchronization
+        // due to a node joining or leaving and some peers have already started the service, the POST will
+        // automatically get converted to a PUT, if the factory is IDEMPOTENT. Otherwise, it will fail
+        clonedState.documentSelfLink = UriUtils.getLastPathSegment(bestState.documentSelfLink);
+
+        if (isServiceDeleted && version == null) {
+            peerOp.setAction(Action.DELETE);
+
+            // If this is a delete request, let's reset the uri to
+            // the actual documentSelfLink, both on the operation
+            // and the ServiceDocument.
+            peerOp.setUri(UriUtils.buildUri(peer, bestState.documentSelfLink));
+            clonedState.documentSelfLink = bestState.documentSelfLink;
+        }
+
+        peerOp.setBody(clonedState);
+        return peerOp;
     }
 
     private void markServiceInConflict(ServiceDocument state, ServiceDocument bestPeerRsp) {
         logWarning("State in conflict. Local: %s, Among peers: %s",
                 Utils.toJsonHtml(state), Utils.toJsonHtml(bestPeerRsp));
     }
-
 }

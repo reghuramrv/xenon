@@ -26,7 +26,30 @@ public class UserGroupService extends StatefulService {
     public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_USER_GROUPS;
 
     public static Service createFactory() {
-        return FactoryService.createIdempotent(UserGroupService.class);
+        FactoryService fs = new FactoryService(UserGroupState.class) {
+
+            @Override
+            public Service createServiceInstance() throws Throwable {
+                return new UserGroupService();
+            }
+
+            @Override
+            public void handlePost(Operation request) {
+                checkAndNestCompletionForAuthzCacheClear(this, request);
+                super.handlePost(request);
+            }
+        };
+        fs.toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+        return fs;
+    }
+
+    private static void checkAndNestCompletionForAuthzCacheClear(Service s, Operation op) {
+        if (AuthorizationCacheUtils.isAuthzCacheClearApplicableOperation(op)) {
+            UserGroupState state = AuthorizationCacheUtils.extractBody(op, s, UserGroupState.class);
+            if (state != null) {
+                AuthorizationCacheUtils.clearAuthzCacheForUserGroup(s, op, state);
+            }
+        }
     }
 
     /**
@@ -34,6 +57,32 @@ public class UserGroupService extends StatefulService {
      */
     public static class UserGroupState extends ServiceDocument {
         public Query query;
+
+        public static class Builder {
+            private UserGroupService.UserGroupState userGroupState;
+
+            private Builder() {
+                this.userGroupState = new UserGroupState();
+            }
+
+            public static Builder create() {
+                return  new Builder();
+            }
+
+            public Builder withQuery(QueryTask.Query query) {
+                this.userGroupState.query = query;
+                return this;
+            }
+
+            public Builder withSelfLink(String userGroupSelfLink) {
+                this.userGroupState.documentSelfLink = userGroupSelfLink;
+                return this;
+            }
+
+            public UserGroupService.UserGroupState build() {
+                return this.userGroupState;
+            }
+        }
     }
 
     public UserGroupService() {
@@ -41,6 +90,17 @@ public class UserGroupService extends StatefulService {
         super.toggleOption(ServiceOption.PERSISTENCE, true);
         super.toggleOption(ServiceOption.REPLICATION, true);
         super.toggleOption(ServiceOption.OWNER_SELECTION, true);
+    }
+
+    @Override
+    public void processCompletionStageUpdateAuthzArtifacts(Operation op) {
+        checkAndNestCompletionForAuthzCacheClear(this, op);
+        op.complete();
+    }
+
+    @Override
+    public void setProcessingStage(Service.ProcessingStage stage) {
+        super.setProcessingStage(stage);
     }
 
     @Override
@@ -54,7 +114,6 @@ public class UserGroupService extends StatefulService {
         if (!validate(op, newState)) {
             return;
         }
-
         op.complete();
     }
 
@@ -71,13 +130,13 @@ public class UserGroupService extends StatefulService {
         }
 
         UserGroupState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
-            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
-        } else {
-            setState(op, newState);
+            // do not update state
+            op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED);
         }
 
+        setState(op, newState);
         op.complete();
     }
 

@@ -5,7 +5,7 @@
   <parent>
     <groupId>com.vmware.xenon</groupId>
     <artifactId>xenon-parent</artifactId>
-    <version>0.7.6-SNAPSHOT</version>
+    <version>1.6.2-SNAPSHOT</version>
   </parent>
 
   <artifactId>xenon-samples</artifactId>
@@ -19,11 +19,6 @@
     <dependency>
       <groupId>${project.groupId}</groupId>
       <artifactId>xenon-ui</artifactId>
-      <version>${project.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>${project.groupId}</groupId>
-      <artifactId>xenon-swagger</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>
@@ -72,35 +67,15 @@
         </executions>
       </plugin>
       <plugin>
-        <groupId>pl.project13.maven</groupId>
-        <artifactId>git-commit-id-plugin</artifactId>
-        <configuration>
-          <skip>true</skip>
-        </configuration>
-      </plugin>
-      <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-assembly-plugin</artifactId>
-        <version>2.4.1</version>
         <configuration>
-          <descriptorRefs>
-            <descriptorRef>jar-with-dependencies</descriptorRef>
-          </descriptorRefs>
           <archive>
             <manifest>
               <mainClass>com.vmware.xenon.samples.SampleHost</mainClass>
             </manifest>
           </archive>
         </configuration>
-        <executions>
-          <execution>
-            <id>make-assembly</id>
-            <phase>package</phase>
-            <goals>
-              <goal>single</goal>
-            </goals>
-          </execution>
-        </executions>
       </plugin>
     </plugins>
   </build>

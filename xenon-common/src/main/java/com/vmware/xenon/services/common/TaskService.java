@@ -14,10 +14,12 @@
 package com.vmware.xenon.services.common;
 
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
+import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.Utils;
@@ -82,7 +84,8 @@ public abstract class TaskService<T extends TaskService.TaskServiceState>
         if (state == null) {
             throw new IllegalArgumentException("state cannot be null");
         }
-        state.documentExpirationTimeMicros = Utils.getNowMicrosUtc() + timeUnit.toMicros(timeUnitValue);
+        state.documentExpirationTimeMicros = Utils
+                .fromNowMicrosUtc(timeUnit.toMicros(timeUnitValue));
     }
 
     /**
@@ -99,7 +102,17 @@ public abstract class TaskService<T extends TaskService.TaskServiceState>
         }
         taskOperation.complete();
 
+        if (!ServiceHost.isServiceCreate(taskOperation)
+                || (task.taskInfo != null && !TaskState.isCreated(task.taskInfo))) {
+            // Skip self patch to STARTED if this is a restart operation, or, task stage is
+            // other than CREATED.
+            // Tasks that handle restart should override handleStart and decide if they should
+            // continue processing on restart, or fail
+            return;
+        }
+
         initializeState(task, taskOperation);
+
         sendSelfPatch(task);
     }
 
@@ -108,16 +121,17 @@ public abstract class TaskService<T extends TaskService.TaskServiceState>
      * implementation to also validate their {@code SubStage}.
      */
     protected T validateStartPost(Operation taskOperation) {
+        T task = getBody(taskOperation);
+
         if (!taskOperation.hasBody()) {
             taskOperation.fail(new IllegalArgumentException("POST body is required"));
             return null;
         }
 
-        T task = getBody(taskOperation);
-        if (task.taskInfo != null) {
-            taskOperation.fail(new IllegalArgumentException(
-                    "Do not specify taskBody: internal use only"));
-            return null;
+        if (!ServiceHost.isServiceCreate(taskOperation)) {
+            // we apply validation only on the original, client issued POST, not operations
+            // caused by host restart
+            return task;
         }
 
         // Subclasses might also want to ensure that their "SubStage" is not specified also
@@ -129,9 +143,12 @@ public abstract class TaskService<T extends TaskService.TaskServiceState>
      * implementation to initialize their {@code SubStage}
      */
     protected void initializeState(T task, Operation taskOperation) {
-        task.taskInfo = new TaskState();
+        if (task.taskInfo == null) {
+            task.taskInfo = new TaskState();
+        }
+        task.taskInfo.failure = null;
+        task.taskInfo.durationMicros = null;
         task.taskInfo.stage = TaskState.TaskStage.STARTED;
-
         // Put in some default expiration time if it hasn't been provided yet.
         if (task.documentExpirationTimeMicros == 0) {
             setExpiration(task, DEFAULT_EXPIRATION_MINUTES, TimeUnit.MINUTES);
@@ -185,21 +202,51 @@ public abstract class TaskService<T extends TaskService.TaskServiceState>
      * not need to explicitly save the state: that will happen when we call patch.complete()
      */
     protected void updateState(T currentTask, T patchBody) {
-        Utils.mergeWithState(getDocumentTemplate().documentDescription, currentTask, patchBody);
-
+        Utils.mergeWithState(getStateDescription(), currentTask, patchBody);
         // NOTE: If patchBody provides a new expiration, Utils.mergeWithState will take care of it
+    }
+
+    /**
+     * Send ourselves a PATCH to indicate successful completion of task
+     */
+    protected void sendSelfFinishedPatch(T task) {
+        sendSelfPatch(task, TaskState.TaskStage.FINISHED, null);
     }
 
     /**
      * Send ourselves a PATCH that will indicate failure
      */
     protected void sendSelfFailurePatch(T task, String failureMessage) {
-        task.failureMessage = failureMessage;
+        sendSelfPatch(task, TaskState.TaskStage.FAILED,
+                (s) -> s.failureMessage = failureMessage);
+    }
 
-        if (task.taskInfo == null) {
-            task.taskInfo = new TaskState();
+    /**
+     * Send ourselves a PATCH that will indicate cancellation
+     */
+    protected void sendSelfCancellationPatch(T task, String cancellationMessage) {
+        sendSelfPatch(task, TaskState.TaskStage.CANCELLED,
+                (s) -> s.failureMessage = cancellationMessage);
+    }
+
+    /**
+     * Send ourselves a PATCH that will advance to another step in the task workflow to the
+     * specified stage and substage.
+     *
+     * @param taskState the task's state to use for the PATCH
+     * @param stage the next stage to advance to
+     * @param updateTaskState lambda helper for setting any custom field in the task's state (such
+     *                        as SubStage). If null, it will be ignored.
+     */
+    protected void sendSelfPatch(T taskState, TaskState.TaskStage stage, Consumer<T> updateTaskState) {
+        if (taskState.taskInfo == null) {
+            taskState.taskInfo = new TaskState();
         }
-        task.taskInfo.stage = TaskState.TaskStage.FAILED;
-        sendSelfPatch(task);
+        taskState.taskInfo.stage = stage;
+
+        if (updateTaskState != null) {
+            updateTaskState.accept(taskState);
+        }
+        sendSelfPatch(taskState);
     }
 }

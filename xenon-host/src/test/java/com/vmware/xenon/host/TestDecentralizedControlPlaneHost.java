@@ -20,8 +20,6 @@ import java.util.UUID;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-import com.vmware.xenon.host.DecentralizedControlPlaneHost;
-
 public class TestDecentralizedControlPlaneHost {
 
     @Test
@@ -37,7 +35,8 @@ public class TestDecentralizedControlPlaneHost {
                     "--port=0",
                     "--sandbox=" + tmpFolder.getRoot().getAbsolutePath(),
                     "--bindAddress=" + bindAddress,
-                    "--id=" + hostId
+                    "--id=" + hostId,
+                    "--adminPassword=changeme"
             };
 
             h.initialize(args);

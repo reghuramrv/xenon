@@ -19,41 +19,56 @@ import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
-
 import javax.net.ssl.SSLContext;
 
 import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http2.Http2SecurityUtil;
+import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNames;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
-
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
 
+import com.vmware.xenon.common.AuthorizationSetupHelper;
 import com.vmware.xenon.common.CommandLineArgumentParser;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceClient;
+import com.vmware.xenon.common.ServiceClient.ConnectionPoolMetrics;
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceErrorResponse;
+import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.StatelessService;
+import com.vmware.xenon.common.TestResults;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.test.AuthorizationHelper;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 import com.vmware.xenon.common.test.TestProperty;
+import com.vmware.xenon.common.test.TestRequestSender;
+import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
@@ -66,64 +81,134 @@ public class NettyHttpServiceClientTest {
 
     private static VerificationHost HOST;
 
+    private static final boolean ENABLE_AUTH = false;
+
+    private static final String SAMPLE_EMAIL = "sample@vmware.com";
+    private static final String SAMPLE_PASSWORD = "password";
+
     private VerificationHost host;
 
     public String testURI;
 
     public int requestCount = 16;
 
-    public int serviceCount = 16;
+    public int serviceCount = 32;
 
     public int connectionCount = 32;
 
     // Operation timeout is in seconds
-    public int operationTimeout = 5;
+    public int operationTimeout = 0;
+
+    public int iterationCount = 1;
+
+    @Rule
+    public TestResults testResults = new TestResults();
 
     @BeforeClass
-    public static void setUpOnce() throws Exception {
-
-        NettyChannelContext.setMaxRequestSize(1024 * 512);
+    public static void setUpOnce() throws Throwable {
         HOST = VerificationHost.create(0);
+        HOST.setAuthorizationEnabled(ENABLE_AUTH);
+        HOST.setRequestPayloadSizeLimit(1024 * 512);
+        HOST.setResponsePayloadSizeLimit(1024 * 512);
+
         CommandLineArgumentParser.parseFromProperties(HOST);
         HOST.setMaintenanceIntervalMicros(
                 TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
 
-        ServiceClient client = NettyHttpServiceClient.create(
-                NettyHttpServiceClientTest.class.getCanonicalName(),
-                Executors.newFixedThreadPool(4),
-                Executors.newScheduledThreadPool(1), HOST);
-
-        SSLContext clientContext = SSLContext.getInstance(ServiceClient.TLS_PROTOCOL_NAME);
-        clientContext.init(null, InsecureTrustManagerFactory.INSTANCE.getTrustManagers(), null);
-        client.setSSLContext(clientContext);
+        ServiceClient client = createNettyServiceClient();
         HOST.setClient(client);
 
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         HOST.setCertificateFileReference(ssc.certificate().toURI());
         HOST.setPrivateKeyFileReference(ssc.privateKey().toURI());
+        HOST.setSecurePort(0);
+
+        if (HOST.isStressTest()) {
+            client.setPendingRequestQueueLimit(1000000);
+        }
 
         try {
             HOST.start();
+            CommandLineArgumentParser.parseFromProperties(HOST);
         } catch (Throwable e) {
             throw new RuntimeException(e);
         }
+
+        if (ENABLE_AUTH) {
+            // Create example user auth related objects
+            HOST.setSystemAuthorizationContext();
+            HOST.testStart(1);
+            AuthorizationSetupHelper.create()
+                    .setHost(HOST)
+                    .setUserEmail(SAMPLE_EMAIL)
+                    .setUserPassword(SAMPLE_PASSWORD)
+                    .setUserSelfLink(SAMPLE_EMAIL)
+                    .setIsAdmin(true)
+                    .setCompletion(HOST.getCompletion())
+                    .start();
+            HOST.testWait();
+            HOST.resetAuthorizationContext();
+        }
+    }
+
+    private static ServiceClient createNettyServiceClient() throws Throwable {
+        ServiceClient client = NettyHttpServiceClient.create(
+                NettyHttpServiceClientTest.class.getSimpleName(),
+                Executors.newFixedThreadPool(4),
+                Executors.newScheduledThreadPool(1), HOST);
+
+        if (NettyChannelContext.isALPNEnabled()) {
+            SslContext http2ClientContext = SslContextBuilder.forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+                    .applicationProtocolConfig(new ApplicationProtocolConfig(
+                            ApplicationProtocolConfig.Protocol.ALPN,
+                            ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                            ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                            ApplicationProtocolNames.HTTP_2))
+                    .build();
+            ((NettyHttpServiceClient) client).setHttp2SslContext(http2ClientContext);
+        }
+
+        SSLContext clientContext = SSLContext.getInstance(ServiceClient.TLS_PROTOCOL_NAME);
+        clientContext.init(null, InsecureTrustManagerFactory.INSTANCE.getTrustManagers(), null);
+        client.setSSLContext(clientContext);
+        return client;
     }
 
     @AfterClass
     public static void tearDown() {
+        HOST.log("final teardown");
         HOST.tearDown();
     }
 
     @Before
-    public void setUp() {
+    public void setUp() throws Throwable {
         CommandLineArgumentParser.parseFromProperties(this);
+
         this.host = HOST;
+        this.host.log("restoring operation timeout");
+        if (this.operationTimeout == 0) {
+            this.operationTimeout = (this.host.getTimeoutSeconds() * 2) / 3;
+        }
         this.host.setOperationTimeOutMicros(TimeUnit.SECONDS.toMicros(this.operationTimeout));
+
+        if (ENABLE_AUTH) {
+            // find user with system auth context, then assumeIdentity will reset with found user
+            HOST.setSystemAuthorizationContext();
+            String userServicePath = new AuthorizationHelper(this.host)
+                    .findUserServiceLink(SAMPLE_EMAIL);
+            this.host.assumeIdentity(userServicePath);
+        }
     }
 
     @After
     public void cleanUp() {
-        this.host.getClient().setConnectionLimitPerHost(NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST);
+        this.host.log("cleanup");
+
+        if (ENABLE_AUTH) {
+            this.host.resetAuthorizationContext();
+        }
     }
 
     @Test
@@ -133,16 +218,16 @@ public class NettyHttpServiceClientTest {
         }
         this.host.setOperationTimeOutMicros(TimeUnit.SECONDS.toMicros(120));
         this.host.setTimeoutSeconds(120);
-        this.host
-                .log(
-                        "Starting HTTP GET stress test against %s, request count: %d, connection limit: %d",
-                        this.testURI, this.requestCount, this.connectionCount);
-        this.host.getClient().setConnectionLimitPerHost(this.connectionCount);
+        this.host.log(
+                "Starting HTTP GET stress test against %s, request count: %d, connection limit: %d",
+                this.testURI, this.requestCount, this.connectionCount);
+
         for (int i = 0; i < 3; i++) {
-            long start = Utils.getNowMicrosUtc();
+            long start = System.nanoTime();
             getThirdPartyServerResponse(this.testURI, this.requestCount);
-            long end = Utils.getNowMicrosUtc();
-            double thpt = this.requestCount / ((end - start) / 1000000.0);
+            long end = System.nanoTime();
+            double thpt = this.requestCount
+                    / ((end - start) / (double) TimeUnit.SECONDS.toNanos(1));
             this.host.log("Connection limit: %d, Request count: %d, Requests per second:%f",
                     this.connectionCount, this.requestCount, thpt);
             System.gc();
@@ -156,18 +241,17 @@ public class NettyHttpServiceClientTest {
         }
         this.host.setOperationTimeOutMicros(TimeUnit.SECONDS.toMicros(120));
         this.host.setTimeoutSeconds(120);
-        this.host
-                .log(
-                        "Starting HTTP POST stress test against %s, request count: %d, connection limit: %d",
-                        this.testURI, this.requestCount, this.connectionCount);
-        this.host.getClient().setConnectionLimitPerHost(this.connectionCount);
-        long start = Utils.getNowMicrosUtc();
+        this.host.log(
+                "Starting HTTP POST stress test against %s, request count: %d, connection limit: %d",
+                this.testURI, this.requestCount, this.connectionCount);
+
+        long start = System.nanoTime();
         ExampleServiceState body = new ExampleServiceState();
         body.name = UUID.randomUUID().toString();
         this.host.sendHttpRequest(this.host.getClient(), this.testURI, Utils.toJson(body),
                 this.requestCount);
-        long end = Utils.getNowMicrosUtc();
-        double thpt = this.requestCount / ((end - start) / 1000000.0);
+        long end = System.nanoTime();
+        double thpt = this.requestCount / ((end - start) / (double) TimeUnit.SECONDS.toNanos(1));
         this.host.log("Connection limit: %d, Request count: %d, Requests per second:%f",
                 this.connectionCount, this.requestCount, thpt);
     }
@@ -191,11 +275,39 @@ public class NettyHttpServiceClientTest {
         for (URI u : uris) {
             MinimalTestServiceState body = (MinimalTestServiceState) this.host
                     .buildMinimalTestState();
-            Operation put = Operation.createPut(u).setBody(body)
+            Operation put = Operation.createPut(u)
+                    .setBody(body)
+                    .forceRemote()
                     .setCompletion(this.host.getCompletion());
             this.host.send(put);
         }
         this.host.testWait();
+
+        String tag = ServiceClient.CONNECTION_TAG_DEFAULT;
+        validateTagInfo(this.host, tag);
+    }
+
+    static void validateTagInfo(VerificationHost host, String tag) {
+        validateTagInfo(host, host.getClient(), tag, null);
+    }
+
+    private static void validateTagInfo(VerificationHost host, ServiceClient client, String tag,
+            Integer limit) {
+        host.waitFor("pending requests", () -> {
+            ConnectionPoolMetrics tagInfo = client.getConnectionPoolMetricsPerTag(tag);
+            if (tagInfo == null) {
+                return false;
+            }
+            host.log("%s", Utils.toJson(tagInfo));
+            if (limit != null && tagInfo.availableConnectionCount > limit) {
+                throw new IllegalStateException("Available: " + tagInfo.availableConnectionCount);
+            }
+            if (tagInfo.pendingRequestCount != 0 || tagInfo.inUseConnectionCount > 0) {
+                host.log("Requests still pending: %s", Utils.toJson(tagInfo));
+                return false;
+            }
+            return true;
+        });
     }
 
     @Test
@@ -233,7 +345,6 @@ public class NettyHttpServiceClientTest {
         this.host.testStart(1);
         Operation get = Operation
                 .createGet(UriUtils.buildUri(this.host, UUID.randomUUID().toString()))
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_QUEUING)
                 .setCompletion(
                         (op, ex) -> {
                             if (op.getStatusCode() == Operation.STATUS_CODE_NOT_FOUND) {
@@ -266,13 +377,14 @@ public class NettyHttpServiceClientTest {
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY)
                 .setCompletion(
                         (op, ex) -> {
-                            if (op.getStatusCode() == Operation.STATUS_CODE_OK) {
+                            int statusCode = op.getStatusCode();
+                            if (statusCode == Operation.STATUS_CODE_OK) {
                                 this.host.completeIteration();
                                 return;
                             }
 
                             this.host.failIteration(new Throwable(
-                                    "Expected Operation.STATUS_CODE_OK"));
+                                    "Expected Operation.STATUS_CODE_OK but was " + statusCode));
                         });
 
         this.host.send(get);
@@ -281,55 +393,62 @@ public class NettyHttpServiceClientTest {
     }
 
     @Test
-    public void remotePatchTimeout() throws Throwable {
-        doRemotePatchWithTimeout(false);
+    public void sendRequestWithTimeout() throws Throwable {
+        for (int i = 0; i < this.iterationCount; i++) {
+            doRemotePatchWithTimeout();
+        }
     }
 
-    @Test
-    public void remotePatchWithCallbackTimeout() throws Throwable {
-        doRemotePatchWithTimeout(true);
-    }
-
-    private void doRemotePatchWithTimeout(boolean useCallback) throws Throwable {
+    private void doRemotePatchWithTimeout() throws Throwable {
         List<Service> services = this.host.doThroughputServiceStart(1,
                 MinimalTestService.class,
                 this.host.buildMinimalTestState(),
                 EnumSet.noneOf(Service.ServiceOption.class), null);
-        this.host.toggleNegativeTestMode(true);
-        this.host.setOperationTimeOutMicros(TimeUnit.MILLISECONDS.toMicros(250));
+        try {
+            this.host.toggleNegativeTestMode(true);
+            this.host.setOperationTimeOutMicros(TimeUnit.MILLISECONDS.toMicros(500));
 
-        // send a request to the MinimalTestService, with a body that makes it NOT complete it
-        MinimalTestServiceState body = new MinimalTestServiceState();
-        body.id = MinimalTestService.STRING_MARKER_TIMEOUT_REQUEST;
+            // send a request to the MinimalTestService, with a body that makes it NOT complete it
+            MinimalTestServiceState body = new MinimalTestServiceState();
+            body.id = MinimalTestService.STRING_MARKER_TIMEOUT_REQUEST;
 
-        this.host.getClient()
-                .setConnectionLimitPerHost(NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST);
-        int count = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST * 2;
-        // timeout tracking currently works only for remote requests ...
-        this.host.testStart(count);
-        for (int i = 0; i < count; i++) {
-            Operation request = Operation
-                    .createPatch(services.get(0).getUri())
-                    .forceRemote()
-                    .setBody(body)
-                    .setCompletion((o, e) -> {
-                        if (e != null) {
-                            // timeout occurred, good
-                            this.host.completeIteration();
-                            return;
-                        }
-                        this.host.failIteration(new IllegalStateException(
-                                "Request should have timed out"));
-                    });
-            if (useCallback) {
-                this.host.sendRequestWithCallback(request.setReferer(this.host.getReferer()));
-            } else {
+            int count = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST;
+
+            // Use a random boolean to test the keep-alive and close code paths
+            Random r = new Random();
+
+            // Use a custom tag to ensure that connections are not shared with the default pool.
+            String tag = ServiceClient.CONNECTION_TAG_DEFAULT + "-timeout";
+
+            // timeout tracking currently works only for remote requests
+            this.host.testStart(count);
+            for (int i = 0; i < count; i++) {
+                Operation request = Operation
+                        .createPatch(services.get(0).getUri())
+                        .forceRemote()
+                        .setConnectionTag(tag)
+                        .setBody(body)
+                        .setKeepAlive(r.nextBoolean())
+                        .setCompletion((o, e) -> {
+                            if (e != null) {
+                                // timeout occurred, good
+                                this.host.completeIteration();
+                                return;
+                            }
+                            this.host.failIteration(new IllegalStateException(
+                                    "Request should have timed out"));
+                        });
+
                 this.host.send(request);
+
             }
+            this.host.testWait();
+            validateTagInfo(this.host, this.host.getClient(), tag, 0);
+        } finally {
+            this.host.toggleNegativeTestMode(false);
+            this.host.setOperationTimeOutMicros(
+                    TimeUnit.SECONDS.toMicros(ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS));
         }
-        this.host.testWait();
-        this.host.toggleNegativeTestMode(false);
-        this.host.setOperationTimeOutMicros(TimeUnit.SECONDS.toMicros(10));
     }
 
     @Test
@@ -345,44 +464,37 @@ public class NettyHttpServiceClientTest {
         this.host.doPutPerService(
                 EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.SINGLE_ITERATION),
                 services);
-        this.host.doPutPerService(
-                EnumSet.of(TestProperty.CALLBACK_SEND, TestProperty.SINGLE_ITERATION),
-                services);
-        this.host.doPutPerService(
-                EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.CALLBACK_SEND,
-                        TestProperty.SINGLE_ITERATION),
-                services);
 
-        // check that content type is set and preserved
+        String tag = ServiceClient.CONNECTION_TAG_DEFAULT;
+        validateTagInfo(this.host, tag);
+
+        // check that query and fragment make it to the service
         URI u = services.get(0).getUri();
-        this.host.testStart(1);
+        u = new URI(u.getScheme(), null, u.getHost(), u.getPort(), u.getPath(), "k=v", "fragment");
         MinimalTestServiceState body = new MinimalTestServiceState();
-        body.id = MinimalTestService.STRING_MARKER_USE_DIFFERENT_CONTENT_TYPE;
+        body.id = MinimalTestService.STRING_MARKER_URI_HAS_QUERY_AND_FRAGMENT;
         Operation patch = Operation
                 .createPatch(u)
-                .setBody(body)
-                .setCompletion(
-                        (o, e) -> {
-                            if (e != null) {
-                                this.host.failIteration(e);
-                                return;
-                            }
+                .setBody(body);
+        TestRequestSender sender = this.host.getTestRequestSender();
 
-                            if (!Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED.equals(o
-                                    .getContentType())) {
-                                this.host.failIteration(new IllegalArgumentException(
-                                        "unexpected content type: " + o.getContentType()));
-                                return;
-                            }
+        Operation resOp = sender.sendAndWait(patch);
 
-                            this.host.completeIteration();
-                        });
-        this.host.send(patch);
-        this.host.testWait();
+        // check that content type is set and preserved
+        body = new MinimalTestServiceState();
+        body.id = MinimalTestService.STRING_MARKER_USE_DIFFERENT_CONTENT_TYPE;
+        patch = Operation
+                .createPatch(u)
+                .setBody(body);
+        resOp = sender.sendAndWait(patch);
+        if (!Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED.equals(resOp
+                .getContentType())) {
+            throw new IllegalArgumentException(
+                    "unexpected content type: " + resOp.getContentType());
+        }
 
         // verify content de-serializes with slightly different content type
         String contentType = "application/json; charset=UTF-8";
-        this.host.testStart(1);
         MinimalTestServiceState body1 = new MinimalTestServiceState();
         body1.id = UUID.randomUUID().toString();
         body1.stringValue = UUID.randomUUID().toString();
@@ -392,28 +504,15 @@ public class NettyHttpServiceClientTest {
                 .setContentType(contentType)
                 .forceRemote();
 
-        Operation p = patch;
-        p.setCompletion((o, e) -> {
-            if (e != null) {
-                this.host.failIteration(e);
-                return;
-            }
-            try {
-                MinimalTestServiceState rsp = o.getBody(MinimalTestServiceState.class);
-                assertEquals(body1.stringValue, rsp.stringValue);
-                assertEquals(o.getContentType(), p.getContentType());
-                this.host.completeIteration();
-            } catch (Throwable ex) {
-                this.host.failIteration(ex);
-            }
-        });
-        this.host.send(p);
-        this.host.testWait();
+        resOp = sender.sendAndWait(patch);
+        MinimalTestServiceState rsp = resOp.getBody(MinimalTestServiceState.class);
+        assertEquals(body1.stringValue, rsp.stringValue);
+        assertEquals(resOp.getContentType(), patch.getContentType());
     }
 
     @Test
     public void putSingleNoQueueing() throws Throwable {
-        long s = Utils.getNowMicrosUtc();
+        long s = System.nanoTime() / 1000;
         this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
 
         URI uriToMissingService = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK
@@ -425,7 +524,6 @@ public class NettyHttpServiceClientTest {
         // cause the this.host to queue the request until the child became available
         Operation put = Operation.createPut(uriToMissingService)
                 .setBody(this.host.buildMinimalTestState())
-                .addRequestHeader(Operation.PRAGMA_HEADER, Operation.PRAGMA_DIRECTIVE_NO_QUEUING)
                 .setCompletion(this.host.getExpectedFailureCompletion());
 
         this.host.send(put);
@@ -440,12 +538,11 @@ public class NettyHttpServiceClientTest {
                         uriToMissingService)
                 .setBody(this.host.buildMinimalTestState())
                 .forceRemote()
-                .addRequestHeader(Operation.PRAGMA_HEADER, Operation.PRAGMA_DIRECTIVE_NO_QUEUING)
                 .setCompletion(this.host.getExpectedFailureCompletion());
 
         this.host.send(put);
         this.host.testWait();
-        long e = Utils.getNowMicrosUtc();
+        long e = System.nanoTime() / 1000;
 
         if (e - s > this.host.getOperationTimeoutMicros() / 2) {
             throw new TimeoutException("Request got queued, it should have bypassed queuing");
@@ -459,7 +556,7 @@ public class NettyHttpServiceClientTest {
             nonXenonLookingClient = NettyHttpServiceClient.create(UUID.randomUUID().toString(),
                     Executors.newFixedThreadPool(1), Executors.newScheduledThreadPool(1));
             nonXenonLookingClient.start();
-            s = Utils.getNowMicrosUtc();
+            s = System.nanoTime() / 1000;
             // try a JAVA HTTP client and verify we do not queue.
             this.host.sendWithJavaClient(uriToMissingService,
                     Operation.MEDIA_TYPE_APPLICATION_JSON,
@@ -473,14 +570,14 @@ public class NettyHttpServiceClientTest {
                     .createPut(
                             uriToMissingService)
                     .setBody(this.host.buildMinimalTestState())
-                    .setExpiration(Utils.getNowMicrosUtc() + TimeUnit.SECONDS.toMicros(1000))
+                    .setExpiration(Utils.fromNowMicrosUtc(TimeUnit.SECONDS.toMicros(1000)))
                     .setReferer(this.host.getReferer())
                     .forceRemote()
                     .setCompletion(this.host.getExpectedFailureCompletion());
             nonXenonLookingClient.send(put);
             this.host.testWait();
 
-            e = Utils.getNowMicrosUtc();
+            e = System.nanoTime() / 1000;
             if (e - s > this.host.getOperationTimeoutMicros() / 2) {
                 throw new TimeoutException("Request got queued, it should have bypassed queuing");
             }
@@ -525,10 +622,31 @@ public class NettyHttpServiceClientTest {
                 EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.LARGE_PAYLOAD,
                         TestProperty.BINARY_PAYLOAD, TestProperty.FORCE_FAILURE),
                 services);
+
+        // create a PUT request larger than the allowed size of a request and verify that it fails.
+        ServiceDocument largeState = this.host.buildMinimalTestState(
+                this.host.getClient().getRequestPayloadSizeLimit() + 100);
+        this.host.testStart(1);
+        Operation put = Operation.createPut(services.get(0).getUri())
+                .forceRemote()
+                .setBody(largeState)
+                .setCompletion((o, e) -> {
+                    if (e != null && e instanceof IllegalArgumentException &&
+                            e.getMessage().contains("limit")) {
+                        this.host.completeIteration();
+                        return;
+                    }
+                    this.host.failIteration(
+                            new IllegalStateException("Operation was expected to fail because " +
+                                    "op.getContentLength() is more than allowed"));
+                });
+        this.host.send(put);
+        this.host.testWait();
+        validateTagInfo(this.host, ServiceClient.CONNECTION_TAG_DEFAULT);
     }
 
     @Test
-    public void putSingleWithFailure() throws Throwable {
+    public void updatesWithForcedFailure() throws Throwable {
         long serviceCount = 1;
         List<Service> services = this.host.doThroughputServiceStart(serviceCount,
                 MinimalTestService.class,
@@ -557,9 +675,20 @@ public class NettyHttpServiceClientTest {
                 .setCompletion(this.host.getExpectedFailureCompletion()));
         this.host.testWait();
 
+        // do the same, forceRemote to go over socket I/O
         this.host.testStart(1);
         this.host.send(Operation.createPut(services.get(0).getUri())
                 .setBody("this is not JSON")
+                .forceRemote()
+                .setCompletion(this.host.getExpectedFailureCompletion()));
+        this.host.testWait();
+
+        // request that the service fails the request but returns corrupted JSON
+        MinimalTestServiceState body = new MinimalTestServiceState();
+        this.host.testStart(1);
+        body.id = MinimalTestService.STRING_MARKER_FAIL_REQUEST_WITH_CORRUPTED_JSON_RSP;
+        this.host.send(Operation.createPatch(services.get(0).getUri())
+                .setBody(body)
                 .forceRemote()
                 .setCompletion(this.host.getExpectedFailureCompletion()));
         this.host.testWait();
@@ -579,9 +708,7 @@ public class NettyHttpServiceClientTest {
     }
 
     private void verifyErrorResponseBodyHandling(List<Service> services) throws Throwable {
-        // send a body with instructions to the test service to fail the
-        // request, but set the error body as plain text. This verifies the runtime
-        // preserves the plain text error response
+        // send a body with instructions to the test service to fail the request.
         CompletionHandler ch = (o, e) -> {
             if (e == null) {
                 this.host.failIteration(new IllegalStateException("expected failure"));
@@ -589,10 +716,13 @@ public class NettyHttpServiceClientTest {
             }
 
             Object rsp = o.getBodyRaw();
-            if (!o.getContentType().equals(Operation.MEDIA_TYPE_TEXT_PLAIN)
-                    || !(rsp instanceof String)) {
-                this.host.failIteration(new IllegalStateException(
-                        "expected text plain content type and response"));
+            if (!o.getContentType().equals(Operation.MEDIA_TYPE_APPLICATION_JSON)) {
+                this.host.failIteration(new IllegalStateException("expected json response"));
+                return;
+            }
+
+            if (!o.isRemote() && !(rsp instanceof ServiceErrorResponse)) {
+                this.host.failIteration(new IllegalStateException("expected json response"));
                 return;
             }
             this.host.completeIteration();
@@ -613,8 +743,7 @@ public class NettyHttpServiceClientTest {
                 .setCompletion(ch));
         this.host.testWait();
 
-        // now verify we leave binary or custom content type error responses alone
-        // in process response will stay as string
+        // now verify we leave binary or custom content type error responses
         ch = (o, e) -> {
             if (e == null) {
                 this.host.failIteration(new IllegalStateException("expected failure"));
@@ -622,10 +751,9 @@ public class NettyHttpServiceClientTest {
             }
 
             Object rsp = o.getBodyRaw();
-            if (!o.getContentType().equals(MinimalTestService.CUSTOM_CONTENT_TYPE)
-                    || !(rsp instanceof String)) {
-                this.host.failIteration(new IllegalStateException(
-                        "expected custom content type and binary response"));
+            if (!o.getContentType().equals(Operation.MEDIA_TYPE_APPLICATION_JSON)
+                    || !(rsp instanceof ServiceErrorResponse)) {
+                this.host.failIteration(new IllegalStateException("expected json response"));
                 return;
             }
             this.host.completeIteration();
@@ -639,7 +767,7 @@ public class NettyHttpServiceClientTest {
                 .setCompletion(ch));
         this.host.testWait();
 
-        // cross node response will stay as binary
+        // cross node response
         ch = (o, e) -> {
             if (e == null) {
                 this.host.failIteration(new IllegalStateException("expected failure"));
@@ -647,10 +775,9 @@ public class NettyHttpServiceClientTest {
             }
 
             Object rsp = o.getBodyRaw();
-            if (!o.getContentType().equals(MinimalTestService.CUSTOM_CONTENT_TYPE)
-                    || !(rsp instanceof byte[])) {
-                this.host.failIteration(new IllegalStateException(
-                        "expected custom content type and binary response"));
+            if (!o.getContentType().equals(Operation.MEDIA_TYPE_APPLICATION_JSON)
+                    || !(rsp instanceof String)) {
+                this.host.failIteration(new IllegalStateException("expected json response"));
                 return;
             }
             this.host.completeIteration();
@@ -720,38 +847,131 @@ public class NettyHttpServiceClientTest {
                 this.host.buildMinimalTestState(),
                 null, null);
 
+        String tag = ServiceClient.CONNECTION_TAG_DEFAULT;
+
         if (!this.host.isStressTest()) {
             this.host.log("Single connection runs");
-            this.host.getClient().setConnectionLimitPerHost(1);
             this.host.doPutPerService(
                     this.requestCount,
                     EnumSet.of(TestProperty.FORCE_REMOTE),
                     services);
+            validateTagInfo(this.host, tag);
+        } else {
+            this.host.setOperationTimeOutMicros(
+                    TimeUnit.SECONDS.toMicros(this.host.getTimeoutSeconds()));
         }
+
+        // use global limit, which applies by default to all tags
+        int limit = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST;
+        this.host.connectionTag = null;
+        this.host.log("Using client global connection limit %d", limit);
 
         for (int i = 0; i < 5; i++) {
-            this.host.doPutPerService(
+            double throughput = this.host.doPutPerService(
                     this.requestCount,
                     EnumSet.of(TestProperty.FORCE_REMOTE),
                     services);
-            for (int k = 0; k < 5; k++) {
-                Runtime.getRuntime().gc();
-                Runtime.getRuntime().runFinalization();
-            }
+            this.testResults.getReport().all("HTTP1.1 JSON PUTS/sec", throughput);
+            this.host.waitForGC();
+            throughput = this.host.doPutPerService(
+                    this.requestCount,
+                    EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.BINARY_SERIALIZATION),
+                    services);
+            this.testResults.getReport().all("HTTP1.1 binary PUTS/sec", throughput);
+            this.host.waitForGC();
         }
 
-        if (!this.host.isStressTest()) {
-            this.host.doPutPerService(
-                    this.requestCount,
-                    EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.CALLBACK_SEND),
-                    services);
+        limit = 8;
+        this.host.connectionTag = "http1.1test";
+        this.host.log("Using tag specific connection limit %d", limit);
+        this.host.getClient().setConnectionLimitPerTag(this.host.connectionTag, limit);
+        this.host.doPutPerService(
+                this.requestCount,
+                EnumSet.of(TestProperty.FORCE_REMOTE),
+                services);
+
+        tag = this.host.connectionTag;
+        validateTagInfo(this.host, tag);
+    }
+
+    @Test
+    public void testConnectionLimit() throws Throwable {
+
+        List<Service> services = this.host.doThroughputServiceStart(this.serviceCount,
+                MinimalTestService.class,
+                this.host.buildMinimalTestState(),
+                null, null);
+
+        String tag = "http1.1ConnectionLimitTag";
+        int limit = 8;
+        ServiceClient serviceClient = createNettyServiceClient();
+        serviceClient.setConnectionLimitPerTag(tag, limit);
+        serviceClient.start();
+
+        for (int i = 0; i < this.iterationCount; i++) {
+            doConnectionLimit(services, serviceClient, tag, limit);
         }
+
+        serviceClient.stop();
+    }
+
+    private void doConnectionLimit(List<Service> services, ServiceClient serviceClient, String tag,
+            int limit) throws Throwable {
+        this.host.testStart(this.requestCount * services.size());
+        for (int i = 0; i < this.requestCount; i++) {
+            for (Service service : services) {
+                Operation getOp = Operation.createGet(service.getUri())
+                        .setReferer(this.host.getReferer())
+                        .setConnectionTag(tag)
+                        .forceRemote()
+                        .setCompletion((o, e) -> this.host.completeIteration());
+                this.host.run(() -> serviceClient.send(getOp));
+            }
+        }
+        this.host.testWait();
+
+        validateTagInfo(this.host, serviceClient, tag, limit);
+    }
+
+    @Test
+    public void testConnectionLimitWithOperationTimeout() throws Throwable {
+
+        List<Service> services = this.host.doThroughputServiceStart(this.serviceCount,
+                MinimalTestService.class,
+                this.host.buildMinimalTestState(),
+                null, null);
+
+        this.host.connectionTag = "connectionLimitWithOperationTimeoutTag";
+        this.host.getClient().setConnectionLimitPerTag(this.host.connectionTag,
+                ServiceClient.DEFAULT_CONNECTION_LIMIT_PER_HOST);
+
+        for (int i = 0; i < this.iterationCount; i++) {
+            doConnectionLimitWithOperationTimeout(services);
+        }
+    }
+
+    private void doConnectionLimitWithOperationTimeout(List<Service> services) {
+        this.host.testStart(this.requestCount * services.size());
+        for (int i = 0; i < this.requestCount; i++) {
+            for (Service service : services) {
+                Operation getOp = Operation.createGet(service.getUri())
+                        .setReferer(this.host.getReferer())
+                        .setConnectionTag(this.host.connectionTag)
+                        .forceRemote()
+                        .setExpiration(Utils.getNowMicrosUtc() + 10)
+                        // Ignore timeout failures
+                        .setCompletion((o, e) -> this.host.completeIteration());
+                this.host.run(() -> this.host.send(getOp));
+            }
+        }
+        this.host.testWait();
+        validateTagInfo(this.host, this.host.getClient(), this.host.connectionTag,
+                ServiceClient.DEFAULT_CONNECTION_LIMIT_PER_HOST);
     }
 
     @Test
     public void throughputNonPersistedServiceGetSingleConnection() throws Throwable {
         long serviceCount = 256;
-        this.host.getClient().setConnectionLimitPerHost(1);
         MinimalTestServiceState body = (MinimalTestServiceState) this.host.buildMinimalTestState();
 
         EnumSet<TestProperty> props = EnumSet.of(TestProperty.FORCE_REMOTE);
@@ -819,6 +1039,10 @@ public class NettyHttpServiceClientTest {
                     }
 
                     if (!props.contains(TestProperty.TEXT_RESPONSE)) {
+                        if (!o.hasBody()) {
+                            this.host.failIteration(new IllegalStateException("no body"));
+                            return;
+                        }
                         MinimalTestServiceState st = o.getBody(MinimalTestServiceState.class);
                         try {
                             assertTrue(st.id != null);
@@ -840,7 +1064,8 @@ public class NettyHttpServiceClientTest {
 
         for (int i = 0; i < c; i++) {
             inFlight.incrementAndGet();
-            this.host.send(get);
+            this.host.send(get.setExpiration(Utils.fromNowMicrosUtc(
+                    this.host.getOperationTimeoutMicros())));
             if (inFlight.get() < concurrencyFactor) {
                 continue;
             }
@@ -881,6 +1106,7 @@ public class NettyHttpServiceClientTest {
         List<Map<String, String>> actualCookies = new ArrayList<>();
         Operation getOp = Operation
                 .createGet(UriUtils.buildUri(this.host, link))
+                .setCookies(Collections.singletonMap("custom-cookie", "custom-value"))
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         this.host.failIteration(e);
@@ -899,13 +1125,10 @@ public class NettyHttpServiceClientTest {
         this.host.testWait();
 
         assertNotNull("expect cookies to be set", actualCookies.get(0));
-        assertEquals(1, actualCookies.get(0).size());
+        assertEquals(2, actualCookies.get(0).size());
         assertEquals("value", actualCookies.get(0).get("key"));
-    }
-
-    @Test
-    public void singleCookieLocal() throws Throwable {
-        singleCookieTest(false);
+        // Make sure that the cookies passed with operation are not lost.
+        assertEquals("custom-value", actualCookies.get(0).get("custom-cookie"));
     }
 
     @Test
@@ -969,7 +1192,10 @@ public class NettyHttpServiceClientTest {
         MinimalTestServiceState initialState = new MinimalTestServiceState();
         initialState.id = "";
         initialState.stringValue = "";
+
+        this.host.setSystemAuthorizationContext();
         this.host.startServiceAndWait(service, UUID.randomUUID().toString(), initialState);
+        this.host.resetAuthorizationContext();
 
         Map<String, String> headers;
 
@@ -1019,7 +1245,7 @@ public class NettyHttpServiceClientTest {
             return null;
         }
         String[] headerLines = headersRaw[0].split("\\n");
-        Map <String, String> headers = new HashMap<>();
+        Map<String, String> headers = new HashMap<>();
         for (String headerLine : headerLines) {
             String[] splitHeader = headerLine.split(":", 2);
             if (splitHeader.length == 2) {
@@ -1043,7 +1269,7 @@ public class NettyHttpServiceClientTest {
         this.host.testStart(2);
         noUriOp.setCompletion((op, ex) -> {
             if (ex == null) {
-                this.host.failIteration(ex);;
+                this.host.failIteration(ex);
                 return;
             }
             if (!ex.getMessage().contains("Uri is required")) {
@@ -1058,7 +1284,7 @@ public class NettyHttpServiceClientTest {
                 this.host.failIteration(ex);
                 return;
             }
-            if (!ex.getMessage().contains("Missing host")) {
+            if (!ex.getMessage().contains("host")) {
                 this.host.failIteration(new IllegalStateException("Unexpected exception"));
                 return;
             }
@@ -1066,10 +1292,52 @@ public class NettyHttpServiceClientTest {
         });
 
         this.host.toggleNegativeTestMode(true);
-        this.host.getClient().send(noUriOp);
-        this.host.getClient().send(noHostOp);
+        ServiceClient cl = this.host.getClient();
+        cl.send(noUriOp);
+        cl.send(noHostOp);
         this.host.testWait();
         this.host.toggleNegativeTestMode(false);
     }
 
+    @Test
+    public void testErrorResponse() throws Throwable {
+        testErrorResponse(false);
+    }
+
+    @Test
+    public void testErrorResponseWithKeepAlive() throws Throwable {
+        testErrorResponse(true);
+    }
+
+    private void testErrorResponse(boolean keepAlive) throws Throwable {
+
+        // When keepAlive=false is set in server side and channels is closed, response was
+        // always code=400, message="Socket channel closed:..."
+
+        StatelessService failureService = new StatelessService() {
+            @Override
+            public void handleGet(Operation get) {
+                ServiceErrorResponse body = new ServiceErrorResponse();
+                body.message = "hello";
+                get.setStatusCode(Operation.STATUS_CODE_CONFLICT);
+                get.setContentType("text/xml");
+                get.setBody(body);
+                get.setKeepAlive(keepAlive);
+                get.complete();
+            }
+        };
+
+        String servicePath = "/keepAliveInServer" + keepAlive;
+        this.host.startServiceAndWait(failureService, servicePath, null);
+
+        Operation put = Operation.createGet(this.host, servicePath).forceRemote();
+        TestRequestSender sender = new TestRequestSender(this.host);
+        FailureResponse resp = sender.sendAndWaitFailure(put);
+
+        assertEquals(Operation.STATUS_CODE_CONFLICT, resp.op.getStatusCode());
+        assertEquals("content-type should be overridden to application/json",
+                Operation.MEDIA_TYPE_APPLICATION_JSON, resp.op.getContentType());
+        ServiceErrorResponse error = resp.op.getBody(ServiceErrorResponse.class);
+        assertEquals("hello", error.message);
+    }
 }

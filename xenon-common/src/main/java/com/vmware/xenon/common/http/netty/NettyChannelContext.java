@@ -13,36 +13,44 @@
 
 package com.vmware.xenon.common.http.netty;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelPromise;
+import io.netty.handler.ssl.OpenSsl;
 import io.netty.util.AttributeKey;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.SocketContext;
+import com.vmware.xenon.common.ServiceErrorResponse;
+import com.vmware.xenon.common.config.XenonConfiguration;
+import com.vmware.xenon.common.http.netty.NettyChannelPool.NettyChannelGroupKey;
 
 public class NettyChannelContext extends SocketContext {
 
+    private static final Logger logger = Logger.getLogger(NettyChannelPool.class.getName());
+
     // For HTTP/1.1 channels, this stores the operation associated with the channel
-    static final AttributeKey<Operation> OPERATION_KEY = AttributeKey
-            .<Operation> valueOf("operation");
+    static final AttributeKey<Operation> OPERATION_KEY = AttributeKey.valueOf("operation");
+
     // For HTTP/2 channels, the promise lets us know when the HTTP/2 settings
     // negotiation is complete
-    static final AttributeKey<ChannelPromise> SETTINGS_PROMISE_KEY = AttributeKey
-            .<ChannelPromise> valueOf("settings-promise");
+    static final AttributeKey<ChannelPromise> SETTINGS_PROMISE_KEY = AttributeKey.valueOf("settings-promise");
+
     // For HTTP/2 connections, we store the channel context as an attribute on the
     // channel so we can get access to the context and stream mapping when needed
-    static final AttributeKey<NettyChannelContext> CHANNEL_CONTEXT_KEY = AttributeKey
-            .<NettyChannelContext> valueOf("channel-context");
+    static final AttributeKey<NettyChannelContext> CHANNEL_CONTEXT_KEY = AttributeKey.valueOf("channel-context");
+
     // The presence attribute tell us that a channel is using HTTP/2
-    static final AttributeKey<Boolean> HTTP2_KEY = AttributeKey.<Boolean> valueOf("http2");
+    static final AttributeKey<Boolean> HTTP2_KEY = AttributeKey.valueOf("http2");
 
     public static final int BUFFER_SIZE = 4096 * 16;
-
     public static final int MAX_INITIAL_LINE_LENGTH = 4096;
     public static final int MAX_HEADER_SIZE = 65536;
     public static final int MAX_CHUNK_SIZE = 65536;
@@ -62,41 +70,53 @@ public class NettyChannelContext extends SocketContext {
         HTTP11, HTTP2
     }
 
-    public static final PooledByteBufAllocator ALLOCATOR = NettyChannelContext.createAllocator();
+    public static final PooledByteBufAllocator ALLOCATOR = createAllocator();
 
-    static PooledByteBufAllocator createAllocator() {
+    private static PooledByteBufAllocator createAllocator() {
         // We are using defaults from the code internals since the pooled allocator does not
         // expose the values it calculates. The available constructor methods that take cache
         // sizes require us to pass things like max order and page size.
         // maxOrder determines the allocation chunk size as a multiple of page size
         int maxOrder = 4;
-        return new PooledByteBufAllocator(true, 2, 2, 8192, maxOrder, 64, 32, 16);
+        return new PooledByteBufAllocator(true, 2, 2, 8192, maxOrder, 64, 32, 16, true);
     }
 
-    int port;
-    String host;
+    private static boolean initializeALPNEnabled() {
+        String property = XenonConfiguration.string(
+                NettyChannelContext.class,
+                "isALPNEnabled",
+                null);
+        return (property != null) ? Boolean.parseBoolean(property) : OpenSsl.isAlpnSupported();
+    }
+
+    private static boolean isALPNEnabled = initializeALPNEnabled();
+
+    public static boolean isALPNEnabled() {
+        return isALPNEnabled;
+    }
+
     private Channel channel;
-    private final String key;
+    private final NettyChannelGroupKey key;
     private Protocol protocol;
 
     // An HTTP/2 connection may have multiple simultaneous operations. This map
     // Will associate each stream with the operation happening on the stream
-    public final Map<Integer, Operation> streamIdMap;
+    private final Map<Integer, Operation> streamIdMap;
 
     // We need to know if an HTTP/2 connection is being opened so that we can queue
     // pending operations instead of adding a new HTTP/2 connection
-    private AtomicBoolean openInProgress = new AtomicBoolean(false);
+    private boolean openInProgress = true;
 
     // We track the largest stream ID seen, so we know when the connection is exhausted
     private int largestStreamId = 0;
 
-    public NettyChannelContext(String host, int port, String key, Protocol protocol) {
-        this.host = host;
-        this.port = port;
+    private boolean isPoolStopping;
+
+    public NettyChannelContext(NettyChannelGroupKey key, Protocol protocol) {
         this.key = key;
         this.protocol = protocol;
         if (protocol == Protocol.HTTP2) {
-            this.streamIdMap = new HashMap<Integer, Operation>();
+            this.streamIdMap = new HashMap<>();
         } else {
             this.streamIdMap = null;
         }
@@ -104,6 +124,14 @@ public class NettyChannelContext extends SocketContext {
 
     public NettyChannelContext setChannel(Channel c) {
         this.channel = c;
+        this.channel.closeFuture().addListener(future -> {
+            if (this.isPoolStopping) {
+                return;
+            }
+            logger.fine(() -> String
+                    .format("Channel closed, ChannelId:%s, Protocol:%s, NodeChannelGroupKey:%s",
+                            this.channel.id(), this.protocol, this.key));
+        });
         return this;
     }
 
@@ -115,7 +143,15 @@ public class NettyChannelContext extends SocketContext {
     }
 
     public NettyChannelContext setOperation(Operation request) {
-        this.channel.attr(OPERATION_KEY).set(request);
+        if (this.channel == null) {
+            return this;
+        }
+        if (this.streamIdMap == null) {
+            this.channel.attr(OPERATION_KEY).set(request);
+        }
+        if (request == null) {
+            return this;
+        }
         request.setSocketContext(this);
         return this;
     }
@@ -160,19 +196,39 @@ public class NettyChannelContext extends SocketContext {
         }
     }
 
+    /**
+     * This method removes the stream ID mapping for the specified {@link Operation}, if one
+     * exists.
+     *
+     * Note this method is O(n) on the number of pending operations; operation cancellation must
+     * be correct, but for architectural reasons there's no good way to track the stream ID for a
+     * given {@link Operation} object, so this approach will have to suffice.
+     *
+     * @param op Supplies an {@link Operation} object.
+     */
+    public void removeStreamForOperation(Operation op) {
+        if (this.streamIdMap == null) {
+            return;
+        }
+        synchronized (this.streamIdMap) {
+            Iterator<Map.Entry<Integer, Operation>> it = this.streamIdMap.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<Integer, Operation> entry = it.next();
+                if (entry.getValue() == op) {
+                    it.remove();
+                    return;
+                }
+            }
+        }
+    }
+
     public boolean hasActiveStreams() {
         synchronized (this.streamIdMap) {
             return !this.streamIdMap.isEmpty();
         }
     }
 
-    public int getActiveStreamCount() {
-        synchronized (this.streamIdMap) {
-            return this.streamIdMap.size();
-        }
-    }
-
-    public String getKey() {
+    public NettyChannelGroupKey getKey() {
         return this.key;
     }
 
@@ -180,12 +236,12 @@ public class NettyChannelContext extends SocketContext {
         return this.channel;
     }
 
-    public boolean getOpenInProgress() {
-        return this.openInProgress.get();
+    public boolean isOpenInProgress() {
+        return this.openInProgress;
     }
 
     public void setOpenInProgress(boolean inProgress) {
-        this.openInProgress.set(inProgress);
+        this.openInProgress = inProgress;
     }
 
     public Protocol getProtocol() {
@@ -196,7 +252,7 @@ public class NettyChannelContext extends SocketContext {
      * Returns true if we can't allocate any more streams. Used by NettyChannelPool
      * to decide when it's time to close the connection and open a new one.
      */
-    public boolean isValid() {
+    public boolean hasRemainingStreamIds() {
         if (this.protocol == Protocol.HTTP11) {
             throw new IllegalStateException(
                     "Internal error: checked for stream exhaustion on HTTP/1.1 connection");
@@ -219,18 +275,55 @@ public class NettyChannelContext extends SocketContext {
         updateLastUseTime();
     }
 
+    public void close(boolean isShutdown) {
+        this.isPoolStopping = isShutdown;
+        close();
+    }
+
     @Override
     public void close() {
         Channel c = this.channel;
         if (c == null) {
             return;
         }
-        if (!c.isOpen()) {
+
+        if (c.isOpen()) {
+            try {
+                c.close();
+            } catch (Exception e) {
+            }
+        }
+
+        Operation op = getOperation();
+        boolean hasStreamIdMapEntry = this.streamIdMap != null && !this.streamIdMap.isEmpty();
+
+        if (op == null && !hasStreamIdMapEntry) {
+            // Common case: no operations are associated with the channel
             return;
         }
-        try {
-            c.close();
-        } catch (Throwable e) {
+
+        Throwable e = new IllegalStateException("Socket channel closed:" + this.key);
+        ServiceErrorResponse body = ServiceErrorResponse.createWithShouldRetry(e);
+
+        if (op != null) {
+            // channel closed even though keep alive was set to true
+            setOperation(null);
+            op.setStatusCode(body.statusCode);
+            op.fail(e, body);
         }
+
+        if (hasStreamIdMapEntry) {
+            // channel closed even though ops still exist in streamIdMap
+            List<Operation> ops = new ArrayList<>();
+            synchronized (this.streamIdMap) {
+                ops.addAll(this.streamIdMap.values());
+                this.streamIdMap.clear();
+            }
+            for (Operation o : ops) {
+                o.setStatusCode(body.statusCode);
+                o.fail(e, body);
+            }
+        }
+
     }
 }

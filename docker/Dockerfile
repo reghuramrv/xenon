@@ -1,12 +1,12 @@
-# This image is built by Dockerfile in machines repository at docker/jre8.
-FROM jre8-minimal:latest
+FROM java:openjdk-8-jre-alpine
 
-ADD root /
+RUN apk add --update --repository http://dl-cdn.alpinelinux.org/alpine/edge/community/ tini
 
 RUN mkdir -p /opt/xenon
-ADD base /opt/xenon
-
-RUN echo "hosts: files dns" > /etc/nsswitch.conf
+ADD xenon-host-*-SNAPSHOT-jar-with-dependencies.jar /opt/xenon/test.jar
+ADD start.sh /opt/xenon
+ADD logging.properties /opt/xenon/
 
 WORKDIR /opt/xenon
-CMD bin/run.sh
+
+ENTRYPOINT ["/sbin/tini", "--", "./start.sh"]

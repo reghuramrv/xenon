@@ -27,20 +27,27 @@ import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.Before;
 import org.junit.Test;
 
-import com.vmware.xenon.common.BasicReportTestCase;
+import com.vmware.xenon.common.BasicTestCase;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceStats;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.test.VerificationHost;
 
-public class TestProcessService extends BasicReportTestCase {
+public class TestProcessService extends BasicTestCase {
 
+    @Override
     public void beforeHostStart(VerificationHost host) {
         host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS
                 .toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
+    }
+
+    @Before
+    public void setUp() throws Throwable {
+        this.host.startServiceAndWait(ProcessFactoryService.class, ProcessFactoryService.SELF_LINK);
     }
 
     @Test
@@ -101,10 +108,10 @@ public class TestProcessService extends BasicReportTestCase {
         }
 
         final ProcessState[] state = { new ProcessState() };
-        // issue a sleep for a random number of seconds between 100 and 200
+        // issue a sleep for a random number of seconds between 5 and 10
         String processCommandLine = "sleep";
         Random r = new Random();
-        String sleepTime = Integer.toString((r.nextInt(100) + 100));
+        String sleepTime = Integer.toString((r.nextInt(5) + 10));
         state[0].arguments = new String[] { processCommandLine, sleepTime };
         state[0].isRestartRequired = false;
 
@@ -141,14 +148,27 @@ public class TestProcessService extends BasicReportTestCase {
 
     private void waitForProcess(String commandToExecute, boolean exists) throws Throwable {
         this.host.waitFor("Process state did not change", () -> {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", commandToExecute);
+            ProcessBuilder pb = new ProcessBuilder("sh", "-c", commandToExecute);
+            this.host.log("Running %s", commandToExecute);
             Process process = pb.start();
+            this.host.log("waiting");
+            int exitValue = process.waitFor();
+            this.host.log("Run %s, status: %d", commandToExecute, exitValue);
             BufferedReader bReader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            Integer outputState = Integer.valueOf(bReader.readLine().trim());
-            if (outputState.equals(Integer.valueOf(exists ? 1 : 0))) {
-                return true;
-            }
-            return false;
+            boolean[] isReady = new boolean[1];
+            bReader.lines().forEach((line) -> {
+                this.host.log("read: %s", line);
+                int outputState = Integer.valueOf(line.trim());
+                // other sleep processes might be active, so the tests below, and this whole method is
+                // unreliable. In the future, we should look for specific PID of the process we start
+                if (exists && outputState >= 1) {
+                    isReady[0] = true;
+                } else if (!exists && outputState < 1) {
+                    isReady[0] = true;
+                }
+            });
+
+            return isReady[0];
         });
     }
 
@@ -191,7 +211,7 @@ public class TestProcessService extends BasicReportTestCase {
         // If this works correctly, this should be appended only once!
         String childProc = "echo '" + FILE_CONTENTS + "' >> " + fileName;
 
-        state[0].arguments = new String[] { "bash", "-c", childProc };
+        state[0].arguments = new String[] { "sh", "-c", childProc };
         state[0].isRestartRequired = false;
 
         this.host.testStart(1);

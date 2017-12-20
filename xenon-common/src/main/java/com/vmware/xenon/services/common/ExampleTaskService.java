@@ -17,12 +17,13 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.OperationJoin;
-import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
+import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.TaskState.TaskStage;
 import com.vmware.xenon.common.UriUtils;
@@ -76,7 +77,7 @@ public class ExampleTaskService
      * Create a default factory service that starts instances of this task service on POST.
      */
     public static FactoryService createFactory() {
-        return FactoryService.create(ExampleTaskService.class, ServiceOption.IDEMPOTENT_POST,
+        return TaskFactoryService.create(ExampleTaskService.class, ServiceOption.IDEMPOTENT_POST,
                 ServiceOption.INSTRUMENTATION);
     }
 
@@ -102,8 +103,19 @@ public class ExampleTaskService
          * The query we make to the Query Task service, and the result we
          * get back from it.
          */
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
+        @PropertyOptions(usage = {
+                PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL,
+                PropertyUsageOption.SERVICE_USE })
         public QueryTask exampleQueryTask;
+
+        /**
+         * Optional query clause that will be added, with MUST_OCCUR,
+         * to the query used to find example service instances. The default query
+         * uses only the document kind to restrict results to example service documents.
+         */
+        @PropertyOptions(usage = {
+                PropertyUsageOption.OPTIONAL })
+        public Query customQueryClause;
     }
 
     public ExampleTaskService() {
@@ -115,29 +127,61 @@ public class ExampleTaskService
     }
 
     /**
+     * Validate and initialize task state on creation
+     */
+    @Override
+    public void handleStart(Operation post) {
+        ExampleTaskServiceState initialState = validateStartPost(post);
+        if (initialState == null) {
+            return;
+        }
+        initializeState(initialState, post);
+
+        // complete creation POST
+        post.setStatusCode(Operation.STATUS_CODE_ACCEPTED).complete();
+        // self patch to start state machine
+        sendSelfPatch(initialState, TaskStage.STARTED, null);
+    }
+
+    /**
      * Ensure that the input task is valid.
      *
      * Technically we don't need to require a body since there are no parameters. However,
      * non-example tasks will normally have parameters, so this is an example of how they
      * could be validated.
      */
+    @Override
     protected ExampleTaskServiceState validateStartPost(Operation taskOperation) {
         ExampleTaskServiceState task = super.validateStartPost(taskOperation);
         if (task == null) {
             return null;
         }
 
-        if (task.subStage != null) {
-            taskOperation.fail(
-                    new IllegalArgumentException("Do not specify subStage: internal use only"));
-            return null;
+        if (ServiceHost.isServiceCreate(taskOperation)) {
+            // apply validation only for the initial creation POST, not restart. Alternatively,
+            // this code can exist in the handleCreate method
+            if (task.subStage != null) {
+                taskOperation.fail(
+                        new IllegalArgumentException("Do not specify subStage: internal use only"));
+                return null;
+            }
+            if (task.exampleQueryTask != null) {
+                taskOperation.fail(
+                        new IllegalArgumentException(
+                                "Do not specify exampleQueryTask: internal use only"));
+                return null;
+            }
+        } else {
+            // This is a infrastructure start POST, not a client POST.
+            // A persisted task might already be finished, but due to node restart
+            // ownership changes, the service is started with previously indexed state.
+            // We check if the task is in terminal state, so we dont restart it
+            if (!TaskState.isInProgress(task.taskInfo)) {
+                taskOperation.complete();
+                return null;
+            }
         }
-        if (task.exampleQueryTask != null) {
-            taskOperation.fail(
-                    new IllegalArgumentException(
-                            "Do not specify exampleQueryTask: internal use only"));
-            return null;
-        }
+
         if (task.taskLifetime != null && task.taskLifetime <= 0) {
             taskOperation.fail(
                     new IllegalArgumentException("taskLifetime must be positive"));
@@ -154,15 +198,16 @@ public class ExampleTaskService
      * If your task does significant initialization, you may prefer to do it in the
      * CREATED state.
      */
+    @Override
     protected void initializeState(ExampleTaskServiceState task, Operation taskOperation) {
         task.subStage = SubStage.QUERY_EXAMPLES;
 
         if (task.taskLifetime != null) {
-            task.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                    + TimeUnit.SECONDS.toMicros(task.taskLifetime);
+            task.documentExpirationTimeMicros = Utils.fromNowMicrosUtc(
+                    TimeUnit.SECONDS.toMicros(task.taskLifetime));
         } else if (task.documentExpirationTimeMicros != 0) {
-            task.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                    + TimeUnit.SECONDS.toMicros(DEFAULT_TASK_LIFETIME);
+            task.documentExpirationTimeMicros = Utils.fromNowMicrosUtc(
+                    TimeUnit.SECONDS.toMicros(DEFAULT_TASK_LIFETIME));
         }
 
         // Do our task-specific logic... This will allow our ExampleTaskService's "default"
@@ -200,7 +245,7 @@ public class ExampleTaskService
             logInfo("Task canceled: not implemented, ignoring");
             break;
         case FINISHED:
-            logInfo("Task finished successfully");
+            logFine("Task finished successfully");
             break;
         case FAILED:
             logWarning("Task failed: %s", (patchBody.failureMessage == null ? "No reason given"
@@ -229,6 +274,7 @@ public class ExampleTaskService
     /**
      * Validate that the PATCH we got requests reasonanble changes to our state
      */
+    @Override
     protected boolean validateTransition(Operation patch, ExampleTaskServiceState currentTask,
             ExampleTaskServiceState patchBody) {
         super.validateTransition(patch, currentTask, patchBody);
@@ -258,10 +304,16 @@ public class ExampleTaskService
     private void handleQueryExamples(ExampleTaskServiceState task) {
         // Create a query for "all documents with kind ==
         // com:vmware:xenon:services:common:ExampleService:ExampleServiceState"
-        Query exampleDocumentQuery = Query.Builder.create()
-                .setTerm(ServiceDocument.FIELD_NAME_KIND,
-                        Utils.buildKind(ExampleServiceState.class))
-                .build();
+        Query.Builder builder = Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class);
+
+        if (task.customQueryClause != null) {
+            // expand query with a specified field value, narrowing down the eligible
+            // services
+            builder.addClause((task.customQueryClause));
+        }
+
+        Query exampleDocumentQuery = builder.build();
         task.exampleQueryTask = QueryTask.Builder.createDirectTask()
                 .setQuery(exampleDocumentQuery)
                 .build();
@@ -285,7 +337,7 @@ public class ExampleTaskService
                             // We extract the result of the task because DELETE_EXAMPLES will use
                             // the list of documents found
                             task.exampleQueryTask = op.getBody(QueryTask.class);
-                            sendSelfPatch(task, TaskStage.STARTED, SubStage.DELETE_EXAMPLES);
+                            sendSelfPatch(task, TaskStage.STARTED, subStageSetter(SubStage.DELETE_EXAMPLES));
                         });
         sendRequest(queryRequest);
     }
@@ -307,8 +359,9 @@ public class ExampleTaskService
             return;
         }
         if (task.exampleQueryTask.results.documentLinks.size() == 0) {
-            logInfo("No example service documents found, nothing to do");
+            logFine("No example service documents found, nothing to do");
             sendSelfPatch(task, TaskStage.FINISHED, null);
+            return;
         }
 
         List<Operation> deleteOperations = new ArrayList<>();
@@ -335,16 +388,13 @@ public class ExampleTaskService
     }
 
     /**
-     * Send ourselves a PATCH that will advance to another step in the task workflow to the
-     * specified stage and substage.
+     * Helper method that returns a lambda that will set SubStage for us
+     * @param subStage the SubStage to use
+     *
+     * @return lambda helper needed for {@link TaskService#sendSelfPatch(TaskServiceState, TaskStage, Consumer)}
      */
-    private void sendSelfPatch(ExampleTaskServiceState task, TaskStage stage, SubStage subStage) {
-        if (task.taskInfo == null) {
-            task.taskInfo = new TaskState();
-        }
-        task.taskInfo.stage = stage;
-        task.subStage = subStage;
-        sendSelfPatch(task);
+    private Consumer<ExampleTaskServiceState> subStageSetter(SubStage subStage) {
+        return taskState -> taskState.subStage = subStage;
     }
 
 }

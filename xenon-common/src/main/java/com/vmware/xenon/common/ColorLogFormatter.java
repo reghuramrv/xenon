@@ -73,28 +73,32 @@ public class ColorLogFormatter extends LogFormatter {
         }
     }
 
+    protected String getFormattedMessage(LogRecord record) {
+        return super.format(record);
+    }
+
     @Override
     public String format(LogRecord record) {
-        String formatted = super.format(record);
+        String formatted = getFormattedMessage(record);
         if (!this.colorsEnabled) {
             return formatted;
         } else {
             String color;
             String reset = ANSI_RESET;
-            switch (record.getLevel().getName().substring(0, 1).toUpperCase()) {
-            case "S":
+            switch (record.getLevel().getName().charAt(0)) {
+            case 'S':
                 color = this.colorSevere;
                 break;
-            case "W":
+            case 'W':
                 color = this.colorWarn;
                 break;
-            case "I":
+            case 'I':
                 color = this.colorInfo;
                 break;
-            case "F":
+            case 'F':
                 color = this.colorFine;
                 break;
-            case "C":
+            case 'C':
                 color = this.colorConfig;
                 break;
             default:

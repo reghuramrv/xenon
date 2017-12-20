@@ -14,6 +14,7 @@
 package com.vmware.xenon.services.common;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.util.EnumSet;
@@ -30,41 +31,95 @@ import com.vmware.xenon.common.Utils;
 public class TestServiceDocument {
 
     @Test
+    public void copyTo() throws Throwable {
+        // if a field is added to ServiceDocument, this method must be updated.
+        // Also, methods ServiceDocument.isBuiltInFieldXXX() must be updated as well
+        assertEquals(27, ServiceDocument.class.getFields().length);
+        ServiceDocument one = new ServiceDocument();
+        one.documentAuthPrincipalLink = UUID.randomUUID().toString();
+        one.documentDescription = null;
+        one.documentEpoch = Utils.getNowMicrosUtc();
+        one.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
+        one.documentKind = UUID.randomUUID().toString();
+        one.documentOwner = UUID.randomUUID().toString();
+        one.documentSelfLink = UUID.randomUUID().toString();
+        one.documentSourceLink = UUID.randomUUID().toString();
+        one.documentTransactionId = UUID.randomUUID().toString();
+        one.documentUpdateAction = UUID.randomUUID().toString();
+        one.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+        one.documentVersion = Utils.getNowMicrosUtc();
+
+        ServiceDocument two = new ServiceDocument();
+        one.copyTo(two);
+
+        assertEquals(one.documentAuthPrincipalLink, two.documentAuthPrincipalLink);
+        assertEquals(one.documentDescription, two.documentDescription);
+        assertEquals(one.documentEpoch, two.documentEpoch);
+        assertEquals(one.documentExpirationTimeMicros, two.documentExpirationTimeMicros);
+        assertEquals(one.documentKind, two.documentKind);
+        assertEquals(one.documentOwner, two.documentOwner);
+        assertEquals(one.documentSelfLink, two.documentSelfLink);
+        assertEquals(one.documentSourceLink, two.documentSourceLink);
+        assertEquals(one.documentTransactionId, two.documentTransactionId);
+        assertEquals(one.documentUpdateAction, two.documentUpdateAction);
+        assertEquals(one.documentUpdateTimeMicros, two.documentUpdateTimeMicros);
+        assertEquals(one.documentVersion, two.documentVersion);
+    }
+
+    public static class ComparableServiceState extends ExampleService.ExampleServiceState {
+        public Boolean booleanValue;
+    }
+
+    @Test
     public void equals() throws Throwable {
         ServiceDocumentDescription description = TestUtils.buildStateDescription(
-                ExampleService.ExampleServiceState.class, null);
-        ExampleService.ExampleServiceState initialState = new ExampleService.ExampleServiceState();
+                ComparableServiceState.class, null);
+        ComparableServiceState initialState = new ComparableServiceState();
         initialState.name = UUID.randomUUID().toString();
         initialState.counter = 5L;
+        initialState.booleanValue = false;
 
-        ExampleService.ExampleServiceState modifiedState = new ExampleService
-                .ExampleServiceState();
+        ComparableServiceState modifiedState = new ComparableServiceState();
         modifiedState.name = initialState.name;
         modifiedState.counter = initialState.counter;
+        modifiedState.booleanValue = initialState.booleanValue;
 
         boolean value = ServiceDocument.equals(description, initialState, modifiedState);
-        assertEquals(true, value);
+        assertTrue(value);
 
-        initialState = new ExampleService.ExampleServiceState();
+        initialState = new ComparableServiceState();
         initialState.name = UUID.randomUUID().toString();
         initialState.counter = 5L;
+        initialState.booleanValue = false;
 
-        modifiedState = new ExampleService
-                .ExampleServiceState();
+        modifiedState = new ComparableServiceState();
         modifiedState.name = initialState.name;
         modifiedState.counter = 10L;
+        modifiedState.booleanValue = initialState.booleanValue;
 
         value = ServiceDocument.equals(description, initialState, modifiedState);
-        assertEquals(false, value);
+        assertFalse(value);
+
+        initialState = new ComparableServiceState();
+        initialState.name = UUID.randomUUID().toString();
+        initialState.counter = 5L;
+        initialState.booleanValue = false;
+
+        modifiedState = new ComparableServiceState();
+        modifiedState.name = initialState.name;
+        modifiedState.counter = initialState.counter;
+        modifiedState.booleanValue = true;
+
+        value = ServiceDocument.equals(description, initialState, modifiedState);
+        assertFalse(value);
 
         // set a core document field to be different between states and still verify
         // the states compare as equals (core fields are ignored)
-        initialState = new ExampleService.ExampleServiceState();
+        initialState = new ComparableServiceState();
         initialState.documentOwner = UUID.randomUUID().toString();
         initialState.counter = 10L;
 
-        modifiedState = new ExampleService
-                .ExampleServiceState();
+        modifiedState = new ComparableServiceState();
         modifiedState.documentOwner = UUID.randomUUID().toString();
         modifiedState.counter = 10L;
 
@@ -90,6 +145,34 @@ public class TestServiceDocument {
         stateB.documentUpdateTimeMicros = stateA.documentUpdateTimeMicros;
 
         EnumSet<DocumentRelationship> results = ServiceDocument.compare(stateA, stateB,
+                description, Utils.getTimeComparisonEpsilonMicros());
+        assertTrue(results.contains(DocumentRelationship.EQUAL_TIME));
+        assertTrue(!results.contains(DocumentRelationship.NEWER_VERSION));
+        assertTrue(!results.contains(DocumentRelationship.PREFERRED));
+        assertTrue(!results.contains(DocumentRelationship.IN_CONFLICT));
+
+        // different epochs, equal time, B should be preferred
+        stateA.documentEpoch = 1L;
+        stateB.documentEpoch = 2L;
+        stateA.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+        stateB.documentUpdateTimeMicros = stateA.documentUpdateTimeMicros;
+
+        results = ServiceDocument.compare(stateA, stateB,
+                description, Utils.getTimeComparisonEpsilonMicros());
+        assertTrue(results.contains(DocumentRelationship.EQUAL_TIME));
+        assertTrue(!results.contains(DocumentRelationship.NEWER_VERSION));
+        assertTrue(!results.contains(DocumentRelationship.PREFERRED));
+        assertTrue(!results.contains(DocumentRelationship.IN_CONFLICT));
+
+        // same epochs, different versions, equal time, B should be preferred
+        stateA.documentEpoch = 1L;
+        stateB.documentEpoch = 1L;
+        stateA.documentVersion = 1;
+        stateB.documentVersion = 2;
+        stateA.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+        stateB.documentUpdateTimeMicros = stateA.documentUpdateTimeMicros;
+
+        results = ServiceDocument.compare(stateA, stateB,
                 description, Utils.getTimeComparisonEpsilonMicros());
         assertTrue(results.contains(DocumentRelationship.EQUAL_TIME));
         assertTrue(!results.contains(DocumentRelationship.NEWER_VERSION));
@@ -174,7 +257,7 @@ public class TestServiceDocument {
         assertTrue(!results.contains(DocumentRelationship.PREFERRED));
         assertTrue(!results.contains(DocumentRelationship.IN_CONFLICT));
 
-        // equal versions, time within epsilon, states NOT equal, in conflict
+        // equal versions, time within epsilon (B newer), states NOT equal, in conflict
         stateB.counter = Long.MAX_VALUE;
         stateA.documentVersion = 1;
         stateB.documentVersion = 1;
@@ -190,5 +273,23 @@ public class TestServiceDocument {
         assertTrue(!results.contains(DocumentRelationship.EQUAL_TIME));
         assertTrue(!results.contains(DocumentRelationship.PREFERRED));
         assertTrue(results.contains(DocumentRelationship.IN_CONFLICT));
+
+        // equal versions, time within epsilon (A newer), states NOT equal, in conflict
+        stateB.counter = Long.MAX_VALUE;
+        stateA.documentVersion = 1;
+        stateB.documentVersion = 1;
+        stateA.documentUpdateTimeMicros = Utils.getNowMicrosUtc()
+                + Utils.getTimeComparisonEpsilonMicros() / 2;
+        stateB.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+
+        results = ServiceDocument.compare(stateA, stateB,
+                description, Utils.getTimeComparisonEpsilonMicros());
+        assertTrue(!results.contains(DocumentRelationship.NEWER_VERSION));
+        assertTrue(results.contains(DocumentRelationship.EQUAL_VERSION));
+        assertTrue(results.contains(DocumentRelationship.NEWER_UPDATE_TIME));
+        assertTrue(!results.contains(DocumentRelationship.EQUAL_TIME));
+        assertTrue(!results.contains(DocumentRelationship.PREFERRED));
+        assertTrue(results.contains(DocumentRelationship.IN_CONFLICT));
+
     }
 }

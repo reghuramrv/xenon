@@ -34,6 +34,7 @@ import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
 import com.vmware.xenon.services.common.QueryFilter.Conjunction;
 import com.vmware.xenon.services.common.QueryFilter.QueryFilterException;
 import com.vmware.xenon.services.common.QueryFilter.UnsupportedMatchTypeException;
+import com.vmware.xenon.services.common.QueryTask.NumericRange;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.Query.Occurance;
 import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
@@ -51,6 +52,8 @@ public class TestQueryFilter {
         public String c6;
         public String c7;
         public String c8;
+
+        public int numeric;
 
         public Color e1;
         public URI u1;
@@ -89,6 +92,13 @@ public class TestQueryFilter {
 
     Query createTerm(String key, String value, Occurance occurance) {
         Query query = createTerm(key, value);
+        query.occurance = occurance;
+        return query;
+    }
+
+    Query createTerm(String key, String value, Occurance occurance, MatchType matchType) {
+        Query query = createTerm(key, value);
+        query.setTermMatchType(matchType);
         query.occurance = occurance;
         return query;
     }
@@ -191,6 +201,52 @@ public class TestQueryFilter {
         q.addBooleanClause(t1);
         q.addBooleanClause(t2);
         return q;
+    }
+
+    @Test
+    public void evaluateWithEqualRange() throws QueryFilterException {
+        QueryFilter filter = QueryFilter.create(createWithEqualRangeQuery());
+        QueryFilterDocument document;
+
+        document = new QueryFilterDocument();
+        document.numeric = 315;
+        assertFalse(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.numeric = 314;
+        assertTrue(filter.evaluate(document, this.description));
+    }
+
+    Query createWithEqualRangeQuery() {
+        Query query = new Query();
+        query.setTermPropertyName("numeric");
+        query.setNumericRange(NumericRange.createEqualRange(314L));
+        return query;
+    }
+
+    @Test
+    public void evaluateWithLessThanRange() throws QueryFilterException {
+        QueryFilter filter = QueryFilter.create(createWithLessThanRangeQuery());
+        QueryFilterDocument document;
+
+        document = new QueryFilterDocument();
+        document.numeric = 315;
+        assertFalse(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.numeric = 314;
+        assertFalse(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.numeric = 313;
+        assertTrue(filter.evaluate(document, this.description));
+    }
+
+    Query createWithLessThanRangeQuery() {
+        Query query = new Query();
+        query.setTermPropertyName("numeric");
+        query.setNumericRange(NumericRange.createLessThanRange(314L));
+        return query;
     }
 
     @Test
@@ -419,6 +475,10 @@ public class TestQueryFilter {
 
         document.l2.add("v3");
         assertFalse(filter.evaluate(document, this.description));
+
+        document.l1 = new LinkedList<>();
+        document.l1.add(null);
+        assertFalse(filter.evaluate(document, this.description));
     }
 
     Query createWithMapOfStringToString() {
@@ -535,10 +595,10 @@ public class TestQueryFilter {
         document = new QueryFilterDocument();
         document.nc1 = new NestedClass();
         document.nc1.ns1 = "v2";
-        assertFalse(filter.evaluate(document,  this.description));
+        assertFalse(filter.evaluate(document, this.description));
 
         document = new QueryFilterDocument();
-        assertFalse(filter.evaluate(document,  this.description));
+        assertFalse(filter.evaluate(document, this.description));
     }
 
     @Test()
@@ -553,6 +613,12 @@ public class TestQueryFilter {
         assertTrue(filter.evaluate(document, this.description));
 
         document.documentSelfLink = "\\*a@#$%$^%&%^&/ttt/uri";
+        assertTrue(filter.evaluate(document, this.description));
+
+        document.documentSelfLink = "";
+        assertTrue(filter.evaluate(document, this.description));
+
+        document.documentSelfLink = null;
         assertTrue(filter.evaluate(document, this.description));
 
         q = createTerm(ServiceDocument.FIELD_NAME_SELF_LINK, "/test*");
@@ -583,6 +649,22 @@ public class TestQueryFilter {
         document.documentSelfLink = "aaatestaaa";
         assertFalse(filter.evaluate(document, this.description));
 
+        q = createTerm(ServiceDocument.FIELD_NAME_SELF_LINK, "*[t]est");
+        q.term.matchType = MatchType.WILDCARD;
+        filter = QueryFilter.create(q);
+
+        document = new QueryFilterDocument();
+        document.documentSelfLink = "/test.com/test";
+        assertFalse(filter.evaluate(document, this.description));
+
+        q = createTerm(ServiceDocument.FIELD_NAME_SELF_LINK, "*/t?st");
+        q.term.matchType = MatchType.WILDCARD;
+        filter = QueryFilter.create(q);
+
+        document = new QueryFilterDocument();
+        document.documentSelfLink = "/test.com/test";
+        assertTrue(filter.evaluate(document, this.description));
+
         q = createTerm(ServiceDocument.FIELD_NAME_SELF_LINK, "abc()*test*");
         q.term.matchType = MatchType.WILDCARD;
         filter = QueryFilter.create(q);
@@ -607,6 +689,51 @@ public class TestQueryFilter {
 
         document.documentSelfLink = "/ttt/uri";
         assertFalse(filter.evaluate(document, this.description));
+    }
+
+    @Test()
+    public void matchTypePrefix() throws QueryFilterException {
+        Query q = createTerm(ServiceDocument.FIELD_NAME_SELF_LINK, "/test/");
+        q.term.matchType = MatchType.PREFIX;
+        QueryFilter filter = QueryFilter.create(q);
+        QueryFilterDocument document;
+
+        document = new QueryFilterDocument();
+        document.documentSelfLink = "/test/test.com";
+        assertTrue(filter.evaluate(document, this.description));
+
+        document.documentSelfLink = "foobar";
+        assertFalse(filter.evaluate(document, this.description));
+
+        document.documentSelfLink = null;
+        assertFalse(filter.evaluate(document, this.description));
+
+        document.documentSelfLink = "";
+        assertFalse(filter.evaluate(document, this.description));
+    }
+
+    Query createWithListOfStringWithPrefixQuery() {
+        String n1 = QueryTask.QuerySpecification.buildCollectionItemName("l1");
+        Query t1 = createTerm(n1, "v2", Occurance.MUST_OCCUR, MatchType.PREFIX);
+
+        Query q = new Query();
+        q.addBooleanClause(t1);
+        return q;
+    }
+
+    @Test
+    public void matchTypePrefixForCollections() throws QueryFilterException {
+        QueryFilter filter = QueryFilter.create(createWithListOfStringWithPrefixQuery());
+        QueryFilterDocument document;
+
+        document = new QueryFilterDocument();
+        document.l1 = new LinkedList<>();
+        document.l1.add("v1-v2");
+        assertFalse(filter.evaluate(document, this.description));
+
+        document.l1.add("v2-foo");
+        assertTrue(filter.evaluate(document, this.description));
+
     }
 
     @Test(expected = UnsupportedMatchTypeException.class)
@@ -681,6 +808,68 @@ public class TestQueryFilter {
         }
 
         return q;
+    }
+
+    private Query createComposedNegationQuery() {
+        Query inner = new Query();
+        inner.addBooleanClause(createTerm("c2", "match", Occurance.MUST_OCCUR));
+        inner.addBooleanClause(createTerm("c3", "match", Occurance.MUST_NOT_OCCUR));
+        inner.occurance = Occurance.MUST_NOT_OCCUR;
+
+        Query q = new Query();
+        q.addBooleanClause(createTerm("c1", "match", Occurance.MUST_OCCUR));
+        q.addBooleanClause(inner);
+        return q;
+    }
+
+    @Test
+    public void simpleComposedNegation() {
+        Set<String> dnf = createDisjunctiveNormalForm(createComposedNegationQuery());
+        assertEquals(2, dnf.size());
+        assertTrue(dnf.contains("c1=match AND NOT(c2=match)"));
+        assertTrue(dnf.contains("c1=match AND c3=match"));
+    }
+
+    @Test
+    public void evaluateSimpleComposedNegation() throws QueryFilterException {
+        QueryFilter filter = QueryFilter.create(createComposedNegationQuery());
+        QueryFilterDocument document;
+        document = new QueryFilterDocument();
+        assertFalse(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.c1 = "match";
+        assertTrue(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.c1 = "match";
+        document.c2 = "match";
+        document.c3 = "match";
+        assertTrue(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.c1 = "match";
+        document.c2 = "other";
+        document.c3 = "other";
+        assertTrue(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.c1 = "match";
+        document.c2 = "match";
+        document.c3 = "other";
+        assertFalse(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.c1 = "match";
+        document.c2 = null;
+        document.c3 = "match";
+        assertTrue(filter.evaluate(document, this.description));
+
+        document = new QueryFilterDocument();
+        document.c1 = "match";
+        document.c2 = "match";
+        document.c3 = null;
+        assertFalse(filter.evaluate(document, this.description));
     }
 
     @Test

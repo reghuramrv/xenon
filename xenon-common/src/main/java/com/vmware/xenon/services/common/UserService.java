@@ -19,7 +19,11 @@ import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
+import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 import com.vmware.xenon.common.StatefulService;
+import com.vmware.xenon.common.Utils;
+
 
 public class UserService extends StatefulService {
     public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_USERS;
@@ -34,7 +38,12 @@ public class UserService extends StatefulService {
     public static class UserState extends ServiceDocument {
         public static final String FIELD_NAME_EMAIL = "email";
         public static final String FIELD_NAME_USER_GROUP_LINKS = "userGroupLinks";
+
+        @PropertyOptions(indexing = PropertyIndexingOption.SORT)
+        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
         public String email;
+
+        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
         public Set<String> userGroupLinks;
     }
 
@@ -43,6 +52,19 @@ public class UserService extends StatefulService {
         super.toggleOption(ServiceOption.PERSISTENCE, true);
         super.toggleOption(ServiceOption.REPLICATION, true);
         super.toggleOption(ServiceOption.OWNER_SELECTION, true);
+    }
+
+    @Override
+    public void processCompletionStageUpdateAuthzArtifacts(Operation op) {
+        if (AuthorizationCacheUtils.isAuthzCacheClearApplicableOperation(op)) {
+            AuthorizationCacheUtils.clearAuthzCacheForUser(this, op);
+        }
+        op.complete();
+    }
+
+    @Override
+    public void setProcessingStage(Service.ProcessingStage stage) {
+        super.setProcessingStage(stage);
     }
 
     @Override
@@ -56,7 +78,6 @@ public class UserService extends StatefulService {
         if (!validate(op, state)) {
             return;
         }
-
         op.complete();
     }
 
@@ -80,10 +101,11 @@ public class UserService extends StatefulService {
                 && ((currentState.userGroupLinks == null && newState.userGroupLinks == null)
                 || (currentState.userGroupLinks != null && newState.userGroupLinks != null
                     && currentState.userGroupLinks.equals(newState.userGroupLinks)))) {
-            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
-        } else {
-            setState(op, newState);
+            // do not update state
+            op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED);
         }
+
+        setState(op, newState);
         op.complete();
     }
 
@@ -94,19 +116,18 @@ public class UserService extends StatefulService {
             return;
         }
         UserState currentState = getState(op);
-        UserState newState = op.getBody(UserState.class);
-        if (newState.email != null) {
-            currentState.email = newState.email;
-        }
-        if (newState.userGroupLinks != null) {
-            if (currentState.userGroupLinks == null) {
-                currentState.userGroupLinks = newState.userGroupLinks;
-            } else {
-                currentState.userGroupLinks.addAll(newState.userGroupLinks);
+        try {
+            UserState newState = getBody(op);
+            if (newState.email != null && !validate(op, newState)) {
+                op.fail(new IllegalArgumentException("Invalid email address"));
+                return;
             }
+            Utils.mergeWithStateAdvanced(getStateDescription(), currentState, UserState.class, op);
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            op.fail(e);
+            return;
         }
-        op.setBody(currentState);
-        op.complete();
+        op.setBody(currentState).complete();
     }
 
     private boolean validate(Operation op, UserState state) {

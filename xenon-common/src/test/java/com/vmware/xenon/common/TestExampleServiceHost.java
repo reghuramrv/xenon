@@ -17,8 +17,8 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
-import java.util.Base64;
 import java.util.Date;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import org.junit.Test;
@@ -28,7 +28,7 @@ import com.vmware.xenon.services.common.ExampleServiceHost;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 import com.vmware.xenon.services.common.UserService;
 import com.vmware.xenon.services.common.authn.AuthenticationRequest;
-import com.vmware.xenon.services.common.authn.BasicAuthenticationService;
+import com.vmware.xenon.services.common.authn.BasicAuthenticationUtils;
 
 public class TestExampleServiceHost extends BasicReusableHostTestCase {
 
@@ -63,6 +63,7 @@ public class TestExampleServiceHost extends BasicReusableHostTestCase {
             };
 
             h.initialize(args);
+            h.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(100));
             h.start();
 
             URI hostUri = h.getUri();
@@ -80,7 +81,11 @@ public class TestExampleServiceHost extends BasicReusableHostTestCase {
      * isn't created immediately, so this polls.
      */
     private String loginUser(URI hostUri) throws Throwable {
-        String basicAuth = constructBasicAuth(adminUser, adminUser);
+        URI usersLink = UriUtils.buildUri(hostUri, UserService.FACTORY_LINK);
+        // wait for factory availability
+        this.host.waitForReplicatedFactoryServiceAvailable(usersLink);
+
+        String basicAuth = BasicAuthenticationUtils.constructBasicAuth(adminUser, adminUser);
         URI loginUri = UriUtils.buildUri(hostUri, ServiceUriPaths.CORE_AUTHN_BASIC);
         AuthenticationRequest login = new AuthenticationRequest();
         login.requestType = AuthenticationRequest.AuthenticationRequestType.LOGIN;
@@ -92,8 +97,7 @@ public class TestExampleServiceHost extends BasicReusableHostTestCase {
         while (new Date().before(exp)) {
             Operation loginPost = Operation.createPost(loginUri)
                     .setBody(login)
-                    .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME,
-                            basicAuth)
+                    .addRequestHeader(Operation.AUTHORIZATION_HEADER, basicAuth)
                     .forceRemote()
                     .setCompletion((op, ex) -> {
                         if (ex != null) {
@@ -128,17 +132,22 @@ public class TestExampleServiceHost extends BasicReusableHostTestCase {
      * so this polls.
      */
     private void waitForUsers(URI hostUri, String authToken) throws Throwable {
-        URI exampleUri = UriUtils.buildUri(hostUri, UserService.FACTORY_LINK);
-
+        URI usersLink = UriUtils.buildUri(hostUri, UserService.FACTORY_LINK);
         Integer[] numberUsers = new Integer[1];
         for (int i = 0; i < 20; i++) {
-            Operation get = Operation.createGet(exampleUri)
+            Operation get = Operation.createGet(usersLink)
                     .forceRemote()
                     .addRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER, authToken)
                     .setCompletion((op, ex) -> {
                         if (ex != null) {
-                            this.host.failIteration(ex);
-                            return;
+                            if (op.getStatusCode() != Operation.STATUS_CODE_FORBIDDEN) {
+                                this.host.failIteration(ex);
+                                return;
+                            } else {
+                                numberUsers[0] = 0;
+                                this.host.completeIteration();
+                                return;
+                            }
                         }
                         ServiceDocumentQueryResult response = op
                                 .getBody(ServiceDocumentQueryResult.class);
@@ -159,14 +168,4 @@ public class TestExampleServiceHost extends BasicReusableHostTestCase {
         assertTrue(numberUsers[0] == 2);
     }
 
-    /**
-     * Supports loginUser() by creating a Basic Auth header
-     */
-    private String constructBasicAuth(String name, String password) {
-        String userPass = String.format("%s:%s", name, password);
-        String encodedUserPass = new String(Base64.getEncoder().encode(userPass.getBytes()));
-        String basicAuth = "Basic " + encodedUserPass;
-        return basicAuth;
-
-    }
 }

@@ -13,29 +13,46 @@
 
 package com.vmware.xenon.common;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import static com.vmware.xenon.common.UriUtils.buildUriPath;
+
 import java.net.URI;
-import java.util.Base64;
+import java.util.EnumSet;
 import java.util.UUID;
 
 import org.junit.Test;
 
+import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.http.netty.NettyHttpServiceClient;
+import com.vmware.xenon.common.test.AuthorizationHelper;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.AuthorizationContextService;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.QueryTask;
+import com.vmware.xenon.services.common.QueryTask.Query;
+import com.vmware.xenon.services.common.QueryTask.Query.Occurance;
+import com.vmware.xenon.services.common.ResourceGroupService;
+import com.vmware.xenon.services.common.ResourceGroupService.ResourceGroupState;
+import com.vmware.xenon.services.common.RoleService;
+import com.vmware.xenon.services.common.RoleService.RoleState;
 import com.vmware.xenon.services.common.ServiceHostManagementService;
 import com.vmware.xenon.services.common.ServiceUriPaths;
-import com.vmware.xenon.services.common.authn.AuthenticationRequest;
-import com.vmware.xenon.services.common.authn.BasicAuthenticationService;
+import com.vmware.xenon.services.common.UserGroupService;
+import com.vmware.xenon.services.common.UserGroupService.UserGroupState;
 
-// Note that we can't use BasicReusableHostTestCase here because we need to enable
-// authorization on the host before it's started, and BasicReusableHostTestCase
-// doesn't have authorization enabled.
+// Note that we can't use BasicReusableHostTestCase here because we need to
+// enable authorization on the host before it's started, and
+// BasicReusableHostTestCase doesn't have authorization enabled.
 public class TestAuthSetupHelper extends BasicTestCase {
+
+    private static final String GUEST_ROLE = "guest-role";
+    private static final String GUEST_USER_GROUP = "guest-user-group";
+    private static final String GUEST_RESOURCE_GROUP = "guest-resource-group";
 
     @Override
     public void beforeHostStart(VerificationHost host) {
@@ -58,15 +75,17 @@ public class TestAuthSetupHelper extends BasicTestCase {
         OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
         makeUsersWithAuthSetupHelper();
 
+        AuthorizationHelper authHelper = new AuthorizationHelper(this.host);
+
         // Make sure the following tests don't automatically set the authorization
         // context: we explicitly set the auth token to make sure it's acting as
         // expected.
         OperationContext.setAuthorizationContext(null);
 
         // Step 2: Have each user login and get a token
-        String adminAuthToken = loginUser(this.adminUser, this.adminUser);
-        String exampleAuthToken = loginUser(this.exampleUser, this.exampleUser);
-        String exampleWithMgmtAuthToken = loginUser(this.exampleWithManagementServiceUser,
+        String adminAuthToken = authHelper.login(this.adminUser, this.adminUser);
+        String exampleAuthToken = authHelper.login(this.exampleUser, this.exampleUser);
+        String exampleWithMgmtAuthToken = authHelper.login(this.exampleWithManagementServiceUser,
                 this.exampleWithManagementServiceUser);
 
         // Step 3: Have each user create an example document
@@ -89,18 +108,195 @@ public class TestAuthSetupHelper extends BasicTestCase {
         this.host.log("AuthorizationSetupHelper is working");
     }
 
+    @Test
+    public void testIdempotentCreation() throws Throwable {
+        this.host.waitForServiceAvailable(ServiceHostManagementService.SELF_LINK);
+        OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
+
+        TestContext ctx1 = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserSelfLink(ServiceUriPaths.CORE_AUTHZ_GUEST_USER)
+                .setDocumentLink(ServiceUriPaths.SWAGGER)
+                .setUserGroupName(GUEST_USER_GROUP)
+                .setResourceGroupName(GUEST_RESOURCE_GROUP)
+                .setRoleName(GUEST_ROLE)
+                .setVerbs(EnumSet.of(Action.GET))
+                .setCompletion(e -> {
+                    if (e != null) {
+                        ctx1.failIteration(e);
+                    }
+                    ctx1.completeIteration();
+                })
+                .setupRole();
+        this.host.testWait(ctx1);
+
+        // Delete Role, UserGroup, ResourceGroup
+        Operation response;
+        response = this.host.waitForResponse(
+                createDeleteOp(
+                        buildUriPath(ResourceGroupService.FACTORY_LINK, GUEST_RESOURCE_GROUP)));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
+
+        response = this.host.waitForResponse(
+                createDeleteOp(
+                        buildUriPath(UserGroupService.FACTORY_LINK, GUEST_USER_GROUP)));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
+
+        response = this.host.waitForResponse(
+                createDeleteOp(
+                        buildUriPath(RoleService.FACTORY_LINK, GUEST_ROLE)));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
+
+        // create again after delete
+        TestContext ctx2 = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserSelfLink(ServiceUriPaths.CORE_AUTHZ_GUEST_USER)
+                .setDocumentLink(ServiceUriPaths.SWAGGER)
+                .setUserGroupName(GUEST_USER_GROUP)
+                .setResourceGroupName(GUEST_RESOURCE_GROUP)
+                .setRoleName(GUEST_ROLE)
+                .setVerbs(EnumSet.of(Action.GET))
+                .setCompletion(e -> {
+                    if (e != null) {
+                        ctx2.failIteration(e);
+                    }
+                    ctx2.completeIteration();
+                })
+                .setupRole();
+        this.host.testWait(ctx2);
+
+        // create again already created
+        TestContext ctx3 = this.host.testCreate(1);
+        AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserSelfLink(ServiceUriPaths.CORE_AUTHZ_GUEST_USER)
+                .setDocumentLink(ServiceUriPaths.SWAGGER)
+                .setUserGroupName(GUEST_USER_GROUP)
+                .setResourceGroupName(GUEST_RESOURCE_GROUP)
+                .setRoleName(GUEST_ROLE)
+                .setVerbs(EnumSet.of(Action.GET))
+                .setCompletion(e -> {
+                    if (e != null) {
+                        ctx3.failIteration(e);
+                    }
+                    ctx3.completeIteration();
+                })
+                .setupRole();
+        this.host.testWait(ctx3);
+    }
+
+    private Operation createDeleteOp(String link) {
+        // pragma to make delete synchronous (would be necessary in multi-node
+        // scenario)
+        return Operation.createDelete(this.host, link)
+                .addRequestHeader(
+                        Operation.REPLICATION_QUORUM_HEADER,
+                        Operation.REPLICATION_QUORUM_HEADER_VALUE_ALL);
+    }
+
+    @Test
+    public void testRoleSetupWithLinks() throws Throwable {
+        this.host.waitForServiceAvailable(ServiceHostManagementService.SELF_LINK);
+        OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
+
+        EnumSet<Action> verbs = EnumSet.of(Action.GET);
+
+        this.host.testStart(1);
+        AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserSelfLink(ServiceUriPaths.CORE_AUTHZ_GUEST_USER)
+                .setDocumentLink(ServiceUriPaths.SWAGGER)
+                .setUserGroupName(GUEST_USER_GROUP)
+                .setResourceGroupName(GUEST_RESOURCE_GROUP)
+                .setRoleName(GUEST_ROLE)
+                .setVerbs(verbs)
+                .setCompletion(this.host.getCompletion())
+                .setupRole();
+
+        this.host.testWait();
+
+        ServiceDocumentQueryResult result = queryDocuments(Utils.buildKind(UserGroupState.class),
+                1);
+        UserGroupState userGroupState = Utils
+                .fromJson(result.documents.values().iterator().next(), UserGroupState.class);
+        assertEquals(GUEST_USER_GROUP,
+                UriUtils.getLastPathSegment(userGroupState.documentSelfLink));
+
+        result = queryDocuments(Utils.buildKind(ResourceGroupState.class), 1);
+        ResourceGroupState resourceGroupState = Utils
+                .fromJson(result.documents.values().iterator().next(), ResourceGroupState.class);
+        assertEquals(GUEST_RESOURCE_GROUP,
+                UriUtils.getLastPathSegment(resourceGroupState.documentSelfLink));
+
+        result = queryDocuments(Utils.buildKind(RoleState.class), 1);
+        RoleState roleState = Utils
+                .fromJson(result.documents.values().iterator().next(), RoleState.class);
+        assertEquals(UriUtils.buildUriPath(UserGroupService.FACTORY_LINK, GUEST_USER_GROUP),
+                roleState.userGroupLink);
+        assertEquals(UriUtils.buildUriPath(ResourceGroupService.FACTORY_LINK, GUEST_RESOURCE_GROUP),
+                roleState.resourceGroupLink);
+        assertEquals(GUEST_ROLE, UriUtils.getLastPathSegment(roleState.documentSelfLink));
+        assertEquals(roleState.verbs, verbs);
+    }
+
+    @Test
+    public void testRoleSetupWithQueries() throws Throwable {
+        this.host.waitForServiceAvailable(ServiceHostManagementService.SELF_LINK);
+        OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
+
+        this.host.testStart(1);
+
+        Query userQuery = Query.Builder.create()
+                .addFieldClause(
+                        ServiceDocument.FIELD_NAME_SELF_LINK,
+                        ServiceUriPaths.CORE_AUTHZ_GUEST_USER)
+                .build();
+
+        Query resourceQuery = Query.Builder.create()
+                .addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK,
+                        ServiceUriPaths.SWAGGER, Occurance.SHOULD_OCCUR)
+                .build();
+
+        AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserGroupQuery(userQuery)
+                .setResourceQuery(resourceQuery)
+                .setRoleName(GUEST_ROLE)
+                .setCompletion(this.host.getCompletion())
+                .setupRole();
+
+        this.host.testWait();
+
+        ServiceDocumentQueryResult result = queryDocuments(Utils.buildKind(UserGroupState.class),
+                1);
+        UserGroupState userGroupState = Utils
+                .fromJson(result.documents.values().iterator().next(), UserGroupState.class);
+        assertEquals(userQuery.booleanClauses.get(0).term.propertyName,
+                userGroupState.query.booleanClauses.get(0).term.propertyName);
+        assertEquals(userQuery.booleanClauses.get(0).term.matchValue,
+                userGroupState.query.booleanClauses.get(0).term.matchValue);
+
+        result = queryDocuments(Utils.buildKind(ResourceGroupState.class), 1);
+        ResourceGroupState resourceGroupState = Utils
+                .fromJson(result.documents.values().iterator().next(), ResourceGroupState.class);
+        assertEquals(resourceQuery.booleanClauses.get(0).term.propertyName,
+                resourceGroupState.query.booleanClauses.get(0).term.propertyName);
+        assertEquals(resourceQuery.booleanClauses.get(0).term.matchValue,
+                resourceGroupState.query.booleanClauses.get(0).term.matchValue);
+
+        result = queryDocuments(Utils.buildKind(RoleState.class), 1);
+        RoleState roleState = Utils
+                .fromJson(result.documents.values().iterator().next(), RoleState.class);
+        assertEquals(GUEST_ROLE, UriUtils.getLastPathSegment(roleState.documentSelfLink));
+    }
+
     /**
      * Supports testAuthSetupHelper() by invoking the AuthorizationSetupHelper to
      * create two users with associated user groups, resource groups, and roles
      */
     private void makeUsersWithAuthSetupHelper() throws Throwable {
-        AuthorizationSetupHelper.AuthSetupCompletion authCompletion = (ex) -> {
-            if (ex == null) {
-                this.host.completeIteration();
-            } else {
-                this.host.failIteration(ex);
-            }
-        };
 
         this.host.testStart(3);
         AuthorizationSetupHelper.create()
@@ -108,7 +304,7 @@ public class TestAuthSetupHelper extends BasicTestCase {
                 .setUserEmail(this.adminUser)
                 .setUserPassword(this.adminUser)
                 .setIsAdmin(true)
-                .setCompletion(authCompletion)
+                .setCompletion(this.host.getCompletion())
                 .start();
 
         AuthorizationSetupHelper.create()
@@ -117,7 +313,7 @@ public class TestAuthSetupHelper extends BasicTestCase {
                 .setUserPassword(this.exampleUser)
                 .setIsAdmin(false)
                 .setDocumentKind(Utils.buildKind(ExampleServiceState.class))
-                .setCompletion(authCompletion)
+                .setCompletion(this.host.getCompletion())
                 .start();
 
         AuthorizationSetupHelper.create()
@@ -126,50 +322,10 @@ public class TestAuthSetupHelper extends BasicTestCase {
                 .setUserPassword(this.exampleWithManagementServiceUser)
                 .setIsAdmin(false)
                 .setDocumentLink(ServiceHostManagementService.SELF_LINK)
-                .setCompletion(authCompletion)
+                .setCompletion(this.host.getCompletion())
                 .start();
 
         this.host.testWait();
-    }
-
-    /**
-     * Supports testAuthSetupHelper() by logging in a single user and returning the auth
-     * token it gets upon login
-     */
-    private String loginUser(String user, String password) throws Throwable {
-        String basicAuth = constructBasicAuth(user, password);
-        URI loginUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHN_BASIC);
-        AuthenticationRequest login = new AuthenticationRequest();
-        login.requestType = AuthenticationRequest.AuthenticationRequestType.LOGIN;
-
-        String[] authToken = new String[1];
-
-        Operation loginPost = Operation.createPost(loginUri)
-                .setBody(login)
-                .addRequestHeader(BasicAuthenticationService.AUTHORIZATION_HEADER_NAME,
-                        basicAuth)
-                .forceRemote()
-                .setCompletion((op, ex) -> {
-                    if (ex != null) {
-                        this.host.failIteration(ex);
-                        return;
-                    }
-                    authToken[0] = op.getResponseHeader(Operation.REQUEST_AUTH_TOKEN_HEADER);
-                    if (authToken[0] == null) {
-                        this.host.failIteration(
-                                new IllegalStateException("Missing auth token in login response"));
-                        return;
-                    }
-                    this.host.completeIteration();
-                });
-
-        this.host.testStart(1);
-        this.host.send(loginPost);
-        this.host.testWait();
-
-        assertTrue(authToken[0] != null);
-
-        return authToken[0];
     }
 
     /**
@@ -210,7 +366,8 @@ public class TestAuthSetupHelper extends BasicTestCase {
                         this.host.failIteration(ex);
                         return;
                     }
-                    ServiceDocumentQueryResult response = op.getBody(ServiceDocumentQueryResult.class);
+                    ServiceDocumentQueryResult response = op
+                            .getBody(ServiceDocumentQueryResult.class);
                     assertTrue(response != null && response.documentLinks != null);
                     numberDocuments[0] = response.documentLinks.size();
                     this.host.completeIteration();
@@ -252,17 +409,6 @@ public class TestAuthSetupHelper extends BasicTestCase {
     }
 
     /**
-     * Supports testAuthSetupHelper() by creating a Basic Auth header
-     */
-    private String constructBasicAuth(String name, String password) {
-        String userPass = String.format("%s:%s", name, password);
-        String encodedUserPass = new String(Base64.getEncoder().encode(userPass.getBytes()));
-        String basicAuth = "Basic " + encodedUserPass;
-        return basicAuth;
-
-    }
-
-    /**
      * Clear NettyHttpServiceClient's cookie jar
      *
      * The NettyHttpServiceClient is nice: it tracks what cookies we receive and sets them
@@ -276,4 +422,52 @@ public class TestAuthSetupHelper extends BasicTestCase {
         NettyHttpServiceClient client = (NettyHttpServiceClient) this.host.getClient();
         client.clearCookieJar();
     }
+
+    private ServiceDocumentQueryResult queryDocuments(String documentKind, int desiredCount)
+            throws Throwable {
+        QueryTask.QuerySpecification q = new QueryTask.QuerySpecification();
+        q.query.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
+                .setTermMatchValue(documentKind);
+        q.options = EnumSet
+                .of(QueryTask.QuerySpecification.QueryOption.EXPAND_CONTENT);
+        return this.host
+                .createAndWaitSimpleDirectQuery(this.host.getUri(), q, desiredCount, desiredCount, null);
+    }
+
+    @Test
+    public void testCompletionHandlerWhenUserExists() throws Throwable {
+        this.host.waitForServiceAvailable(ServiceHostManagementService.SELF_LINK);
+        OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
+
+        // create users
+        makeUsersWithAuthSetupHelper();
+
+        boolean[] isCalled = new boolean[1];
+
+        TestContext testContext = this.host.testCreate(1);
+
+        AuthorizationSetupHelper.AuthSetupCompletion authCompletion = (ex) -> {
+            if (ex == null) {
+                isCalled[0] = true;
+                testContext.completeIteration();
+            } else {
+                testContext.failIteration(ex);
+            }
+        };
+
+        // try to create existing user
+        AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserEmail(this.adminUser)
+                .setUserPassword(this.adminUser)
+                .setIsAdmin(true)
+                .setCompletion(authCompletion)
+                .start();
+
+        testContext.await();
+
+        assertTrue("completion handler must be called when trying to create an existing user",
+                isCalled[0]);
+    }
+
 }

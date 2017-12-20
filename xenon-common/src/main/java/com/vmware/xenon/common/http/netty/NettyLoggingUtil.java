@@ -21,13 +21,17 @@ import io.netty.util.internal.logging.JdkLoggerFactory;
  * see logging from Netty, unless debug logging is turned on. However, this
  * doesn't have any negative impact.
  */
-public class NettyLoggingUtil {
+public final class NettyLoggingUtil {
 
     static boolean setupLogging = false;
 
+    private NettyLoggingUtil() {
+
+    }
+
     public static synchronized void setupNettyLogging() {
         if (!setupLogging) {
-            InternalLoggerFactory.setDefaultFactory(new JdkLoggerFactory());
+            InternalLoggerFactory.setDefaultFactory(JdkLoggerFactory.INSTANCE);
         }
     }
 }

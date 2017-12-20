@@ -42,6 +42,7 @@ public class OperationJoin {
     private Iterator<Operation> operationIterator;
     private ServiceRequestSender sender;
     private final Object failuresLock = new Object();
+    private String transactionId;
 
     private OperationJoin() {
         this.operations = new ConcurrentHashMap<>(APPROXIMATE_EXPECTED_CAPACITY);
@@ -151,6 +152,11 @@ public class OperationJoin {
 
     private void prepareOperation(Operation op) {
         this.operations.put(op.getId(), op);
+
+        if (this.transactionId != null) {
+            op.setTransactionId(this.transactionId);
+        }
+
         op.nestCompletion(this::parentCompletion);
         this.pendingCount.incrementAndGet();
     }
@@ -282,7 +288,7 @@ public class OperationJoin {
     }
 
     /**
-     * Sets (overwrites) the operation context of this operataion join instance
+     * Sets (overwrites) the operation context of this operation join instance
      *
      * The visibility of this method is intentionally package-local. It is intended to
      * only be called by functions in this package, so that we can apply whitelisting
@@ -310,12 +316,31 @@ public class OperationJoin {
         return this.operations.get(id);
     }
 
+    public String getTransactionId() {
+        return this.transactionId;
+    }
+
+    public OperationJoin setTransactionId(String transactionId) {
+        this.transactionId = transactionId;
+        return this;
+    }
+
     @FunctionalInterface
     public interface JoinedCompletionHandler {
         void handle(Map<Long, Operation> ops, Map<Long, Throwable> failures);
     }
 
 
+    /**
+     * WARNING: This method is unsafe. If called when some operation o in this.operations has been
+     * sent but neither completed nor failed, o will be failed immediately, which may cause immediate
+     * success/fail of all operations in this.operations (if it was the last pending operation due to the latch in
+     * parentCompletion), and separately the actual outstanding async work will when it calls complete or fail, cause
+     * the original callback to be called, potentially succeeding even though this method was intended to fail
+     * everything.
+     *
+     * @param t The exception to fail operations with.
+     */
     void fail(Throwable t) {
         this.failures = new ConcurrentHashMap<>();
         this.failures.put(this.operations.keys().nextElement(), t);

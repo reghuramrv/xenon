@@ -27,7 +27,30 @@ public class RoleService extends StatefulService {
     public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_ROLES;
 
     public static Service createFactory() {
-        return FactoryService.createIdempotent(RoleService.class);
+        FactoryService fs = new FactoryService(RoleState.class) {
+
+            @Override
+            public Service createServiceInstance() throws Throwable {
+                return new RoleService();
+            }
+
+            @Override
+            public void handlePost(Operation request) {
+                checkAndNestCompletionForAuthzCacheClear(this, request);
+                super.handlePost(request);
+            }
+        };
+        fs.toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+        return fs;
+    }
+
+    private static void checkAndNestCompletionForAuthzCacheClear(Service s, Operation op) {
+        if (AuthorizationCacheUtils.isAuthzCacheClearApplicableOperation(op)) {
+            RoleState state = AuthorizationCacheUtils.extractBody(op, s, RoleState.class);
+            if (state != null) {
+                AuthorizationCacheUtils.clearAuthzCacheForRole(s, op, state);
+            }
+        }
     }
 
     public enum Policy {
@@ -49,6 +72,47 @@ public class RoleService extends StatefulService {
         public Set<Action> verbs;
         public Policy policy;
         public int priority;
+
+        public static class Builder {
+            private RoleService.RoleState roleState;
+
+            private Builder() {
+                this.roleState = new RoleState();
+            }
+
+            public static Builder create() {
+                return  new Builder();
+            }
+
+            public Builder withUserGroupLink(String userGroupLink) {
+                this.roleState.userGroupLink = userGroupLink;
+                return this;
+            }
+
+            public Builder withResourceGroupLink(String resourceGroupLink) {
+                this.roleState.resourceGroupLink = resourceGroupLink;
+                return this;
+            }
+
+            public Builder withVerbs(Set<Service.Action> verbs) {
+                this.roleState.verbs = verbs;
+                return this;
+            }
+
+            public Builder withPolicy(RoleService.Policy policy) {
+                this.roleState.policy = policy;
+                return this;
+            }
+
+            public Builder withSelfLink(String selfLink) {
+                this.roleState.documentSelfLink = selfLink;
+                return this;
+            }
+
+            public RoleService.RoleState build() {
+                return this.roleState;
+            }
+        }
     }
 
     public RoleService() {
@@ -56,6 +120,17 @@ public class RoleService extends StatefulService {
         super.toggleOption(ServiceOption.PERSISTENCE, true);
         super.toggleOption(ServiceOption.REPLICATION, true);
         super.toggleOption(ServiceOption.OWNER_SELECTION, true);
+    }
+
+    @Override
+    public void processCompletionStageUpdateAuthzArtifacts(Operation op) {
+        checkAndNestCompletionForAuthzCacheClear(this, op);
+        op.complete();
+    }
+
+    @Override
+    public void setProcessingStage(Service.ProcessingStage stage) {
+        super.setProcessingStage(stage);
     }
 
     @Override
@@ -69,7 +144,6 @@ public class RoleService extends StatefulService {
         if (!validate(op, state)) {
             return;
         }
-
         op.complete();
     }
 
@@ -86,13 +160,14 @@ public class RoleService extends StatefulService {
         }
 
         RoleState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
+
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
-            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
-        } else {
-            setState(op, newState);
+            // do not update state
+            op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED);
         }
 
+        setState(op, newState);
         op.complete();
     }
 
@@ -114,11 +189,6 @@ public class RoleService extends StatefulService {
 
         if (state.policy == null) {
             op.fail(new IllegalArgumentException("policy is required"));
-            return false;
-        }
-
-        if (state.policy == Policy.DENY) {
-            op.fail(new IllegalArgumentException("DENY policy is not supported"));
             return false;
         }
 

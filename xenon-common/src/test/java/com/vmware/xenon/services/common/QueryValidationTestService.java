@@ -38,10 +38,17 @@ public class QueryValidationTestService extends StatefulService {
         public long longValue;
         @ServiceDocument.PropertyOptions(usage = PropertyUsageOption.LINK)
         public String link;
+        public String anotherLink;
     }
 
     public static class QueryValidationServiceState extends ServiceDocument {
         public static final String FIELD_NAME_IGNORED_STRING_VALUE = "ignoredStringValue";
+        public static final String FIELD_NAME_TEXT_VALUE = "textValue";
+        public static final String FIELD_NAME_STRING_VALUE = "stringValue";
+        public static final String FIELD_NAME_SERVICE_LINK = "serviceLink";
+        public static final String FIELD_NAME_SERVICE_LINKS = "serviceLinks";
+        public static final String FIELD_NAME_LONG_VALUE = "longValue";
+        public static final String FIELD_NAME_ID = "id";
         public String id;
         @Documentation(description = "a Long value")
         @PropertyOptions(usage = PropertyUsageOption.OPTIONAL)
@@ -55,8 +62,12 @@ public class QueryValidationTestService extends StatefulService {
         public byte bytePrimitive;
         public Date dateValue;
         public String stringValue;
-        @PropertyOptions(usage = PropertyUsageOption.OPTIONAL)
+        public String textValue;
+        @PropertyOptions(usage = { PropertyUsageOption.OPTIONAL,
+                PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL })
         public String serviceLink;
+        @PropertyOptions(usage = { PropertyUsageOption.OPTIONAL })
+        public List<String> serviceLinks;
         public URI referenceValue;
         public Boolean booleanValue;
         public TaskState taskInfo;
@@ -103,16 +114,21 @@ public class QueryValidationTestService extends StatefulService {
                 .getBody(QueryValidationServiceState.class);
         QueryValidationServiceState currentState = getState(patch);
         currentState.documentExpirationTimeMicros = body.documentExpirationTimeMicros;
+        currentState.serviceLink = body.serviceLink;
+        currentState.serviceLinks = body.serviceLinks;
         patch.setBody(null).complete();
     }
 
     @Override
     public ServiceDocument getDocumentTemplate() {
         ServiceDocument d = super.getDocumentTemplate();
-
+        PropertyDescription pdTextValue = d.documentDescription.propertyDescriptions
+                .get(QueryValidationServiceState.FIELD_NAME_TEXT_VALUE);
+        pdTextValue.indexingOptions.add(PropertyIndexingOption.TEXT);
         PropertyDescription pdStringValue = d.documentDescription.propertyDescriptions
-                .get("stringValue");
-        pdStringValue.indexingOptions.add(PropertyIndexingOption.TEXT);
+                .get(QueryValidationServiceState.FIELD_NAME_STRING_VALUE);
+        pdStringValue.indexingOptions.add(PropertyIndexingOption.SORT);
+        pdStringValue.indexingOptions.add(PropertyIndexingOption.CASE_INSENSITIVE);
 
         PropertyDescription pdExample = d.documentDescription.propertyDescriptions
                 .get("exampleValue");

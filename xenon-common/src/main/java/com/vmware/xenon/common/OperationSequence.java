@@ -105,6 +105,7 @@ public class OperationSequence {
     private OperationSequence parent;
     private ServiceRequestSender sender;
     private boolean cumulative = true;
+    private boolean abortOnFirstFailure = false;
 
     private OperationSequence(OperationJoin join) {
         this.join = join;
@@ -165,6 +166,32 @@ public class OperationSequence {
     }
 
     /**
+     * Abort entire sequence on first operation failure.
+     *
+     * The joinedCompletion handler set by {@link #setCompletion(JoinedCompletionHandler)}
+     * will NOT be called when the sequence encounters an operation failure.
+     *
+     * <pre>
+     * {@code
+     *    Operation op1 = Operation.createGet(...)
+     *        .setCompletion((o, e) -> {
+     *            // This will be called always
+     *        });
+     *
+     *    OperationSequence.create(op1)
+     *        .setCompletion((ops, exs) -> {
+     *            // This will NOT be called if op1 failed
+     *         })
+     *        .abortOnFirstFailure();
+     * }
+     * </pre>
+     */
+    public OperationSequence abortOnFirstFailure() {
+        this.abortOnFirstFailure = true;
+        return this;
+    }
+
+    /**
      * Send using the {@link ServiceRequestSender}.
      * @see OperationJoin#sendWith(ServiceRequestSender)
      */
@@ -206,6 +233,12 @@ public class OperationSequence {
                 return;
             }
 
+            boolean hasFailure = failures != null && !failures.isEmpty();
+            boolean abortImmediately = this.sequence.hasAbortOnFirstFailureInChildSequences();
+            if (hasFailure && abortImmediately) {
+                return;
+            }
+
             final AtomicBoolean errors = new AtomicBoolean();
             if (this.joinedCompletionHandler != null) {
                 if (this.sequence.cumulative) {
@@ -221,9 +254,9 @@ public class OperationSequence {
             if (this.sequence.child != null && !errors.get()) {
                 try {
                     this.sequence.child.send(this.sequence.sender);
-                } catch (Throwable t) {
+                } catch (Exception e) {
                     // complete with failure
-                    this.sequence.child.join.fail(t);
+                    this.sequence.child.join.fail(e);
                 }
             }
         }
@@ -265,6 +298,17 @@ public class OperationSequence {
         if (this.join == null) {
             throw new IllegalStateException("No joined operation to be sent.");
         }
+    }
+
+    private boolean hasAbortOnFirstFailureInChildSequences() {
+        OperationSequence childSequence = this.child;
+        while (childSequence != null) {
+            if (childSequence.abortOnFirstFailure) {
+                return true;
+            }
+            childSequence = childSequence.child;
+        }
+        return false;
     }
 
 }

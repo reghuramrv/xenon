@@ -25,14 +25,16 @@ import java.security.KeyStore;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
-
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
+import io.netty.handler.codec.http2.Http2SecurityUtil;
+import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
-
+import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -41,6 +43,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import com.vmware.xenon.common.CommandLineArgumentParser;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ServiceClient;
 import com.vmware.xenon.common.ServiceDocument;
@@ -50,7 +53,9 @@ import com.vmware.xenon.common.StatelessService;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.test.VerificationHost;
-
+import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
+import com.vmware.xenon.services.common.NodeState;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 
 /**
  * DCP Host with 2-way SSL certificate authentication test.
@@ -64,6 +69,8 @@ import com.vmware.xenon.common.test.VerificationHost;
 public class Netty2WaySslAuthTest {
     public static final String JAVAX_NET_SSL_TRUST_STORE = "javax.net.ssl.trustStore";
     public static final String JAVAX_NET_SSL_TRUST_STORE_PASSWORD = "javax.net.ssl.trustStorePassword";
+
+    public int securePort = 0;
     private VerificationHost host;
     private TemporaryFolder temporaryFolder;
     private static String savedTrustStore;
@@ -95,19 +102,49 @@ public class Netty2WaySslAuthTest {
 
     @Before
     public void setUp() throws Throwable {
+        CommandLineArgumentParser.parseFromProperties(this);
         this.temporaryFolder = new TemporaryFolder();
         this.temporaryFolder.create();
         this.host = new VerificationHost();
         ServiceHost.Arguments args = new ServiceHost.Arguments();
-        args.securePort = 0;
+        args.securePort = this.securePort;
         args.port = 0;
         args.keyFile = getCanonicalFileForResource("/ssl/server.pem").toPath();
         args.certificateFile = getCanonicalFileForResource("/ssl/server.crt").toPath();
         args.sslClientAuthMode = SslClientAuthMode.WANT;
         args.sandbox = this.temporaryFolder.getRoot().toPath();
         args.bindAddress = ServiceHost.LOOPBACK_ADDRESS;
+
+        if (args.securePort != 0) {
+            args.port = 0;
+            args.peerNodes = new String[] { "https://127.0.0.1:" + args.securePort };
+        }
+
         this.host.initialize(args);
         this.host.start();
+
+        if (args.securePort == 0) {
+            return;
+        }
+
+        // verify that the self URI supplied, even if its a HTTPS, was filtered out of the
+        // peer list
+        assertEquals(this.host.getInitialPeerHosts().size(), 0);
+
+        // verify quorum is set to 1, since we supplied just self as peer
+        this.host.waitFor("quorum not set", () -> {
+            NodeGroupState ngs = this.host.getServiceState(null,
+                    NodeGroupState.class,
+                    UriUtils.buildUri(this.host, ServiceUriPaths.DEFAULT_NODE_GROUP));
+            NodeState self = ngs.nodes.get(this.host.getId());
+            if (self == null) {
+                return false;
+            }
+            if (self.membershipQuorum != 1) {
+                return false;
+            }
+            return true;
+        });
     }
 
     @After
@@ -149,6 +186,46 @@ public class Netty2WaySslAuthTest {
     }
 
     @Test
+    public void testCustomHttp2SslContext() throws Throwable {
+        Path keyFile = getCanonicalFileForResource("/ssl/server.pem").toPath();
+        Path certificateFile = getCanonicalFileForResource("/ssl/server.crt").toPath();
+        SslContext customContext = SslContextBuilder
+                .forServer(certificateFile.toFile(), keyFile.toFile(), null)
+                .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+                .applicationProtocolConfig(new ApplicationProtocolConfig(
+                        ApplicationProtocolConfig.Protocol.ALPN,
+                        ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                        ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                        ApplicationProtocolNames.HTTP_2,
+                        ApplicationProtocolNames.HTTP_1_1))
+                .build();
+        NettyHttpListener listener = new NettyHttpListener(this.host);
+        listener.setSSLContext(customContext);
+
+        // verify that we cannot set the context after the host is started
+        NettyHttpListener hostListener = (NettyHttpListener) this.host.getListener();
+        try {
+            hostListener.setSSLContext(customContext);
+            throw new RuntimeException("call should have thrown an exception");
+        } catch (IllegalStateException ignored) {
+        }
+
+        // now stop the host, replace the listener, and restart
+        this.host.stop();
+        this.host.setPort(0);
+        this.host.setSecurePort(0);
+        this.host.setListener(listener);
+        this.host.start();
+
+        assertEquals(listener, this.host.getListener());
+        hostListener = (NettyHttpListener) this.host.getListener();
+        assertEquals(hostListener.getSSLContext(), customContext);
+
+        test2WaySsl();
+        test2WaySslWithHttp2();
+    }
+
+    @Test
     public void test2WaySsl() throws Throwable {
         // Start sample test service
         this.host.testStart(1);
@@ -184,6 +261,72 @@ public class Netty2WaySslAuthTest {
         AtomicReference<String> result = new AtomicReference<>();
         Operation get = Operation
                 .createGet(UriUtils.buildUri(this.host.getSecureUri(), TestService.SELF_LINK))
+                .setReferer(this.host.getPublicUri())
+                .setCompletion((o, e) -> {
+                    if (e == null) {
+                        result.set(o.getBody(TestServiceResponse.class).principal);
+                    } else {
+                        this.host.log(Level.SEVERE, "Operation failed: %s", Utils.toString(e));
+                    }
+                    this.host.completeIteration();
+                });
+        client.send(get);
+        this.host.testWait();
+        Assert.assertNotNull("Peer principal", result.get());
+        Assert.assertEquals("Peer principal", "CN=agent-461b1767-ea89-4452-9408-283d0752fe40",
+                result.get());
+        client.stop();
+    }
+
+    @Test
+    public void test2WaySslWithHttp2() throws Throwable {
+        // Start sample test service
+        this.host.testStart(1);
+        URI testServiceUri = UriUtils.buildUri(this.host, TestService.SELF_LINK);
+        Operation post = Operation.createPost(testServiceUri)
+                .setCompletion((o, e) -> this.host.completeIteration());
+        this.host.startService(post, new TestService());
+        this.host.testWait();
+
+        // Create ServiceClient with client SSL auth support
+        ServiceClient client = NettyHttpServiceClient.create(
+                getClass().getCanonicalName(),
+                Executors.newFixedThreadPool(4),
+                Executors.newScheduledThreadPool(1));
+
+        SSLContext clientContext = SSLContext.getInstance(ServiceClient.TLS_PROTOCOL_NAME);
+        TrustManagerFactory trustManagerFactory = TrustManagerFactory
+                .getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trustManagerFactory.init((KeyStore) null);
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory
+                .getDefaultAlgorithm());
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+        try (InputStream stream = Netty2WaySslAuthTest.class.getResourceAsStream("/ssl/client.p12")) {
+            keyStore.load(stream, "changeit".toCharArray());
+        }
+        kmf.init(keyStore, "changeit".toCharArray());
+        clientContext.init(kmf.getKeyManagers(), trustManagerFactory.getTrustManagers(), null);
+        client.setSSLContext(clientContext);
+
+        SslContext http2ClientContext = SslContextBuilder.forClient()
+                .keyManager(kmf)
+                .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+                .applicationProtocolConfig(new ApplicationProtocolConfig(
+                        ApplicationProtocolConfig.Protocol.ALPN,
+                        ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                        ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                        ApplicationProtocolNames.HTTP_2))
+                .build();
+
+        ((NettyHttpServiceClient) client).setHttp2SslContext(http2ClientContext);
+        client.start();
+
+        // Perform request and validate that detected principal is correct
+        this.host.testStart(1);
+        AtomicReference<String> result = new AtomicReference<>();
+        Operation get = Operation
+                .createGet(UriUtils.buildUri(this.host.getSecureUri(), TestService.SELF_LINK))
+                .setConnectionSharing(true)
                 .setReferer(this.host.getPublicUri())
                 .setCompletion((o, e) -> {
                     if (e == null) {

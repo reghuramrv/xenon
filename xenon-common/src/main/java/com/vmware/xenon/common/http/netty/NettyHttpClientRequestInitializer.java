@@ -14,7 +14,6 @@
 package com.vmware.xenon.common.http.netty;
 
 import java.util.logging.Level;
-
 import javax.net.ssl.SSLEngine;
 
 import io.netty.channel.ChannelHandlerContext;
@@ -39,9 +38,10 @@ import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.InboundHttp2ToHttpAdapter;
 import io.netty.handler.codec.http2.InboundHttp2ToHttpAdapterBuilder;
 import io.netty.handler.logging.LogLevel;
+import io.netty.handler.ssl.ApplicationProtocolNames;
+import io.netty.handler.ssl.ApplicationProtocolNegotiationHandler;
 import io.netty.handler.ssl.SslHandler;
 
-import com.vmware.xenon.common.Operation.SocketContext;
 import com.vmware.xenon.common.Utils;
 
 /**
@@ -53,23 +53,77 @@ import com.vmware.xenon.common.Utils;
  */
 public class NettyHttpClientRequestInitializer extends ChannelInitializer<SocketChannel> {
 
+    private static class Http2NegotiationHandler extends ApplicationProtocolNegotiationHandler {
+
+        private NettyHttpClientRequestInitializer initializer;
+        private ChannelPromise settingsPromise;
+
+        Http2NegotiationHandler(NettyHttpClientRequestInitializer initializer,
+                ChannelPromise settingsPromise) {
+            super("Fallback protocol");
+            this.initializer = initializer;
+            this.settingsPromise = settingsPromise;
+        }
+
+        @Override
+        protected void configurePipeline(ChannelHandlerContext ctx, String protocol)
+                throws Exception {
+            try {
+                if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
+                    this.initializer.initializeHttp2Pipeline(ctx.pipeline(), this.settingsPromise);
+                    return;
+                }
+                throw new IllegalStateException("Unexpected protocol: " + protocol);
+            } catch (Exception ex) {
+                log(Level.WARNING, "HTTP/2 pipeline initialization failed: %s",
+                        Utils.toString(ex));
+                ctx.close();
+            }
+        }
+
+        @Override
+        protected void handshakeFailure(ChannelHandlerContext ctx, Throwable cause)
+                throws Exception {
+            log(Level.WARNING, "TLS handshake failed: %s", Utils.toString(cause));
+            ctx.close();
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
+                throws Exception {
+            log(Level.WARNING, "ALPN protocol negotiation failed: %s", Utils.toString(cause));
+            ctx.close();
+        }
+
+        private void log(Level level, String fmt, Object... args) {
+            Utils.log(Http2NegotiationHandler.class, Http2NegotiationHandler.class.getSimpleName(),
+                    level, fmt, args);
+        }
+    }
+
+    public static final String ALPN_HANDLER = "alpn";
     public static final String SSL_HANDLER = "ssl";
     public static final String HTTP1_CODEC = "http1-codec";
+    public static final String HTTP2_HANDLER = "http2-handler";
     public static final String UPGRADE_HANDLER = "upgrade-handler";
     public static final String UPGRADE_REQUEST = "upgrade-request";
     public static final String AGGREGATOR_HANDLER = "aggregator";
     public static final String XENON_HANDLER = "xenon";
     public static final String EVENT_LOGGER = "event-logger";
+    public static final String EVENT_STREAM_HANDLER = "event-stream-handler";
 
     private final NettyChannelPool pool;
     private boolean isHttp2Only = false;
     private boolean debugLogging = false;
+    private int requestPayloadSizeLimit;
 
     public NettyHttpClientRequestInitializer(
             NettyChannelPool nettyChannelPool,
-            boolean isHttp2Only) {
+            boolean isHttp2Only,
+            int requestPayloadSizeLimit) {
         this.pool = nettyChannelPool;
         this.isHttp2Only = isHttp2Only;
+        this.requestPayloadSizeLimit = requestPayloadSizeLimit;
         NettyLoggingUtil.setupNettyLogging();
     }
 
@@ -82,6 +136,18 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
         ch.config().setAllocator(NettyChannelContext.ALLOCATOR);
         ch.config().setSendBufferSize(NettyChannelContext.BUFFER_SIZE);
         ch.config().setReceiveBufferSize(NettyChannelContext.BUFFER_SIZE);
+        ChannelPromise settingsPromise = ch.newPromise();
+        ch.attr(NettyChannelContext.SETTINGS_PROMISE_KEY).set(settingsPromise);
+
+        if (this.pool.getHttp2SslContext() != null) {
+            if (!this.isHttp2Only) {
+                throw new IllegalStateException("HTTP/2 must be enabled to set an SSL context");
+            }
+            p.addLast(SSL_HANDLER, this.pool.getHttp2SslContext().newHandler(ch.alloc()));
+            p.addLast(ALPN_HANDLER, new Http2NegotiationHandler(this, settingsPromise));
+            return;
+        }
+
         if (this.pool.getSSLContext() != null) {
             if (this.isHttp2Only) {
                 throw new IllegalArgumentException("HTTP/2 with SSL is not supported");
@@ -94,7 +160,7 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
         HttpClientCodec http1_codec = new HttpClientCodec(
                 NettyChannelContext.MAX_INITIAL_LINE_LENGTH,
                 NettyChannelContext.MAX_HEADER_SIZE,
-                NettyChannelContext.MAX_CHUNK_SIZE, false);
+                NettyChannelContext.MAX_CHUNK_SIZE, false, false);
 
         // The HttpClientCodec combines the HttpRequestEncoder and the HttpResponseDecoder, and it
         // also provides a method for upgrading the protocol, which we use to support HTTP/2.
@@ -108,29 +174,32 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
                 HttpClientUpgradeHandler upgradeHandler = new HttpClientUpgradeHandler(
                         http1_codec,
                         upgradeCodec,
-                        SocketContext.getMaxClientRequestSize());
+                        this.requestPayloadSizeLimit);
 
                 p.addLast(UPGRADE_HANDLER, upgradeHandler);
                 p.addLast(UPGRADE_REQUEST, new UpgradeRequestHandler());
-
-                // This promise will be triggered when we negotiate the settings.
-                // That's important because we can't send user data until the negotiation is done
-                ChannelPromise settingsPromise = ch.newPromise();
                 p.addLast("settings-handler", new Http2SettingsHandler(settingsPromise));
-                ch.attr(NettyChannelContext.SETTINGS_PROMISE_KEY).set(settingsPromise);
                 p.addLast(EVENT_LOGGER, new NettyHttp2UserEventLogger(this.debugLogging));
-            } catch (Throwable ex) {
+            } catch (Exception ex) {
                 Utils.log(NettyHttpClientRequestInitializer.class,
                         NettyHttpClientRequestInitializer.class.getSimpleName(),
                         Level.WARNING, "Channel Initializer exception: %s", ex);
                 throw ex;
             }
         } else {
+            p.addLast(EVENT_STREAM_HANDLER, new NettyHttpEventStreamHandler());
             // The HttpObjectAggregator is not needed for HTTP/2. For HTTP/1.1 it
             // aggregates the HttpMessage and HttpContent into the FullHttpResponse
             p.addLast(AGGREGATOR_HANDLER,
-                    new HttpObjectAggregator(SocketContext.getMaxClientRequestSize()));
+                    new HttpObjectAggregator(this.requestPayloadSizeLimit));
         }
+        p.addLast(XENON_HANDLER, new NettyHttpServerResponseHandler(this.pool));
+    }
+
+    public void initializeHttp2Pipeline(ChannelPipeline p, ChannelPromise settingsPromise) {
+        p.addLast(HTTP2_HANDLER, makeHttp2ConnectionHandler());
+        p.addLast("settings-handler", new Http2SettingsHandler(settingsPromise));
+        p.addLast(EVENT_LOGGER, new NettyHttp2UserEventLogger(this.debugLogging));
         p.addLast(XENON_HANDLER, new NettyHttpServerResponseHandler(this.pool));
     }
 
@@ -160,14 +229,13 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
         // DefaultHttp2Connection is for client or server. False means "client".
         Http2Connection connection = new DefaultHttp2Connection(false);
         InboundHttp2ToHttpAdapter inboundAdapter = new InboundHttp2ToHttpAdapterBuilder(connection)
-                .maxContentLength(NettyChannelContext.MAX_CHUNK_SIZE)
+                .maxContentLength(this.requestPayloadSizeLimit)
                 .propagateSettings(true)
                 .build();
         DelegatingDecompressorFrameListener frameListener = new DelegatingDecompressorFrameListener(
                 connection, inboundAdapter);
 
         Http2Settings settings = new Http2Settings();
-        //settings.maxConcurrentStreams(this.pool.getConnectionLimitPerHost());
         settings.initialWindowSize(NettyChannelContext.INITIAL_HTTP2_WINDOW_SIZE);
 
         NettyHttpToHttp2HandlerBuilder builder = new NettyHttpToHttp2HandlerBuilder()
@@ -185,12 +253,12 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
     }
 
     /**
-    * This handler does just one thing: it informs us (via a promise) that we've received
-    * an HTTP/2 settings frame. We do this because when we connect to the HTTP/2 server,
-    * we have to wait until the settings have been negotiated before we send data.
-    * NettyChannelPool uses this promise.
-    *
-    */
+     * This handler does just one thing: it informs us (via a promise) that we've received
+     * an HTTP/2 settings frame. We do this because when we connect to the HTTP/2 server,
+     * we have to wait until the settings have been negotiated before we send data.
+     * NettyChannelPool uses this promise.
+     *
+     */
     private static class Http2SettingsHandler extends SimpleChannelInboundHandler<Http2Settings> {
         private ChannelPromise promise;
 

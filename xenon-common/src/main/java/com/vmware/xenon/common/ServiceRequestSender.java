@@ -11,7 +11,6 @@
  * specific language governing permissions and limitations under the License.
  */
 
-
 package com.vmware.xenon.common;
 
 /**
@@ -22,5 +21,40 @@ package com.vmware.xenon.common;
  * @see Service
  */
 public interface ServiceRequestSender {
+
+    /**
+     * Sends an asynchronous request.
+     *
+     * @param op The operation to dispatch. The Operation should not be mutated after submission.
+     */
     void sendRequest(Operation op);
+
+    /**
+     * Sends an asynchronous request and returns the eventual response body as deferred result.
+     * @param op The request to send.
+     * @param resultType The expected type of the response body.
+     * @return
+     */
+    default <T> DeferredResult<T> sendWithDeferredResult(Operation op, Class<T> resultType) {
+        return sendWithDeferredResult(op)
+                .thenApply(response -> response.getBody(resultType));
+    }
+
+    /**
+     * Sends an asynchronous request and returns the eventual response as deferred result.
+     * @param op The request to send.
+     * @return
+     */
+    default DeferredResult<Operation> sendWithDeferredResult(Operation op) {
+        DeferredResult<Operation> deferred = new DeferredResult<Operation>();
+        op.nestCompletion((response, e) -> {
+            if (e != null) {
+                deferred.fail(e);
+            } else {
+                deferred.complete(response);
+            }
+        });
+        sendRequest(op);
+        return deferred;
+    }
 }

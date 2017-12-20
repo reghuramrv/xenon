@@ -13,6 +13,7 @@
 
 package com.vmware.xenon.common.test.websockets;
 
+import org.junit.Ignore;
 import org.junit.Test;
 
 import com.vmware.xenon.common.Operation;
@@ -42,12 +43,13 @@ public class TestAuthWebSocketService extends AbstractWebSocketServiceTest {
         this.host.setSystemAuthorizationContext();
         AuthorizationHelper authHelper = new AuthorizationHelper(this.host);
         this.userServicePath = authHelper.createUserService(this.host, "jane@doe.com");
-        authHelper.createRoles(this.host);
+        authHelper.createRoles(this.host, "jane@doe.com");
         super.setUp();
         this.host.resetSystemAuthorizationContext();
-        this.host.assumeIdentity(this.userServicePath, null);
+        this.host.assumeIdentity(this.userServicePath);
     }
 
+    @Ignore("https://www.pivotaltracker.com/story/show/128205795")
     @Test
     public void actions() throws Throwable {
         testGet();
@@ -61,7 +63,6 @@ public class TestAuthWebSocketService extends AbstractWebSocketServiceTest {
     }
 
     private void testAuthContextPropagation() throws Throwable {
-        this.host.getClient().setConnectionLimitPerHost(2);
         // do a regular HTTP operation, with no context, it should fail. we are validating
         // that the web socket client handler does not leak its context on all operations
         this.host.resetSystemAuthorizationContext();
@@ -80,6 +81,7 @@ public class TestAuthWebSocketService extends AbstractWebSocketServiceTest {
         this.host.testWait();
     }
 
+    @Ignore("https://www.pivotaltracker.com/story/show/126512273")
     @Test
     public void subscriptionLifecycle() throws Throwable {
         subscribeUnsubscribe("jane");

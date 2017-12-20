@@ -16,13 +16,16 @@ package com.vmware.xenon.common;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import org.junit.After;
@@ -31,17 +34,24 @@ import org.junit.Test;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceSubscriptionState.ServiceSubscriber;
 import com.vmware.xenon.common.http.netty.NettyHttpServiceClient;
+import com.vmware.xenon.common.test.MinimalTestServiceState;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.MinimalTestService;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupConfig;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 
-public class TestSubscriptions extends BasicReportTestCase {
+
+public class TestSubscriptions extends BasicTestCase {
     private final int NODE_COUNT = 2;
 
     public int serviceCount = 100;
     public long updateCount = 10;
+    public long iterationCount = 0;
 
+    @Override
     public void beforeHostStart(VerificationHost host) {
         host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS
                 .toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
@@ -59,65 +69,85 @@ public class TestSubscriptions extends BasicReportTestCase {
     }
 
     @Test
+    public void remoteAndReliableSubscriptionsLoop() throws Throwable {
+        for (int i = 0; i < this.iterationCount; i++) {
+            tearDown();
+            this.host = createHost();
+            initializeHost(this.host);
+            beforeHostStart(this.host);
+            this.host.start();
+            remoteAndReliableSubscriptions();
+        }
+    }
+
+    @Test
     public void remoteAndReliableSubscriptions() throws Throwable {
         setUpPeers();
+
         // pick one host to post to
         VerificationHost serviceHost = this.host.getPeerHost();
+        URI factoryUri = UriUtils.buildUri(serviceHost, ExampleService.FACTORY_LINK);
+        this.host.waitForReplicatedFactoryServiceAvailable(factoryUri);
+
         // test host to receive notifications
         VerificationHost localHost = this.host;
         int serviceCount = 1;
-        List<URI> exampleURIs = new ArrayList<>();
         // create example service documents across all nodes
-        serviceHost.createExampleServices(serviceHost, serviceCount, exampleURIs, null);
-
+        List<URI> exampleURIs = serviceHost.createExampleServices(serviceHost, serviceCount, null);
+        TestContext oneUseNotificationCtx = this.host.testCreate(1);
         StatelessService notificationTarget = new StatelessService() {
             @Override
             public void handleRequest(Operation update) {
                 update.complete();
                 if (update.getAction().equals(Action.PATCH)) {
                     if (update.getUri().getHost() == null) {
-                        localHost.failIteration(new IllegalStateException(
+                        oneUseNotificationCtx.fail(new IllegalStateException(
                                 "Notification URI does not have host specified"));
                         return;
                     }
-                    localHost.completeIteration();
+                    oneUseNotificationCtx.complete();
                 }
-
             }
         };
 
         String[] ownerHostId = new String[1];
         URI uri = exampleURIs.get(0);
         URI subUri = UriUtils.buildUri(serviceHost.getUri(), uri.getPath());
-        this.host.testStart(1);
-        Operation subscribe = Operation.createPost(subUri).setCompletion(this.host.getCompletion());
+        TestContext subscribeCtx = this.host.testCreate(1);
+        Operation subscribe = Operation.createPost(subUri)
+                .setCompletion(subscribeCtx.getCompletion());
         subscribe.setReferer(localHost.getReferer());
         subscribe.forceRemote();
         // replay state
         serviceHost.startSubscriptionService(subscribe, notificationTarget, ServiceSubscriber
                 .create(false).setUsePublicUri(true));
-        this.host.testWait();
-        this.host.testStart(2);
+        this.host.testWait(subscribeCtx);
+
         // do an update to cause a notification
+        TestContext updateCtx = this.host.testCreate(1);
         ExampleServiceState body = new ExampleServiceState();
         body.name = UUID.randomUUID().toString();
         this.host.send(Operation.createPatch(uri).setBody(body).setCompletion((o, e) -> {
             if (e != null) {
-                this.host.failIteration(e);
+                updateCtx.fail(e);
                 return;
             }
             ExampleServiceState rsp = o.getBody(ExampleServiceState.class);
             ownerHostId[0] = rsp.documentOwner;
-            this.host.completeIteration();
+            updateCtx.complete();
 
         }));
-        this.host.testWait();
+        this.host.testWait(updateCtx);
+        this.host.testWait(oneUseNotificationCtx);
 
         // remove subscription
-        this.host.testStart(1);
-        serviceHost.stopSubscriptionService(subscribe.clone().setAction(Action.DELETE),
+        TestContext unSubscribeCtx = this.host.testCreate(1);
+        Operation unSubscribe = subscribe.clone()
+                .setCompletion(unSubscribeCtx.getCompletion())
+                .setAction(Action.DELETE);
+        serviceHost.stopSubscriptionService(unSubscribe,
                 notificationTarget.getUri());
-        this.host.testWait();
+        this.host.testWait(unSubscribeCtx);
         this.verifySubscriberCount(new URI[] { uri }, 0);
 
         VerificationHost ownerHost = null;
@@ -129,20 +159,20 @@ public class TestSubscriptions extends BasicReportTestCase {
             } else {
                 ownerHost = h;
             }
-            h.setOperationTimeOutMicros(TimeUnit.SECONDS.toMicros(1));
         }
 
         this.host.log("Owner node: %s, subscriber node: %s (%s)", ownerHostId[0],
                 serviceHost.getId(), serviceHost.getUri());
 
         AtomicInteger reliableNotificationCount = new AtomicInteger();
-        localHost.testStart(1);
+        TestContext subscribeCtxNonOwner = this.host.testCreate(1);
         // subscribe using non owner host
+        subscribe.setCompletion(subscribeCtxNonOwner.getCompletion());
         serviceHost.startReliableSubscriptionService(subscribe, (o) -> {
             reliableNotificationCount.incrementAndGet();
             o.complete();
         });
-        localHost.testWait();
+        localHost.testWait(subscribeCtxNonOwner);
 
         // send explicit update to example service
         body.name = UUID.randomUUID().toString();
@@ -168,15 +198,16 @@ public class TestSubscriptions extends BasicReportTestCase {
 
         // stop host that has ownership of example service
         NodeGroupConfig cfg = new NodeGroupConfig();
-        cfg.nodeRemovalDelayMicros = TimeUnit.SECONDS.toMicros(5);
+        cfg.nodeRemovalDelayMicros = TimeUnit.SECONDS.toMicros(2);
         this.host.setNodeGroupConfig(cfg);
 
         // relax quorum
         this.host.setNodeGroupQuorum(1);
-
+        // stop host with subscription
         this.host.stopHost(ownerHost);
 
-        this.host.waitForNodeGroupConvergence(1);
+        factoryUri = UriUtils.buildUri(serviceHost, ExampleService.FACTORY_LINK);
+        this.host.waitForReplicatedFactoryServiceAvailable(factoryUri);
 
         uri = UriUtils.buildUri(serviceHost.getUri(), uri.getPath());
 
@@ -186,7 +217,7 @@ public class TestSubscriptions extends BasicReportTestCase {
 
         // and test once again that notifications flow.
         this.host.log("Sending PATCH requests to %s", uri);
-        int c = 10;
+        long c = this.updateCount;
         for (int i = 0; i < c; i++) {
             body.name = "post-stop-" + UUID.randomUUID().toString();
             this.host.send(Operation.createPatch(uri).setBody(body));
@@ -201,7 +232,6 @@ public class TestSubscriptions extends BasicReportTestCase {
                 throw new TimeoutException();
             }
         }
-
     }
 
     @Test
@@ -232,19 +262,110 @@ public class TestSubscriptions extends BasicReportTestCase {
     }
 
     @Test
+    public void subscriptionsWithAuth() throws Throwable {
+        VerificationHost hostWithAuth = null;
+        try {
+            String testUserEmail = "foo@vmware.com";
+            hostWithAuth = VerificationHost.create(0);
+            hostWithAuth.setAuthorizationEnabled(true);
+            hostWithAuth.start();
+            hostWithAuth.setSystemAuthorizationContext();
+            TestContext waitContext = hostWithAuth.testCreate(1);
+            AuthorizationSetupHelper.create()
+                    .setHost(hostWithAuth)
+                    .setDocumentKind(Utils.buildKind(MinimalTestServiceState.class))
+                    .setUserEmail(testUserEmail)
+                    .setUserSelfLink(testUserEmail)
+                    .setUserPassword(testUserEmail)
+                    .setCompletion(waitContext.getCompletion())
+                    .start();
+            hostWithAuth.testWait(waitContext);
+            hostWithAuth.resetSystemAuthorizationContext();
+            hostWithAuth.assumeIdentity(UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, testUserEmail));
+            MinimalTestService s = new MinimalTestService();
+            MinimalTestServiceState serviceState = new MinimalTestServiceState();
+            serviceState.id = UUID.randomUUID().toString();
+            String minimalServiceUUID = UUID.randomUUID().toString();
+            TestContext notifyContext = hostWithAuth.testCreate(1);
+            hostWithAuth.startServiceAndWait(s, minimalServiceUUID, serviceState);
+
+            Consumer<Operation> notifyC = (nOp) -> {
+                nOp.complete();
+                switch (nOp.getAction()) {
+                case PUT:
+                    notifyContext.completeIteration();
+                    break;
+                default:
+                    break;
+
+                }
+            };
+            Operation subscribe = Operation.createPost(UriUtils.buildUri(hostWithAuth, minimalServiceUUID));
+            subscribe.setReferer(hostWithAuth.getReferer());
+            ServiceSubscriber subscriber = new ServiceSubscriber();
+            subscriber.replayState = true;
+            hostWithAuth.startSubscriptionService(subscribe, notifyC, subscriber);
+            hostWithAuth.testWait(notifyContext);
+        } finally {
+            if (hostWithAuth != null) {
+                hostWithAuth.tearDown();
+            }
+        }
+    }
+
+    @Test
+    public void testSubscriptionsWithExpiry() throws Throwable {
+        MinimalTestService s = new MinimalTestService();
+        MinimalTestServiceState serviceState = new MinimalTestServiceState();
+        serviceState.id = UUID.randomUUID().toString();
+        String minimalServiceUUID = UUID.randomUUID().toString();
+        TestContext notifyContext = this.host.testCreate(1);
+        TestContext notifyDeleteContext = this.host.testCreate(1);
+        this.host.startServiceAndWait(s, minimalServiceUUID, serviceState);
+
+        Service notificationTarget = new StatelessService() {
+            @Override
+            public void authorizeRequest(Operation op) {
+                op.complete();
+                return;
+            }
+
+            @Override
+            public void handleRequest(Operation op) {
+                if (!op.isNotification()) {
+                    if (op.getAction() == Action.DELETE && op.getUri().equals(getUri())) {
+                        notifyDeleteContext.completeIteration();
+                    }
+                    super.handleRequest(op);
+                    return;
+                }
+                if (op.getAction() == Action.PUT) {
+                    notifyContext.completeIteration();
+                }
+            }
+        };
+        Operation subscribe = Operation.createPost(UriUtils.buildUri(host, minimalServiceUUID));
+        subscribe.setReferer(host.getReferer());
+        ServiceSubscriber subscriber = new ServiceSubscriber();
+        subscriber.replayState = true;
+        // Set a 500ms expiry
+        subscriber.documentExpirationTimeMicros = Utils
+                .fromNowMicrosUtc(TimeUnit.MILLISECONDS.toMicros(500));
+        host.startSubscriptionService(subscribe, notificationTarget, subscriber);
+        host.testWait(notifyContext);
+        host.testWait(notifyDeleteContext);
+    }
+
+    @Test
     public void subscribeAndWaitForServiceAvailability() throws Throwable {
         // until HTTP2 support is we must only subscribe to less than max connections!
         // otherwise we deadlock: the connection for the queued subscribe is used up,
         // no more connections can be created, to that owner.
         this.serviceCount = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST / 2;
-        // set the connection limit higher for the test host since it will be issuing parallel
-        // subscribes, POSTs
-        this.host.getClient().setConnectionLimitPerHost(this.serviceCount * 4);
         setUpPeers();
 
-        for (VerificationHost h : this.host.getInProcessHostMap().values()) {
-            h.getClient().setConnectionLimitPerHost(this.serviceCount * 4);
-        }
+        this.host.waitForReplicatedFactoryServiceAvailable(
+                this.host.getPeerServiceUri(ExampleService.FACTORY_LINK));
 
         // Pick one host to post to
         VerificationHost serviceHost = this.host.getPeerHost();
@@ -402,8 +523,8 @@ public class TestSubscriptions extends BasicReportTestCase {
         // with notifications, allowing for notifications to be processed after the next test starts
         ServiceSubscriber sr = createAndStartNotificationTarget(UUID.randomUUID()
                 .toString(), deletesRemainingCount, false, false);
-        sr.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                + this.host.getMaintenanceIntervalMicros() * 2;
+        sr.documentExpirationTimeMicros = Utils.fromNowMicrosUtc(
+                this.host.getMaintenanceIntervalMicros() * 2);
         // Subscribe to notifications from every example service; get notified with current state
         subscribeToServices(childUris, sr);
         verifySubscriberCount(childUris, 1);
@@ -420,10 +541,10 @@ public class TestSubscriptions extends BasicReportTestCase {
     private void deleteNotificationTarget(AtomicInteger deletesRemainingCount,
             ServiceSubscriber sr) throws Throwable {
         deletesRemainingCount.set(1);
-        this.host.testStart(1);
+        TestContext ctx = testCreate(1);
         this.host.send(Operation.createDelete(sr.reference)
-                .setCompletion(this.host.getCompletion()));
-        this.host.testWait();
+                .setCompletion((o, e) -> ctx.completeIteration()));
+        testWait(ctx);
     }
 
     private void doNotificationsWithFailure(URI[] childUris) throws Throwable, InterruptedException {
@@ -635,20 +756,20 @@ public class TestSubscriptions extends BasicReportTestCase {
         this.host.send(Operation.createPost(subUri)
                 .setCompletion(this.host.getCompletion())
                 .setReferer(this.host.getReferer())
-                .setBody(sr));
+                .setBody(sr)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY));
     }
 
     private void unsubscribeFromChildren(URI[] uris, URI targetUri,
             boolean useServiceHostStopSubscription) throws Throwable {
         int count = uris.length;
-        this.host.testStart(count);
+        TestContext ctx = testCreate(count);
         for (int i = 0; i < count; i++) {
             if (useServiceHostStopSubscription) {
                 // stop the subscriptions using the service host API
                 host.stopSubscriptionService(
                         Operation.createDelete(uris[i])
-                                .setReferer(this.host.getReferer())
-                                .setCompletion(this.host.getCompletion()),
+                                .setCompletion(ctx.getCompletion()),
                         targetUri);
                 continue;
             }
@@ -657,11 +778,10 @@ public class TestSubscriptions extends BasicReportTestCase {
 
             URI subUri = UriUtils.buildSubscriptionUri(uris[i]);
             this.host.send(Operation.createDelete(subUri)
-                    .setCompletion(this.host.getCompletion())
-                    .setReferer(this.host.getReferer())
+                    .setCompletion(ctx.getCompletion())
                     .setBody(unsubscribeBody));
         }
-        this.host.testWait();
+        testWait(ctx);
     }
 
     private boolean verifySubscriberCount(URI[] uris, int subscriberCount) throws Throwable {
@@ -678,16 +798,34 @@ public class TestSubscriptions extends BasicReportTestCase {
             subUris[i++] = subUri;
         }
 
-        Date exp = this.host.getTestExpiration();
-        while (new Date().before(exp)) {
-            boolean isConverged = true;
-            Map<URI, ServiceSubscriptionState> subStates = this.host.getServiceState(null,
-                    ServiceSubscriptionState.class, subUris);
+        AtomicBoolean isConverged = new AtomicBoolean();
+        this.host.waitFor("subscriber verification timed out", () -> {
+            isConverged.set(true);
+            Map<URI, ServiceSubscriptionState> subStates = new ConcurrentSkipListMap<>();
+            TestContext ctx = this.host.testCreate(uris.length);
+            for (URI u : subUris) {
+                this.host.send(Operation.createGet(u).setCompletion((o, e) -> {
+                    ServiceSubscriptionState s = null;
+                    if (e == null) {
+                        s = o.getBody(ServiceSubscriptionState.class);
+                    } else {
+                        this.host.log("error response from %s: %s", o.getUri(), e.getMessage());
+                        // because we stopped an owner node, if gossip is not updated a GET
+                        // to subscriptions might fail because it was forward to a stale node
+                        s = new ServiceSubscriptionState();
+                        s.subscribers = new HashMap<>();
+                    }
+                    subStates.put(o.getUri(), s);
+                    ctx.complete();
+                }));
+            }
+            ctx.await();
+
             for (ServiceSubscriptionState state : subStates.values()) {
                 int expected = subscriberCount;
                 int actual = state.subscribers.size();
                 if (actual != expected) {
-                    isConverged = false;
+                    isConverged.set(false);
                     break;
                 }
 
@@ -701,22 +839,20 @@ public class TestSubscriptions extends BasicReportTestCase {
                     }
                     if (sr.failedNotificationCount == null
                             || 0 != sr.failedNotificationCount.compareTo(failedNotificationCount)) {
-                        isConverged = false;
+                        isConverged.set(false);
                         break;
                     }
                 }
 
             }
-            if (isConverged) {
+            if (isConverged.get() || !wait) {
                 return true;
             }
-            if (!wait) {
-                return false;
-            }
-            Thread.sleep(250);
-        }
 
-        throw new TimeoutException("Subscriber count did not converge to " + subscriberCount);
+            return false;
+        });
+
+        return isConverged.get();
     }
 
     private void patchChildren(URI[] uris, boolean expectFailure) throws Throwable {

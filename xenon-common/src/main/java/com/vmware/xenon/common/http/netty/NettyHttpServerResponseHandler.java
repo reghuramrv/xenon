@@ -16,6 +16,7 @@ package com.vmware.xenon.common.http.netty;
 import java.net.ProtocolException;
 import java.util.EnumSet;
 import java.util.Map.Entry;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import io.netty.buffer.ByteBuf;
@@ -30,15 +31,20 @@ import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http2.HttpConversionUtil;
 
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.ServerSentEvent;
 import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceErrorResponse.ErrorDetail;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.http.netty.NettyHttpEventStreamHandler.EventStreamHeadersMessage;
+import com.vmware.xenon.common.http.netty.NettyHttpEventStreamHandler.EventStreamMessage;
 
 /**
  * Processes responses from a remote HTTP server and completes the request associated with the
  * channel
  */
 public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<HttpObject> {
+    public static final Logger LOGGER = Logger.getLogger(NettyHttpServerResponseHandler.class
+            .getName());
 
     private NettyChannelPool pool;
     private Logger logger = Logger.getLogger(getClass().getName());
@@ -52,11 +58,32 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
 
         if (msg instanceof FullHttpResponse) {
             FullHttpResponse response = (FullHttpResponse) msg;
+            Operation request = findOperation(ctx, response, true);
+            if (request == null) {
+                // This will happen when a client-side timeout occurs
+                this.logger.warning("No request in channel " + ctx.channel().id().asLongText());
+                return;
+            }
 
-            Operation request = findOperation(ctx, response);
             request.setStatusCode(response.status().code());
             parseResponseHeaders(request, response);
             completeRequest(ctx, request, response.content());
+        } else if (msg instanceof EventStreamMessage) {
+            EventStreamMessage sseMessage = (EventStreamMessage) msg;
+            ServerSentEvent event = sseMessage.event;
+            if (event != null && ServerSentEvent.EVENT_TYPE_ERROR.equals(event.event)) {
+                Operation request = findOperation(ctx, msg, true);
+                this.handleEventStreamError(request, event);
+            } else {
+                Operation request = findOperation(ctx, msg, false);
+                request.sendServerSentEvent(event);
+            }
+        } else if (msg instanceof EventStreamHeadersMessage) {
+            EventStreamHeadersMessage sseHeaders = (EventStreamHeadersMessage) msg;
+            Operation request = findOperation(ctx, msg, false);
+            request.setStatusCode(sseHeaders.originalResponse.status().code());
+            parseResponseHeaders(request, sseHeaders.originalResponse);
+            request.sendHeaders();
         }
     }
 
@@ -69,11 +96,11 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
      * For HTTP/2, we have multiple requests and have to check a map in the associated
      * NettyChannelContext
      */
-    private Operation findOperation(ChannelHandlerContext ctx, FullHttpResponse response) {
+    private Operation findOperation(ChannelHandlerContext ctx, HttpObject msg, boolean remove) {
         Operation request;
 
-        if (ctx.channel().hasAttr(NettyChannelContext.HTTP2_KEY)) {
-            Integer streamId = response.headers()
+        if (msg instanceof HttpResponse && ctx.channel().hasAttr(NettyChannelContext.HTTP2_KEY)) {
+            Integer streamId = ((HttpResponse) msg).headers()
                     .getInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text());
             if (streamId == null) {
                 this.logger.warning("HTTP/2 message has no stream ID: ignoring.");
@@ -94,9 +121,13 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
             // We only have one request/response per stream, so remove the association.
             channelContext.removeOperationForStream(streamId);
         } else {
-            request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).get();
+            if (remove) {
+                request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).getAndSet(null);
+            } else {
+                request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).get();
+            }
             if (request == null) {
-                this.logger.warning("Can't find operation for channel");
+                this.logger.warning("Can't find operation for channel " + ctx.channel().id().asLongText());
                 return null;
             }
         }
@@ -109,7 +140,13 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
             return;
         }
 
+        if (LOGGER.isLoggable(Level.FINEST)) {
+            logResponseFraming(request, nettyResponse);
+        }
+
         request.setKeepAlive(HttpUtil.isKeepAlive(nettyResponse));
+        headers.remove(HttpHeaderNames.CONNECTION);
+
         if (HttpUtil.isContentLengthSet(nettyResponse)) {
             request.setContentLength(HttpUtil.getContentLength(nettyResponse));
             headers.remove(HttpHeaderNames.CONTENT_LENGTH);
@@ -121,9 +158,23 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
             request.setContentType(contentType);
         }
 
+        if (request.isConnectionSharing()) {
+            headers.remove(HttpConversionUtil.ExtensionHeaderNames.STREAM_WEIGHT.text());
+            headers.remove(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text());
+        }
+
+        if (headers.isEmpty()) {
+            return;
+        }
+
         for (Entry<String, String> h : headers) {
             String key = h.getKey();
             String value = h.getValue();
+            if (Operation.STREAM_ID_HEADER.equals(key)) {
+                // Prevent allocation of response headers in Operation and hide the stream ID
+                // header, since it is manipulated by the HTTP layer, not services
+                continue;
+            }
             request.addResponseHeader(key, value);
         }
     }
@@ -140,19 +191,20 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
                 return;
             }
             // skip body decode, request had no body
-            request.setContentLength(0).complete();
+            request.setContentLength(0).setBodyNoCloning(null).complete();
             return;
         }
 
-        request.nestCompletion((o, e) -> {
-            if (e != null) {
-                request.fail(e);
+        try {
+            Utils.decodeBody(request, content.nioBuffer(), false);
+            if (checkResponseForError(request)) {
                 return;
             }
             completeRequest(request);
-        });
-
-        Utils.decodeBody(request, content.nioBuffer());
+        } catch (Exception e) {
+            request.fail(e);
+            return;
+        }
     }
 
     private void completeRequest(Operation request) {
@@ -164,8 +216,7 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        this.logger.warning(Utils.toString(cause));
-        Operation request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).get();
+        Operation request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).getAndSet(null);
 
         if (request == null) {
             // This will happen when using HTTP/2 because we have multiple requests
@@ -173,7 +224,7 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
             // find all the requests and fail all of them. That's slightly risky because
             // we don't understand why we failed, and we may get responses for them later.
             this.logger.info(
-                    "Channel exception but no HTTP/1.1 request to fail" + cause.getMessage());
+                    "Channel exception but no HTTP/1.1 request to fail:" + cause.getMessage());
             return;
         }
 
@@ -182,6 +233,26 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
         request.setBody(ServiceErrorResponse.create(cause, request.getStatusCode(),
                 EnumSet.of(ErrorDetail.SHOULD_RETRY)));
         request.fail(cause);
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        try {
+            if (!ctx.channel().hasAttr(NettyChannelContext.HTTP2_KEY)) {
+                Operation request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY)
+                        .getAndSet(null);
+                if (request != null && Operation.MEDIA_TYPE_TEXT_EVENT_STREAM
+                        .equals(request.getContentType())) {
+                    // In case of event stream, complete the request -- the consumer is responsible to either
+                    // retry the request or interpret this as the end of the stream.
+                    request.complete();
+                    this.pool.returnOrClose((NettyChannelContext) request.getSocketContext(),
+                            !request.isKeepAlive());
+                }
+            }
+        } finally {
+            super.channelInactive(ctx);
+        }
     }
 
     private boolean checkResponseForError(Operation op) {
@@ -196,16 +267,46 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
                     op.getStatusCode());
             op.setBodyNoCloning(rsp);
         } else if (Operation.MEDIA_TYPE_APPLICATION_JSON.equals(op.getContentType())) {
-            Object originalBody = op.getBodyRaw();
-            ServiceErrorResponse rsp = op.getBody(ServiceErrorResponse.class);
-            if (rsp != null) {
-                errorMsg += " message " + rsp.message;
+            try {
+                Object originalBody = op.getBodyRaw();
+                ServiceErrorResponse rsp = op.getErrorResponseBody();
+                if (rsp != null) {
+                    errorMsg += " message " + rsp.message;
+                }
+                op.setBodyNoCloning(originalBody);
+            } catch (Exception e) {
+                this.logger.warning("Error response body not JSON: " + e.getMessage());
+                ServiceErrorResponse rsp = ServiceErrorResponse.create(e,
+                        op.getStatusCode());
+                op.setBodyNoCloning(rsp);
             }
-            op.setBodyNoCloning(originalBody);
         }
 
         op.fail(new ProtocolException(errorMsg));
         return true;
     }
 
+    private void handleEventStreamError(Operation op, ServerSentEvent event) {
+        String errorMsg = String.format("Service %s returned error for %s. id %d",
+                op.getUri(), op.getAction(), op.getId());
+        ServiceErrorResponse rsp = Utils.fromJson(event.data, ServiceErrorResponse.class);
+        errorMsg += " message " + rsp.message;
+        op.setBodyNoCloning(rsp);
+        op.fail(new ProtocolException(errorMsg));
+    }
+
+    public static void logResponseFraming(Operation op, HttpResponse response) {
+        if (response.headers().isEmpty()) {
+            return;
+        }
+        StringBuilder s = new StringBuilder();
+        s.append(op.getAction().toString())
+                .append(" ")
+                .append(op.getUri().toString())
+                .append("\n");
+        response.headers().forEach((e) -> {
+            s.append(e.toString()).append("\n");
+        });
+        LOGGER.info(s.toString());
+    }
 }

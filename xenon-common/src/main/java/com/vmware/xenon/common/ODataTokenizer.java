@@ -24,7 +24,7 @@ public class ODataTokenizer {
      * (https://github.com/apache/olingo-odata2).
      */
     private static final Pattern BIN_OP = Pattern.compile("^(and|or) ");
-    private static final Pattern BIN_COMP = Pattern.compile("^(eq|ne|lt|gt|le|ge) ");
+    private static final Pattern BIN_COMP = Pattern.compile("^(eq|ne|lt|gt|le|ge|any|all) ");
     private static final Pattern OTHER_LIT = Pattern
             .compile("(?:\\p{L}|\\p{Digit}|[-._~%!$&*+;:@])+");
 
@@ -32,9 +32,9 @@ public class ODataTokenizer {
     private static final String ODATA_NESTED_SEPARATOR = "/";
     private static final String DEFAULT_NESTED_SEPARATOR = ".";
 
-    int curPosition;
-    final String expression;
-    final int expressionLength;
+    private int curPosition;
+    private final String expression;
+    private final int expressionLength;
     ODataTokenList tokens;
 
     public ODataTokenizer(final String expression) {

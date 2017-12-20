@@ -24,13 +24,14 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import com.vmware.xenon.common.BasicReusableHostTestCase;
+import com.vmware.xenon.common.BasicTestCase;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service.Action;
+import com.vmware.xenon.common.SynchronizationTaskService;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
 
-public class TestOperationIndexService extends BasicReusableHostTestCase {
+public class TestOperationIndexService extends BasicTestCase {
 
     /**
      * Command line argument specifying request count
@@ -191,7 +192,16 @@ public class TestOperationIndexService extends BasicReusableHostTestCase {
                             throw new IllegalStateException("no results");
                         }
 
-                        int actualDocLinkSize = query.results.documentLinks.size();
+                        // Exclude all serialized operations specific to
+                        // the synchronization-task.
+                        int actualDocLinkSize = 0;
+                        for (Object obj : query.results.documents.values()) {
+                            String so = Utils.toJson(obj);
+                            if (!so.contains(SynchronizationTaskService.FACTORY_LINK)) {
+                                actualDocLinkSize++;
+                            }
+                        }
+
                         // we have at least updateCount * 2 worth of documents
                         if (actualDocLinkSize < this.updateCount * 2) {
                             throw new IllegalStateException("expected more operations");
