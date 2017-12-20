@@ -13,134 +13,281 @@
 
 package com.vmware.xenon.services.common;
 
+import static com.vmware.xenon.services.common.LuceneIndexDocumentHelper.GROUP_BY_PROPERTY_NAME_SUFFIX;
+
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
-import java.util.Date;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Queue;
+import java.util.Objects;
 import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.stream.Stream;
 
-import com.esotericsoftware.kryo.KryoException;
-import com.google.gson.JsonParser;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.core.SimpleAnalyzer;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.lucene60.Lucene60FieldInfosFormat;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.document.DoubleField;
-import org.apache.lucene.document.Field;
-import org.apache.lucene.document.Field.Store;
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.document.LongField;
-import org.apache.lucene.document.SortedDocValuesField;
-import org.apache.lucene.document.StoredField;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.document.TextField;
-import org.apache.lucene.index.CheckIndex;
+import org.apache.lucene.document.LongPoint;
+import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.DocValuesType;
-import org.apache.lucene.index.IndexCommit;
-import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexUpgrader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.IndexWriterConfig.OpenMode;
-import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.KeepOnlyLastCommitDeletionPolicy;
+import org.apache.lucene.index.SegmentCommitInfo;
+import org.apache.lucene.index.SegmentInfo;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.SnapshotDeletionPolicy;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchNoDocsQuery;
-import org.apache.lucene.search.NumericRangeQuery;
 import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.SortedNumericSortField;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.grouping.GroupDocs;
+import org.apache.lucene.search.grouping.GroupingSearch;
+import org.apache.lucene.search.grouping.TopGroups;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.store.RAMDirectory;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.Version;
 
 import com.vmware.xenon.common.FileUtils;
+import com.vmware.xenon.common.NamedThreadFactory;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.OperationContext;
 import com.vmware.xenon.common.QueryFilterUtils;
 import com.vmware.xenon.common.ReflectionUtils;
+import com.vmware.xenon.common.RoundRobinOperationQueue;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
-import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
+import com.vmware.xenon.common.ServiceDocumentDescription.DocumentIndexingOption;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState.MemoryLimitType;
+import com.vmware.xenon.common.ServiceStatUtils;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.AggregationType;
 import com.vmware.xenon.common.StatelessService;
-import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.TaskState.TaskStage;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
-import com.vmware.xenon.services.common.LuceneQueryPageService.LuceneQueryPage;
+import com.vmware.xenon.common.config.XenonConfiguration;
+import com.vmware.xenon.common.opentracing.TracingExecutor;
+import com.vmware.xenon.common.serialization.GsonSerializers;
+import com.vmware.xenon.common.serialization.KryoSerializers;
+import com.vmware.xenon.services.common.QueryFilter.QueryFilterException;
+import com.vmware.xenon.services.common.QueryPageService.LuceneQueryPage;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryRuntimeContext;
+import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
+import com.vmware.xenon.services.common.ServiceHostManagementService.BackupType;
 
 public class LuceneDocumentIndexService extends StatelessService {
 
-    public static String SELF_LINK = ServiceUriPaths.CORE_DOCUMENT_INDEX;
+    public static final String SELF_LINK = ServiceUriPaths.CORE_DOCUMENT_INDEX;
+
+    public static final int QUERY_THREAD_COUNT = XenonConfiguration.integer(
+            LuceneDocumentIndexService.class,
+            "QUERY_THREAD_COUNT",
+            Utils.DEFAULT_THREAD_COUNT * 2
+    );
+
+    public static final int UPDATE_THREAD_COUNT = XenonConfiguration.integer(
+            LuceneDocumentIndexService.class,
+            "UPDATE_THREAD_COUNT",
+            Utils.DEFAULT_THREAD_COUNT / 2
+    );
+
+    public static final int QUERY_QUEUE_DEPTH = XenonConfiguration.integer(
+            LuceneDocumentIndexService.class,
+            "queryQueueDepth",
+            Service.OPERATION_QUEUE_DEFAULT_LIMIT
+    );
+
+    public static final int UPDATE_QUEUE_DEPTH = XenonConfiguration.integer(
+            LuceneDocumentIndexService.class,
+            "updateQueueDepth",
+            10 * Service.OPERATION_QUEUE_DEFAULT_LIMIT
+    );
 
     public static final String FILE_PATH_LUCENE = "lucene";
 
-    private String indexDirectory;
+    public static final int DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH = 10000;
 
+    public static final int DEFAULT_INDEX_SEARCHER_COUNT_THRESHOLD = 200;
 
-    private static final int DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH = 10000;
+    public static final int MIN_QUERY_RESULT_LIMIT = 1000;
 
-    private static final int DEFAULT_INDEX_SEARCHER_COUNT_THRESHOLD = 200;
+    public static final int DEFAULT_QUERY_RESULT_LIMIT = 10000;
 
-    private static int INDEX_SEARCHER_COUNT_THRESHOLD = DEFAULT_INDEX_SEARCHER_COUNT_THRESHOLD;
+    public static final int DEFAULT_QUERY_PAGE_RESULT_LIMIT = 10000;
 
-    private static int INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH = DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH;
+    public static final int DEFAULT_EXPIRED_DOCUMENT_SEARCH_THRESHOLD = 10000;
 
-    public static void setSearcherCountThreshold(int count) {
-        INDEX_SEARCHER_COUNT_THRESHOLD = count;
+    public static final int DEFAULT_METADATA_UPDATE_MAX_QUEUE_DEPTH = 10000;
+
+    public static final long DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY = TimeUnit.SECONDS.toMicros(1);
+
+    private static final int QUERY_EXECUTOR_WORK_QUEUE_CAPACITY = XenonConfiguration.integer(
+            LuceneDocumentIndexService.class,
+            "queryExecutorWorkQueueCapacity",
+            QUERY_QUEUE_DEPTH
+    );
+
+    private static final int UPDATE_EXECUTOR_WORK_QUEUE_CAPACITY = XenonConfiguration.integer(
+            LuceneDocumentIndexService.class,
+            "updateExecutorWorkQueueCapacity",
+            UPDATE_QUEUE_DEPTH
+    );
+
+    private static final String DOCUMENTS_WITHOUT_RESULTS = "DocumentsWithoutResults";
+
+    /**
+     * Try to find a reusable searcher this many times.
+     */
+    private static final int SEARCHER_REUSE_MAX_ATTEMPTS = 50;
+
+    protected String indexDirectory;
+
+    private static int expiredDocumentSearchThreshold = 1000;
+
+    private static int indexFileCountThresholdForWriterRefresh = DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH;
+
+    private static int versionRetentionBulkCleanupThreshold = 10000;
+
+    private static int versionRetentionServiceThreshold = 100;
+
+    private static int queryResultLimit = DEFAULT_QUERY_RESULT_LIMIT;
+
+    private static int queryPageResultLimit = DEFAULT_QUERY_PAGE_RESULT_LIMIT;
+
+    private static long searcherRefreshIntervalMicros = 0;
+
+    private static int metadataUpdateMaxQueueDepth = DEFAULT_METADATA_UPDATE_MAX_QUEUE_DEPTH;
+
+    private final Runnable queryTaskHandler = this::handleQueryRequest;
+
+    private final Runnable updateRequestHandler = this::handleUpdateRequest;
+
+    public static void setImplicitQueryResultLimit(int limit) {
+        queryResultLimit = limit;
+    }
+
+    public static int getImplicitQueryResultLimit() {
+        return queryResultLimit;
+    }
+
+    public static void setImplicitQueryProcessingPageSize(int limit) {
+        queryPageResultLimit = limit;
+    }
+
+    public static int getImplicitQueryProcessingPageSize() {
+        return queryPageResultLimit;
     }
 
     public static void setIndexFileCountThresholdForWriterRefresh(int count) {
-        INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH = count;
+        indexFileCountThresholdForWriterRefresh = count;
     }
 
     public static int getIndexFileCountThresholdForWriterRefresh() {
-        return INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH;
+        return indexFileCountThresholdForWriterRefresh;
     }
 
-    private static final String LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE = "binarySerializedState";
+    public static void setExpiredDocumentSearchThreshold(int count) {
+        expiredDocumentSearchThreshold = count;
+    }
 
-    private static final String LUCENE_FIELD_NAME_JSON_SERIALIZED_STATE = "jsonSerializedState";
+    public static int getExpiredDocumentSearchThreshold() {
+        return expiredDocumentSearchThreshold;
+    }
 
-    public static final String STAT_NAME_ACTIVE_QUERY_FILTERS = "activeQueryFilters";
+    public static void setVersionRetentionBulkCleanupThreshold(int count) {
+        versionRetentionBulkCleanupThreshold = count;
+    }
+
+    public static int getVersionRetentionBulkCleanupThreshold() {
+        return versionRetentionBulkCleanupThreshold;
+    }
+
+    public static void setVersionRetentionServiceThreshold(int count) {
+        versionRetentionServiceThreshold = count;
+    }
+
+    public static int getVersionRetentionServiceThreshold() {
+        return versionRetentionServiceThreshold;
+    }
+
+    public static long getSearcherRefreshIntervalMicros() {
+        return searcherRefreshIntervalMicros;
+    }
+
+    public static void setSearcherRefreshIntervalMicros(long interval) {
+        searcherRefreshIntervalMicros = interval;
+    }
+
+    public static void setMetadataUpdateMaxQueueDepth(int depth) {
+        metadataUpdateMaxQueueDepth = depth;
+    }
+
+    public static int getMetadataUpdateMaxQueueDepth() {
+        return metadataUpdateMaxQueueDepth;
+    }
+
+
+
+    static final String LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE = "binarySerializedState";
+
+    static final String LUCENE_FIELD_NAME_JSON_SERIALIZED_STATE = "jsonSerializedState";
+
+    public static final String STAT_NAME_ACTIVE_QUERY_FILTERS = "activeQueryFilterCount";
+
+    public static final String STAT_NAME_ACTIVE_PAGINATED_QUERIES = "activePaginatedQueryCount";
 
     public static final String STAT_NAME_COMMIT_COUNT = "commitCount";
 
@@ -148,7 +295,11 @@ public class LuceneDocumentIndexService extends StatelessService {
 
     public static final String STAT_NAME_COMMIT_DURATION_MICROS = "commitDurationMicros";
 
+    public static final String STAT_NAME_GROUP_QUERY_COUNT = "groupQueryCount";
+
     public static final String STAT_NAME_QUERY_DURATION_MICROS = "queryDurationMicros";
+
+    public static final String STAT_NAME_GROUP_QUERY_DURATION_MICROS = "groupQueryDurationMicros";
 
     public static final String STAT_NAME_QUERY_SINGLE_DURATION_MICROS = "querySingleDurationMicros";
 
@@ -160,66 +311,393 @@ public class LuceneDocumentIndexService extends StatelessService {
 
     public static final String STAT_NAME_INDEXED_DOCUMENT_COUNT = "indexedDocumentCount";
 
+    public static final String STAT_NAME_FORCED_UPDATE_DOCUMENT_DELETE_COUNT = "singleVersionDocumentDeleteCount";
+
     public static final String STAT_NAME_FIELD_COUNT_PER_DOCUMENT = "fieldCountPerDocument";
 
     public static final String STAT_NAME_INDEXING_DURATION_MICROS = "indexingDurationMicros";
 
     public static final String STAT_NAME_SEARCHER_UPDATE_COUNT = "indexSearcherUpdateCount";
 
-    private static final String STAT_NAME_WRITER_ALREADY_CLOSED_EXCEPTION_COUNT = "indexWriterAlreadyClosedFailureCount";
+    public static final String STAT_NAME_SEARCHER_REUSE_BY_DOCUMENT_KIND_COUNT = "indexSearcherReuseByDocumentKindCount";
+
+    public static final String STAT_NAME_PAGINATED_SEARCHER_UPDATE_COUNT = "paginatedIndexSearcherUpdateCount";
+
+    public static final String STAT_NAME_PAGINATED_SEARCHER_FORCE_DELETION_COUNT = "paginatedIndexSearcherForceDeletionCount";
+
+    public static final String STAT_NAME_WRITER_ALREADY_CLOSED_EXCEPTION_COUNT = "indexWriterAlreadyClosedFailureCount";
+
+    public static final String STAT_NAME_READER_ALREADY_CLOSED_EXCEPTION_COUNT = "indexReaderAlreadyClosedFailureCount";
 
     public static final String STAT_NAME_SERVICE_DELETE_COUNT = "serviceDeleteCount";
 
     public static final String STAT_NAME_DOCUMENT_EXPIRATION_COUNT = "expiredDocumentCount";
 
-    protected static final int UPDATE_THREAD_COUNT = 4;
+    public static final String STAT_NAME_DOCUMENT_EXPIRATION_FORCED_MAINTENANCE_COUNT = "expiredDocumentForcedMaintenanceCount";
 
-    protected static final int QUERY_THREAD_COUNT = 2;
+    public static final String STAT_NAME_METADATA_INDEXING_UPDATE_COUNT = "metadataIndexingUpdateCount";
 
+    public static final String STAT_NAME_VERSION_CACHE_LOOKUP_COUNT = "versionCacheLookupCount";
+
+    public static final String STAT_NAME_VERSION_CACHE_MISS_COUNT = "versionCacheMissCount";
+
+    public static final String STAT_NAME_VERSION_CACHE_ENTRY_COUNT = "versionCacheEntryCount";
+
+    public static final String STAT_NAME_MAINTENANCE_SEARCHER_REFRESH_DURATION_MICROS =
+            "maintenanceSearcherRefreshDurationMicros";
+
+    public static final String STAT_NAME_MAINTENANCE_DOCUMENT_EXPIRATION_DURATION_MICROS =
+            "maintenanceDocumentExpirationDurationMicros";
+
+    public static final String STAT_NAME_MAINTENANCE_VERSION_RETENTION_DURATION_MICROS =
+            "maintenanceVersionRetentionDurationMicros";
+
+    public static final String STAT_NAME_MAINTENANCE_METADATA_INDEXING_DURATION_MICROS =
+            "maintenanceMetadataIndexingDurationMicros";
+
+    public static final String STAT_NAME_DOCUMENT_KIND_QUERY_COUNT_FORMAT = "documentKindQueryCount-%s";
+
+    public static final String STAT_NAME_NON_DOCUMENT_KIND_QUERY_COUNT = "nonDocumentKindQueryCount";
+
+    public static final String STAT_NAME_SINGLE_QUERY_BY_FACTORY_COUNT_FORMAT = "singleQueryByFactoryCount-%s";
+
+    public static final String STAT_NAME_PREFIX_UPDATE_QUEUE_DEPTH = "updateQueueDepth";
+
+    public static final String STAT_NAME_FORMAT_UPDATE_QUEUE_DEPTH = STAT_NAME_PREFIX_UPDATE_QUEUE_DEPTH + "-%s";
+
+    public static final String STAT_NAME_PREFIX_QUERY_QUEUE_DEPTH = "queryQueueDepth";
+
+    public static final String STAT_NAME_FORMAT_QUERY_QUEUE_DEPTH = STAT_NAME_PREFIX_QUERY_QUEUE_DEPTH + "-%s";
+
+    private static final String STAT_NAME_MAINTENANCE_MEMORY_LIMIT_DURATION_MICROS =
+            "maintenanceMemoryLimitDurationMicros";
+
+    private static final String STAT_NAME_MAINTENANCE_FILE_LIMIT_REFRESH_DURATION_MICROS =
+            "maintenanceFileLimitRefreshDurationMicros";
+
+    static final String STAT_NAME_VERSION_RETENTION_SERVICE_COUNT = "versionRetentionServiceCount";
+
+    static final String STAT_NAME_ITERATIONS_PER_QUERY = "iterationsPerQuery";
+
+    private static final EnumSet<AggregationType> AGGREGATION_TYPE_AVG_MAX =
+            EnumSet.of(AggregationType.AVG, AggregationType.MAX);
+
+    private static final EnumSet<AggregationType> AGGREGATION_TYPE_SUM = EnumSet.of(AggregationType.SUM);
+
+    /**
+     * Synchronization object used to coordinate index searcher refresh
+     */
     protected final Object searchSync = new Object();
-    protected Queue<IndexSearcher> searchersPendingClose = new ConcurrentLinkedQueue<>();
-    protected IndexSearcher searcher = null;
-    protected IndexWriter writer = null;
-    protected final Semaphore writerAvailable = new Semaphore(
+
+    /**
+     * Synchronization object used to coordinate document metadata updates.
+     */
+    private final Object metadataUpdateSync = new Object();
+
+    /**
+     * Synchronization object used to coordinate index writer update
+     */
+    protected final Semaphore writerSync = new Semaphore(
             UPDATE_THREAD_COUNT + QUERY_THREAD_COUNT);
 
-    protected Map<String, QueryTask> activeQueries = new ConcurrentSkipListMap<>();
+    /**
+     * Map of searchers per thread id. We do not use a ThreadLocal since we need visibility to this map
+     * from the maintenance logic
+     */
+    protected Map<Long, IndexSearcher> searchers = new HashMap<>();
 
-    private long searcherUpdateTimeMicros;
+    private ThreadLocal<LuceneIndexDocumentHelper> indexDocumentHelper = ThreadLocal
+            .withInitial(LuceneIndexDocumentHelper::new);
 
-    private long indexUpdateTimeMicros;
+    /**
+     * Searcher refresh time, per searcher (using hash code)
+     */
+    protected Map<Integer, Long> searcherUpdateTimesMicros = new ConcurrentHashMap<>();
 
-    private long indexWriterCreationTimeMicros;
+    /**
+     * Manage paginated searchers and caches.
+     */
+    protected PaginatedSearcherManager paginatedSearcherManager = new PaginatedSearcherManager();
 
-    private final Map<String, Long> linkAccessTimes = new HashMap<>();
-    private final Map<String, Long> linkDocumentRetentionEstimates = new HashMap<>();
-    private long linkAccessMemoryLimitMB;
+
+    /**
+     * Manages IndexSearcher for paginated queries.
+     * Calling methods that modifies state need to be done after acquiring "searcherSync" lock.
+     */
+    public static class PaginatedSearcherManager {
+
+        /**
+         * Used for managing internal cache.
+         */
+        protected static class PaginatedSearcherInfo {
+            public long creationTimeMicros;
+            public long expirationTimeMicros;
+            public int refCount;
+        }
+
+        protected Map<IndexSearcher, PaginatedSearcherInfo> infoBySearcher = new HashMap<>();
+        protected TreeMap<Long, IndexSearcher> searcherByCreationTime = new TreeMap<>();
+        protected TreeMap<Long, List<IndexSearcher>> searchersByExpirationTime = new TreeMap<>();
+
+
+        /**
+         * Remove index searcher from paginated searcher management
+         *
+         * @param searcher searcher to remove
+         * @return {@code true} when the searcher is no longer shared(need to be closed by the caller).
+         */
+        public boolean removeSearcher(IndexSearcher searcher) {
+
+            PaginatedSearcherInfo info = this.infoBySearcher.get(searcher);
+
+            if (info == null) {
+                return false;
+            }
+
+            info.refCount--;
+            if (info.refCount == 0) {
+                this.infoBySearcher.remove(searcher);
+                this.searcherByCreationTime.remove(info.creationTimeMicros);
+
+                long expirationTime = info.expirationTimeMicros;
+                List<IndexSearcher> expirationList = this.searchersByExpirationTime.get(expirationTime);
+                expirationList.remove(searcher);
+                if (expirationList.isEmpty()) {
+                    this.searchersByExpirationTime.remove(expirationTime);
+                }
+            }
+
+            return info.refCount == 0;
+        }
+
+        public List<IndexSearcher> getSearchersOrderByCreationDesc() {
+            return new ArrayList<>(this.searcherByCreationTime.descendingMap().values());
+        }
+
+
+        public void updateExistingSearcher(IndexSearcher searcher, long newExpirationMicros) {
+
+            PaginatedSearcherInfo info = this.infoBySearcher.get(searcher);
+            long currentExpirationMicros = info.expirationTimeMicros;
+            if (newExpirationMicros <= currentExpirationMicros) {
+                info.refCount++;
+                return;
+            }
+
+            // update searchersByExpirationTime with new expiration
+
+            List<IndexSearcher> expirationList = this.searchersByExpirationTime.get(currentExpirationMicros);
+            if (expirationList == null || !expirationList.contains(searcher)) {
+                throw new IllegalStateException("Searcher not found in expiration list");
+            }
+
+            expirationList.remove(searcher);
+            if (expirationList.isEmpty()) {
+                this.searchersByExpirationTime.remove(currentExpirationMicros);
+            }
+
+            info.expirationTimeMicros = newExpirationMicros;
+
+            // initialize the array with size = 1: unlikely that two searcher will expire
+            // at the same microsecond. The default size of 10 is almost never filled up.
+            expirationList = this.searchersByExpirationTime.computeIfAbsent(
+                    newExpirationMicros, _k -> new ArrayList<>(1));
+
+            expirationList.add(searcher);
+
+            info.refCount++;
+        }
+
+        public void addNewSearcher(IndexSearcher searcher, long creationMicros, long expirationMicros) {
+
+            PaginatedSearcherInfo info = new PaginatedSearcherInfo();
+            info.creationTimeMicros = creationMicros;
+            info.expirationTimeMicros = expirationMicros;
+            info.refCount = 1;
+
+            this.infoBySearcher.put(searcher, info);
+
+            this.searcherByCreationTime.put(creationMicros, searcher);
+            List<IndexSearcher> expirationList = this.searchersByExpirationTime
+                    .computeIfAbsent(expirationMicros, k -> new ArrayList<>(1));
+            expirationList.add(searcher);
+        }
+
+        /**
+         * Remove expired searchers from cache.
+         * @param now expiration time
+         * @return a map of expired searcher with expiration time
+         */
+        public Map<IndexSearcher, Long> removeExpiredSearchers(long now) {
+
+            Map<IndexSearcher, Long> toClose = new HashMap<>();
+
+            Iterator<Entry<Long, List<IndexSearcher>>> itr = this.searchersByExpirationTime.entrySet().iterator();
+            while (itr.hasNext()) {
+                Entry<Long, List<IndexSearcher>> entry = itr.next();
+                long expirationMicros = entry.getKey();
+                if (expirationMicros > now) {
+                    break;
+                }
+
+                for (IndexSearcher searcher : entry.getValue()) {
+                    PaginatedSearcherInfo info = this.infoBySearcher.remove(searcher);
+                    this.searcherByCreationTime.remove(info.creationTimeMicros);
+                    toClose.put(searcher, expirationMicros);
+                }
+
+                itr.remove();
+            }
+
+            return toClose;
+        }
+
+        public Set<IndexSearcher> getAllSearchers() {
+            return this.infoBySearcher.keySet();
+        }
+
+        public int getSearcherSize() {
+            return this.infoBySearcher.size();
+        }
+
+        public boolean isEmpty() {
+            return this.infoBySearcher.isEmpty();
+        }
+
+        /**
+         * Clear paginated searcher cache.
+         */
+        public void clear() {
+            this.infoBySearcher.clear();
+            this.searcherByCreationTime.clear();
+            this.searchersByExpirationTime.clear();
+        }
+
+    }
+
+
+    protected IndexWriter writer = null;
+
+    protected Map<String, QueryTask> activeQueries = new ConcurrentHashMap<>();
+
+    private long writerUpdateTimeMicros;
+
+    private long writerCreationTimeMicros;
+
+    /**
+     * Time when memory pressure removed {@link #updatesPerLink} entries.
+     */
+    private long serviceRemovalDetectedTimeMicros;
+
+    private final Map<String, DocumentUpdateInfo> updatesPerLink = new HashMap<>();
+    private final Map<String, Long> liveVersionsPerLink = new HashMap<>();
+    private final Map<String, Long> immutableParentLinks = new HashMap<>();
+    private final Map<String, Long> documentKindUpdateInfo = new HashMap<>();
+
+    private final SortedSet<MetadataUpdateInfo> metadataUpdates =
+            new TreeSet<>(Comparator.comparingLong((info) -> info.updateTimeMicros));
+    private final Map<String, MetadataUpdateInfo> metadataUpdatesPerLink = new HashMap<>();
+
+    // memory pressure threshold in bytes
+    long updateMapMemoryLimit;
 
     private Sort versionSort;
 
-    private ExecutorService privateIndexingExecutor;
+    ExecutorService privateIndexingExecutor;
 
-    private ExecutorService privateQueryExecutor;
+    ExecutorService privateQueryExecutor;
 
-    private final FieldType longStoredField = numericDocType(FieldType.NumericType.LONG, true);
-    private final FieldType longUnStoredField = numericDocType(FieldType.NumericType.LONG, false);
-    private final FieldType doubleStoredField = numericDocType(FieldType.NumericType.DOUBLE, true);
-    private final FieldType doubleUnStoredField = numericDocType(FieldType.NumericType.DOUBLE,
-            false);
-
+    private Set<String> fieldsToLoadIndexingIdLookup;
+    private Set<String> fieldToLoadVersionLookup;
     private Set<String> fieldsToLoadNoExpand;
     private Set<String> fieldsToLoadWithExpand;
 
+    private final RoundRobinOperationQueue queryQueue = new RoundRobinOperationQueue(
+            "index-service-query", QUERY_QUEUE_DEPTH);
+
+    private final RoundRobinOperationQueue updateQueue = new RoundRobinOperationQueue(
+            "index-service-update", UPDATE_QUEUE_DEPTH);
+
     private URI uri;
 
+    private FieldInfoCache fieldInfoCache;
+
+    public static class MetadataUpdateInfo {
+        public String selfLink;
+        public String kind;
+        public long updateTimeMicros;
+    }
+
+    public static class DocumentUpdateInfo {
+        public long updateTimeMicros;
+        public long version;
+    }
+
+    public static class DeleteQueryRuntimeContextRequest extends ServiceDocument {
+        public QueryRuntimeContext context;
+        static final String KIND = Utils.buildKind(DeleteQueryRuntimeContextRequest.class);
+    }
+
+    /**
+     * NOTE: use backup API in ServiceHostManagementService instead of this class.
+     **/
     public static class BackupRequest extends ServiceDocument {
-        URI backupFile;
         static final String KIND = Utils.buildKind(BackupRequest.class);
     }
 
+    public static class BackupResponse extends ServiceDocument {
+        public URI backupFile;
+        static final String KIND = Utils.buildKind(BackupResponse.class);
+    }
+
+    /**
+     * Special GET request/response body to retrieve lucene related info.
+     *
+     * Internal usage only mainly for backup/restore.
+     */
+    public static class InternalDocumentIndexInfo {
+        public IndexWriter indexWriter;
+        public String indexDirectory;
+        public LuceneDocumentIndexService luceneIndexService;
+        public Semaphore writerSync;
+    }
+
+    /**
+     * NOTE: use restore API in ServiceHostManagementService instead of this class.
+     **/
     public static class RestoreRequest extends ServiceDocument {
-        URI backupFile;
+        public URI backupFile;
+        public Long timeSnapshotBoundaryMicros;
         static final String KIND = Utils.buildKind(RestoreRequest.class);
+    }
+
+    public static class MaintenanceRequest {
+        static final String KIND = Utils.buildKind(MaintenanceRequest.class);
+    }
+
+    /**
+     * Used for lucene commit notification.
+     */
+    public static class CommitInfo {
+        public static final String KIND = Utils.buildKind(CommitInfo.class);
+        public String kind = CommitInfo.KIND;
+
+        /**
+         * Result of lucene commit.
+         *
+         * From {@link IndexWriter#commit()}:
+         *
+         * <p> If nothing was committed, because there were no
+         * pending changes, this returns -1.  Otherwise, it returns
+         * the sequence number such that all indexing operations
+         * prior to this sequence will be included in the commit
+         * point, and all other operations will not. </p>
+         *
+         * The <a href="#sequence_number">sequence number</a>
+         * of the last operation in the commit.  All sequence numbers &lt;= this value
+         * will be reflected in the commit, and all others will not.
+         */
+        public long sequenceNumber;
     }
 
     public LuceneDocumentIndexService() {
@@ -228,8 +706,13 @@ public class LuceneDocumentIndexService extends StatelessService {
 
     public LuceneDocumentIndexService(String indexDirectory) {
         super(ServiceDocument.class);
+        super.toggleOption(ServiceOption.CORE, true);
         super.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
         this.indexDirectory = indexDirectory;
+    }
+
+    private boolean isDurable() {
+        return this.indexDirectory != null;
     }
 
     @Override
@@ -239,63 +722,186 @@ public class LuceneDocumentIndexService extends StatelessService {
         // so its worth caching (plus we only have a very small number of index services
         this.uri = super.getUri();
 
-        File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
-        this.privateQueryExecutor = Executors.newFixedThreadPool(QUERY_THREAD_COUNT,
-                r -> new Thread(r, getUri() + "/queries/" + Utils.getNowMicrosUtc()));
-        this.privateIndexingExecutor = Executors.newFixedThreadPool(UPDATE_THREAD_COUNT,
-                r -> new Thread(r, getSelfLink() + "/updates/" + Utils.getNowMicrosUtc()));
-        this.versionSort = new Sort(new SortField(ServiceDocument.FIELD_NAME_VERSION,
+        ExecutorService es = new ThreadPoolExecutor(QUERY_THREAD_COUNT, QUERY_THREAD_COUNT,
+                1, TimeUnit.MINUTES,
+                new ArrayBlockingQueue<>(QUERY_EXECUTOR_WORK_QUEUE_CAPACITY),
+                new NamedThreadFactory(getUri() + "/queries"));
+        this.privateQueryExecutor = TracingExecutor.create(es, this.getHost().getTracer());
+
+        es = new ThreadPoolExecutor(QUERY_THREAD_COUNT, QUERY_THREAD_COUNT,
+                1, TimeUnit.MINUTES,
+                new ArrayBlockingQueue<>(UPDATE_EXECUTOR_WORK_QUEUE_CAPACITY),
+                new NamedThreadFactory(getUri() + "/updates"));
+        this.privateIndexingExecutor = TracingExecutor.create(es, this.getHost().getTracer());
+
+        initializeInstance();
+
+        if (isDurable()) {
+            // create durable index writer
+            File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
+            for (int retryCount = 0; retryCount < 2; retryCount++) {
+                try {
+                    createWriter(directory, true);
+                    // we do not actually know if the index is OK, until we try to query
+                    doSelfValidationQuery();
+                    if (retryCount == 1) {
+                        logInfo("Retry to create index writer was successful");
+                    }
+                    break;
+                } catch (Exception e) {
+                    adjustStat(STAT_NAME_INDEX_LOAD_RETRY_COUNT, 1);
+                    if (retryCount < 1) {
+                        logWarning("Failure creating index writer: %s, will retry",
+                                Utils.toString(e));
+                        close(this.writer);
+                        archiveCorruptIndexFiles(directory);
+                        continue;
+                    }
+                    logWarning("Failure creating index writer: %s", Utils.toString(e));
+                    post.fail(e);
+                    return;
+                }
+            }
+        } else {
+            // create RAM based index writer
+            try {
+                createWriter(null, false);
+            } catch (Exception e) {
+                logSevere(e);
+                post.fail(e);
+                return;
+            }
+        }
+
+        initializeStats();
+
+        post.complete();
+    }
+
+    private void initializeInstance() {
+        this.liveVersionsPerLink.clear();
+        this.updatesPerLink.clear();
+        this.searcherUpdateTimesMicros.clear();
+        this.paginatedSearcherManager.clear();
+        this.versionSort = new Sort(new SortedNumericSortField(ServiceDocument.FIELD_NAME_VERSION,
                 SortField.Type.LONG, true));
+
+        this.fieldsToLoadIndexingIdLookup = new HashSet<>();
+        this.fieldsToLoadIndexingIdLookup.add(ServiceDocument.FIELD_NAME_VERSION);
+        this.fieldsToLoadIndexingIdLookup.add(ServiceDocument.FIELD_NAME_UPDATE_ACTION);
+        this.fieldsToLoadIndexingIdLookup.add(LuceneIndexDocumentHelper.FIELD_NAME_INDEXING_ID);
+        this.fieldsToLoadIndexingIdLookup.add(ServiceDocument.FIELD_NAME_UPDATE_TIME_MICROS);
+        this.fieldsToLoadIndexingIdLookup.add(LuceneIndexDocumentHelper.FIELD_NAME_INDEXING_METADATA_VALUE_TOMBSTONE_TIME);
+
+        this.fieldToLoadVersionLookup = new HashSet<>();
+        this.fieldToLoadVersionLookup.add(ServiceDocument.FIELD_NAME_VERSION);
+        this.fieldToLoadVersionLookup.add(ServiceDocument.FIELD_NAME_UPDATE_TIME_MICROS);
 
         this.fieldsToLoadNoExpand = new HashSet<>();
         this.fieldsToLoadNoExpand.add(ServiceDocument.FIELD_NAME_SELF_LINK);
         this.fieldsToLoadNoExpand.add(ServiceDocument.FIELD_NAME_VERSION);
         this.fieldsToLoadNoExpand.add(ServiceDocument.FIELD_NAME_UPDATE_TIME_MICROS);
         this.fieldsToLoadNoExpand.add(ServiceDocument.FIELD_NAME_UPDATE_ACTION);
-        this.fieldsToLoadNoExpand.add(ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS);
-        this.fieldsToLoadWithExpand = new HashSet<>(this.fieldsToLoadNoExpand);
-        this.fieldsToLoadWithExpand.add(LUCENE_FIELD_NAME_JSON_SERIALIZED_STATE);
-        this.fieldsToLoadWithExpand.add(LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE);
 
-        // create durable index writer
-        for (int retryCount = 0; retryCount < 2; retryCount++) {
-            try {
-                createWriter(directory, true);
-                // we do not actually know if the index is OK, until we try to query
-                doSelfValidationQuery();
-                if (retryCount == 1) {
-                    logInfo("Retry to create index writer was successful");
+        this.fieldsToLoadWithExpand = new HashSet<>(this.fieldsToLoadNoExpand);
+        this.fieldsToLoadWithExpand.add(ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS);
+        this.fieldsToLoadWithExpand.add(LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE);
+    }
+
+    private void initializeStats() {
+        IndexWriter w = this.writer;
+        setTimeSeriesStat(STAT_NAME_INDEXED_DOCUMENT_COUNT, AGGREGATION_TYPE_SUM,
+                w != null ? w.numDocs() : 0);
+        // simple estimate on field count, just so our first bin does not have a completely bogus
+        // number
+        setTimeSeriesStat(STAT_NAME_INDEXED_FIELD_COUNT, AGGREGATION_TYPE_SUM,
+                w != null ? w.numDocs() * 10 : 0);
+    }
+
+    private void setTimeSeriesStat(String name, EnumSet<AggregationType> type, double v) {
+        if (!this.hasOption(ServiceOption.INSTRUMENTATION)) {
+            return;
+        }
+        ServiceStat dayStat = ServiceStatUtils.getOrCreateDailyTimeSeriesStat(this, name, type);
+        this.setStat(dayStat, v);
+
+        ServiceStat hourStat = ServiceStatUtils.getOrCreateHourlyTimeSeriesStat(this, name, type);
+        this.setStat(hourStat, v);
+    }
+
+    private void adjustTimeSeriesStat(String name, EnumSet<AggregationType> type, double delta) {
+        if (!this.hasOption(ServiceOption.INSTRUMENTATION)) {
+            return;
+        }
+
+        ServiceStat dayStat = ServiceStatUtils.getOrCreateDailyTimeSeriesStat(this, name, type);
+        this.adjustStat(dayStat, delta);
+
+        ServiceStat hourStat = ServiceStatUtils.getOrCreateHourlyTimeSeriesStat(this, name, type);
+        this.adjustStat(hourStat, delta);
+    }
+
+    private void setTimeSeriesHistogramStat(String name, EnumSet<AggregationType> type, double v) {
+        if (!this.hasOption(ServiceOption.INSTRUMENTATION)) {
+            return;
+        }
+        ServiceStat dayStat = ServiceStatUtils.getOrCreateDailyTimeSeriesHistogramStat(this, name, type);
+        this.setStat(dayStat, v);
+
+        ServiceStat hourStat = ServiceStatUtils.getOrCreateHourlyTimeSeriesHistogramStat(this, name, type);
+        this.setStat(hourStat, v);
+    }
+
+    private String getQueryStatName(QueryTask.Query query) {
+        if (query.term != null) {
+            if (query.term.propertyName.equals(ServiceDocument.FIELD_NAME_KIND)) {
+                return String.format(STAT_NAME_DOCUMENT_KIND_QUERY_COUNT_FORMAT, query.term.matchValue);
+            }
+            return STAT_NAME_NON_DOCUMENT_KIND_QUERY_COUNT;
+        }
+
+        StringBuilder kindSb = new StringBuilder();
+        for (QueryTask.Query clause : query.booleanClauses) {
+            if (clause.term == null || clause.term.propertyName == null || clause.term.matchValue == null) {
+                continue;
+            }
+            if (clause.term.propertyName.equals(ServiceDocument.FIELD_NAME_KIND)) {
+                if (kindSb.length() > 0) {
+                    kindSb.append(", ");
                 }
-                break;
-            } catch (Throwable e) {
-                adjustStat(STAT_NAME_INDEX_LOAD_RETRY_COUNT, 1);
-                if (retryCount < 1) {
-                    logWarning("Failure creating index writer, will retry");
-                    close(this.writer);
-                    archiveCorruptIndexFiles(directory);
-                    continue;
-                }
-                logWarning("Failure creating index writer: %s", Utils.toString(e));
-                post.fail(e);
-                return;
+                kindSb.append(clause.term.matchValue);
             }
         }
 
-        post.complete();
+        if (kindSb.length() > 0) {
+            return String.format(STAT_NAME_DOCUMENT_KIND_QUERY_COUNT_FORMAT, kindSb.toString());
+        }
+
+        return STAT_NAME_NON_DOCUMENT_KIND_QUERY_COUNT;
     }
 
     public IndexWriter createWriter(File directory, boolean doUpgrade) throws Exception {
+        Directory luceneDirectory = directory != null ? MMapDirectory.open(directory.toPath())
+                : new RAMDirectory();
+        return createWriterWithLuceneDirectory(luceneDirectory, doUpgrade);
+    }
+
+    IndexWriter createWriterWithLuceneDirectory(Directory dir, boolean doUpgrade) throws Exception {
         Analyzer analyzer = new SimpleAnalyzer();
         IndexWriterConfig iwc = new IndexWriterConfig(analyzer);
+
+        iwc.setCodec(createCodec());
+
         Long totalMBs = getHost().getServiceMemoryLimitMB(getSelfLink(), MemoryLimitType.EXACT);
         if (totalMBs != null) {
-            long cacheSizeMB = (totalMBs * 3) / 4;
+            long cacheSizeMB = (totalMBs * 99) / 100;
             cacheSizeMB = Math.max(1, cacheSizeMB);
             iwc.setRAMBufferSizeMB(cacheSizeMB);
-            this.linkAccessMemoryLimitMB = totalMBs / 4;
+            // reserve 1% of service memory budget for version cache
+            long memoryLimitMB = Math.max(1, totalMBs / 100);
+            this.updateMapMemoryLimit = memoryLimitMB * 1024 * 1024;
         }
 
-        Directory dir = MMapDirectory.open(directory.toPath());
 
         // Upgrade the index in place if necessary.
         if (doUpgrade && DirectoryReader.indexExists(dir)) {
@@ -306,136 +912,232 @@ public class LuceneDocumentIndexService extends StatelessService {
         iwc.setIndexDeletionPolicy(new SnapshotDeletionPolicy(
                 new KeepOnlyLastCommitDeletionPolicy()));
 
+        IndexWriter w = new IndexWriter(dir, iwc);
+        overwriteCodecInSegmentsBeforeInitialCommit(iwc.getCodec(), w);
+        w.commit();
 
-        this.writer = new IndexWriter(dir, iwc);
-        this.writer.commit();
-        this.linkAccessTimes.clear();
-        this.indexUpdateTimeMicros = Utils.getNowMicrosUtc();
-        this.indexWriterCreationTimeMicros = this.indexUpdateTimeMicros;
+        synchronized (this.searchSync) {
+            this.writer = w;
+            this.updatesPerLink.clear();
+            this.writerUpdateTimeMicros = Utils.getNowMicrosUtc();
+            this.writerCreationTimeMicros = this.writerUpdateTimeMicros;
+        }
         return this.writer;
+    }
+
+    /**
+     * This hack is needed because segments know which codec they were persisted with.
+     * The {@link LuceneCodecWithFixes} declares the same name as the default code and when read back from
+     * disk the non-caching (original) coded will be used.
+     *
+     * Codecs are meant to be stateless so this is why there is no easy way to pass state during segment read. The
+     * {@link LuceneCodecWithFixes} though keeps state in a {@link FieldInfoCache}.
+     *
+     * That's why after initial load the segment are having their codec overwritten using the reflective calls below.
+     * This method will bail out at the first error ignoring all optimizations but will be able to read any index
+     * on disk, even ones saved with pre-6.0 codecs.
+     *
+     *  @param codec
+     * @param writer
+     */
+    private void overwriteCodecInSegmentsBeforeInitialCommit(Codec codec, IndexWriter writer) {
+        if (this.fieldInfoCache == null) {
+            return;
+        }
+
+        try {
+            Field segmentInfosF = writer.getClass().getDeclaredField("segmentInfos");
+            segmentInfosF.setAccessible(true);
+            SegmentInfos segmentInfos = (SegmentInfos) segmentInfosF.get(writer);
+
+            // must use reflection as codec can be set once only
+            // in this case it's OK as the replaced object is the same 99%
+            // and thread-safe by design
+            Field codecF = SegmentInfo.class.getDeclaredField("codec");
+            codecF.setAccessible(true);
+
+            for (SegmentCommitInfo sci : segmentInfos) {
+                Codec originalCodec = sci.info.getCodec();
+                if (originalCodec.fieldInfosFormat() instanceof Lucene60FieldInfosFormat) {
+                    // only change it if we know how to handle it.
+                    codecF.set(sci.info, codec);
+                }
+            }
+        } catch (Exception e) {
+            getHost().log(Level.WARNING,
+                    "Caching of FieldInfos will not be be enabled on committed segments: %s", e);
+        }
+    }
+
+    private Codec createCodec() {
+        // get the default for the current Lucene version
+        Codec codec = Codec.getDefault();
+
+        if (!(codec.fieldInfosFormat() instanceof Lucene60FieldInfosFormat)) {
+            // during lucene upgrade make sure to introduce a caching version of
+            // the FieldInfosFormat class, similar to Lucene60FieldInfosFormatWithCache
+            getHost().log(Level.WARNING,
+                    "Caching of FieldInfo will be disabled: unsupported Lucene version");
+            return codec;
+        }
+
+        this.fieldInfoCache = new FieldInfoCache();
+        return new LuceneCodecWithFixes(codec, this.fieldInfoCache);
     }
 
     private void upgradeIndex(Directory dir) throws IOException {
         boolean doUpgrade = false;
-        IndexWriterConfig iwc = new IndexWriterConfig(null);
 
-        CheckIndex chkIndex = new CheckIndex(dir);
-
-        try {
-            for (CheckIndex.Status.SegmentInfoStatus segmentInfo : chkIndex
-                    .checkIndex().segmentInfos) {
-                if (!segmentInfo.version.equals(Version.LATEST)) {
-                    logInfo("Found Index version %s", segmentInfo.version.toString());
-                    doUpgrade = true;
-                    break;
-                }
+        String lastSegmentsFile = SegmentInfos.getLastCommitSegmentsFileName(dir.listAll());
+        SegmentInfos sis = SegmentInfos.readCommit(dir, lastSegmentsFile);
+        for (SegmentCommitInfo commit : sis) {
+            if (!commit.info.getVersion().equals(Version.LATEST)) {
+                logInfo("Found Index version %s", commit.info.getVersion().toString());
+                doUpgrade = true;
+                break;
             }
-        } finally {
-            chkIndex.close();
         }
 
         if (doUpgrade) {
             logInfo("Upgrading index to %s", Version.LATEST.toString());
+            IndexWriterConfig iwc = new IndexWriterConfig(null);
             new IndexUpgrader(dir, iwc, false).upgrade();
-            this.indexUpdateTimeMicros = Utils.getNowMicrosUtc();
+            this.writerUpdateTimeMicros = Utils.getNowMicrosUtc();
         }
     }
 
-    private void archiveCorruptIndexFiles(File directory) {
+    void archiveCorruptIndexFiles(File directory) {
         File newDirectory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory
                 + "." + Utils.getNowMicrosUtc());
         try {
+            logWarning("Archiving corrupt index files to %s", newDirectory.toPath());
             Files.createDirectory(newDirectory.toPath());
             // we assume a flat directory structure for the LUCENE directory
             FileUtils.moveOrDeleteFiles(directory, newDirectory, false);
+
         } catch (IOException e) {
             logWarning(e.toString());
         }
     }
 
-    private void doSelfValidationQuery() throws Throwable {
+    /**
+     * Issues a query to verify index is healthy
+     */
+    private void doSelfValidationQuery() throws Exception {
         TermQuery tq = new TermQuery(new Term(ServiceDocument.FIELD_NAME_SELF_LINK, getSelfLink()));
         ServiceDocumentQueryResult rsp = new ServiceDocumentQueryResult();
-        queryIndexWithWriter(Operation.createGet(getUri()), EnumSet
-                .of(QueryOption.INCLUDE_ALL_VERSIONS), tq,
-                null, null, Integer.MAX_VALUE, 0, null, rsp, ServiceOption.PERSISTENCE,
-                new IndexSearcher(
-                        DirectoryReader.open(this.writer, true)));
+
+        Operation op = Operation.createGet(getUri());
+        EnumSet<QueryOption> options = EnumSet.of(QueryOption.INCLUDE_ALL_VERSIONS);
+        IndexSearcher s = new IndexSearcher(DirectoryReader.open(this.writer, true, true));
+        queryIndexPaginated(op, options, s, tq, null, Integer.MAX_VALUE, 0, null, rsp, null,
+                Utils.getNowMicrosUtc());
     }
 
-    private void handleBackup(Operation op, BackupRequest req) throws Throwable {
-        SnapshotDeletionPolicy snapshotter = null;
-        IndexCommit commit = null;
-        handleMaintenanceImpl(true);
-        IndexWriter w = this.writer;
-        if (w == null) {
-            op.fail(new CancellationException());
-            return;
-        }
-        try {
-            // Create a snapshot so the index files won't be deleted.
-            snapshotter = (SnapshotDeletionPolicy) w.getConfig().getIndexDeletionPolicy();
-            commit = snapshotter.snapshot();
-
-            String indexDirectory = UriUtils.buildUriPath(getHost().getStorageSandbox().getPath(),
-                    this.indexDirectory);
-
-            // Add the files in the commit to a zip file.
-            List<URI> fileList = FileUtils.filesToUris(indexDirectory, commit.getFileNames());
-            req.backupFile = FileUtils.zipFiles(fileList,
-                    this.indexDirectory + "-" + Utils.getNowMicrosUtc());
-
-            op.setBody(req).complete();
-        } catch (Exception e) {
-            this.logSevere(e);
-            throw e;
-        } finally {
-            if (snapshotter != null) {
-                snapshotter.release(commit);
-            }
-            w.deleteUnusedFiles();
-        }
-    }
-
-    private void handleRestore(Operation op, RestoreRequest req) {
-        IndexWriter w = this.writer;
-        if (w == null) {
-            op.fail(new CancellationException());
-            return;
+    private void handleDeleteRuntimeContext(Operation op) throws Exception {
+        DeleteQueryRuntimeContextRequest request = (DeleteQueryRuntimeContextRequest)
+                op.getBodyRaw();
+        if (request.context == null) {
+            throw new IllegalArgumentException("Context cannot be null");
         }
 
-        // We already have a slot in the semaphore.  Acquire the rest.
-        final int semaphoreCount = QUERY_THREAD_COUNT + UPDATE_THREAD_COUNT - 1;
-        try {
+        IndexSearcher nativeSearcher = (IndexSearcher) request.context.nativeSearcher;
+        if (nativeSearcher == null) {
+            throw new IllegalArgumentException("Native searcher must be present");
+        }
 
-            this.writerAvailable.acquire(semaphoreCount);
-            close(w);
+        boolean closeSearcher;
+        synchronized (this.searchSync) {
+            closeSearcher = this.paginatedSearcherManager.removeSearcher(nativeSearcher);
+            this.searcherUpdateTimesMicros.remove(nativeSearcher.hashCode());
+        }
 
-            File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
-            // Copy whatever was there out just in case.
-            if (directory.exists()) {
-                // We know the file list won't be null because directory.exists() returned true,
-                // but Findbugs doesn't know that, so we make it happy.
-                File[] files = directory.listFiles();
-                if (files != null && files.length > 0) {
-                    this.logInfo("archiving existing index %s", directory);
-                    archiveCorruptIndexFiles(directory);
-                }
-            }
-
-            this.logInfo("restoring index %s from %s md5sum(%s)", directory, req.backupFile,
-                    FileUtils.md5sum(new File(req.backupFile)));
-            FileUtils.extractZipArchive(new File(req.backupFile), directory.toPath());
-            this.indexUpdateTimeMicros = Utils.getNowMicrosUtc();
-            createWriter(directory, true);
+        if (!closeSearcher) {
             op.complete();
-            this.logInfo("restore complete");
-        } catch (Throwable e) {
-            logSevere(e);
-            op.fail(e);
-        } finally {
-            this.writerAvailable.release(semaphoreCount);
+            return;
         }
+
+        try {
+            nativeSearcher.getIndexReader().close();
+        } catch (Exception ignored) {
+        }
+
+        op.complete();
+
+        adjustTimeSeriesStat(STAT_NAME_PAGINATED_SEARCHER_FORCE_DELETION_COUNT, AGGREGATION_TYPE_SUM, 1);
+    }
+
+    private void handleBackup(Operation op) throws Exception {
+
+        if (!isDurable()) {
+            op.fail(new IllegalStateException("Index service is not durable"));
+            return;
+        }
+
+        // Delegate to LuceneDocumentIndexBackupService
+        logWarning("Please use backup feature from %s.", ServiceHostManagementService.class);
+
+        String outFileName = this.indexDirectory + "-" + Utils.getNowMicrosUtc();
+        Path zipFilePath = Files.createTempFile(outFileName, ".zip");
+
+        ServiceHostManagementService.BackupRequest backupRequest = new ServiceHostManagementService.BackupRequest();
+        backupRequest.kind = ServiceHostManagementService.BackupRequest.KIND;
+        backupRequest.backupType = BackupType.ZIP;
+        backupRequest.destination = zipFilePath.toUri();
+
+        // delegate backup to backup service
+        Operation patch = Operation.createPatch(this, ServiceUriPaths.CORE_DOCUMENT_INDEX_BACKUP)
+                .transferRequestHeadersFrom(op)
+                .transferRefererFrom(op)
+                .setBody(backupRequest)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        op.fail(e);
+                        return;
+                    }
+
+                    BackupResponse response = new BackupResponse();
+                    response.backupFile = backupRequest.destination;
+
+                    op.transferResponseHeadersFrom(o);
+                    op.setBodyNoCloning(response);
+                    op.complete();
+                });
+
+        sendRequest(patch);
+    }
+
+    private void handleRestore(Operation op) {
+        if (!isDurable()) {
+            op.fail(new IllegalStateException("Index service is not durable"));
+            return;
+        }
+
+        // Delegate to LuceneDocumentIndexBackupService
+        logWarning("Please use restore feature from %s.", ServiceHostManagementService.class);
+
+        RestoreRequest req = op.getBody(RestoreRequest.class);
+
+        ServiceHostManagementService.RestoreRequest restoreRequest = new ServiceHostManagementService.RestoreRequest();
+        restoreRequest.kind = ServiceHostManagementService.RestoreRequest.KIND;
+        restoreRequest.destination = req.backupFile;
+        restoreRequest.timeSnapshotBoundaryMicros = req.timeSnapshotBoundaryMicros;
+
+        // delegate restore to backup service
+        Operation patch = Operation.createPatch(this, ServiceUriPaths.CORE_DOCUMENT_INDEX_BACKUP)
+                .transferRequestHeadersFrom(op)
+                .transferRefererFrom(op)
+                .setBody(restoreRequest)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        op.fail(e);
+                        return;
+                    }
+                    op.transferResponseHeadersFrom(o);
+                    op.complete();
+                });
+
+        sendRequest(patch);
     }
 
     @Override
@@ -447,141 +1149,359 @@ public class LuceneDocumentIndexService extends StatelessService {
     public void handleRequest(Operation op) {
         Action a = op.getAction();
         if (a == Action.PUT) {
-            getHost().failRequestActionNotSupported(op);
+            Operation.failActionNotSupported(op);
             return;
         }
 
         if (a == Action.PATCH && op.isRemote()) {
             // PATCH is reserved for in-process QueryTaskService
-            getHost().failRequestActionNotSupported(op);
+            Operation.failActionNotSupported(op);
             return;
         }
 
-        ExecutorService exec = a == Action.GET ? this.privateQueryExecutor
-                : this.privateIndexingExecutor;
-        if (exec.isShutdown()) {
-            op.fail(new CancellationException());
-            return;
+        try {
+            if (a == Action.GET || a == Action.PATCH) {
+                if (offerQueryOperation(op)) {
+                    this.privateQueryExecutor.submit(this.queryTaskHandler);
+                }
+            } else {
+                if (offerUpdateOperation(op)) {
+                    this.privateIndexingExecutor.submit(this.updateRequestHandler);
+                }
+            }
+        } catch (RejectedExecutionException e) {
+            op.fail(e);
         }
-        exec.execute(() -> {
-            try {
-                this.writerAvailable.acquire();
-                switch (a) {
-                case DELETE:
-                    handleDeleteImpl(op);
-                    break;
+    }
+
+    private void handleQueryRequest() {
+        OperationContext originalContext = OperationContext.getOperationContext();
+        Operation op = pollQueryOperation();
+        try {
+            this.writerSync.acquire();
+            while (op != null) {
+                if (op.getExpirationMicrosUtc() > 0 && op.getExpirationMicrosUtc() < Utils.getSystemNowMicrosUtc()) {
+                    op.fail(new RejectedExecutionException("Operation has expired"));
+                    return;
+                }
+
+                OperationContext.setFrom(op);
+                switch (op.getAction()) {
                 case GET:
-                    handleGetImpl(op);
+                    // handle special GET request. Internal call only. Currently from backup/restore services.
+                    if (!op.isRemote() && op.hasBody() && op.getBodyRaw() instanceof InternalDocumentIndexInfo) {
+                        InternalDocumentIndexInfo response = new InternalDocumentIndexInfo();
+                        response.indexWriter = this.writer;
+                        response.indexDirectory = this.indexDirectory;
+                        response.luceneIndexService = this;
+                        response.writerSync = this.writerSync;
+                        op.setBodyNoCloning(response).complete();
+                    } else {
+                        handleGetImpl(op);
+                    }
                     break;
                 case PATCH:
                     ServiceDocument sd = (ServiceDocument) op.getBodyRaw();
                     if (sd.documentKind != null) {
                         if (sd.documentKind.equals(QueryTask.KIND)) {
-                            QueryTask task = (QueryTask) op.getBodyRaw();
+                            QueryTask task = (QueryTask) sd;
                             handleQueryTaskPatch(op, task);
                             break;
                         }
+                        if (sd.documentKind.equals(DeleteQueryRuntimeContextRequest.KIND)) {
+                            handleDeleteRuntimeContext(op);
+                            break;
+                        }
                         if (sd.documentKind.equals(BackupRequest.KIND)) {
-                            BackupRequest backupRequest = (BackupRequest) op.getBodyRaw();
-                            handleBackup(op, backupRequest);
+                            handleBackup(op);
                             break;
                         }
                         if (sd.documentKind.equals(RestoreRequest.KIND)) {
-                            RestoreRequest backupRequest = (RestoreRequest) op.getBodyRaw();
-                            handleRestore(op, backupRequest);
+                            handleRestore(op);
                             break;
                         }
                     }
-
-                    getHost().failRequestActionNotSupported(op);
-                    break;
-                case POST:
-                    updateIndex(op);
+                    Operation.failActionNotSupported(op);
                     break;
                 default:
-                    getHost().failRequestActionNotSupported(op);
                     break;
                 }
-            } catch (Throwable e) {
-                checkFailureAndRecover(e);
-                op.fail(e);
-            } finally {
-                this.writerAvailable.release();
+                op = pollQueryOperation();
             }
-        });
+        } catch (Exception e) {
+            checkFailureAndRecover(e);
+            if (op != null) {
+                op.fail(e);
+            }
+        } finally {
+            OperationContext.setFrom(originalContext);
+            this.writerSync.release();
+        }
     }
 
-    private void handleQueryTaskPatch(Operation op, QueryTask task) throws Throwable {
+    private void handleUpdateRequest() {
+        OperationContext originalContext = OperationContext.getOperationContext();
+        Operation op = pollUpdateOperation();
+        try {
+            this.writerSync.acquire();
+            while (op != null) {
+                OperationContext.setFrom(op);
+                switch (op.getAction()) {
+                case DELETE:
+                    handleDeleteImpl(op);
+                    break;
+                case POST:
+                    Object o = op.getBodyRaw();
+                    if (o != null) {
+                        if (o instanceof UpdateIndexRequest) {
+                            updateIndex(op);
+                            break;
+                        }
+                        if (o instanceof MaintenanceRequest) {
+                            handleMaintenanceImpl(op);
+                            break;
+                        }
+                    }
+                    Operation.failActionNotSupported(op);
+                    break;
+                default:
+                    break;
+                }
+                op = pollUpdateOperation();
+            }
+        } catch (Exception e) {
+            checkFailureAndRecover(e);
+            if (op != null) {
+                op.fail(e);
+            }
+        } finally {
+            OperationContext.setFrom(originalContext);
+            this.writerSync.release();
+        }
+    }
+
+    private void handleQueryTaskPatch(Operation op, QueryTask task) throws Exception {
         QueryTask.QuerySpecification qs = task.querySpec;
 
         Query luceneQuery = (Query) qs.context.nativeQuery;
         Sort luceneSort = (Sort) qs.context.nativeSort;
+
+        if (luceneQuery == null) {
+            luceneQuery = LuceneQueryConverter.convert(task.querySpec.query, qs.context);
+            if (qs.options.contains(QueryOption.TIME_SNAPSHOT)) {
+                Query latestDocumentClause = LongPoint.newRangeQuery(
+                        ServiceDocument.FIELD_NAME_UPDATE_TIME_MICROS, 0,
+                        qs.timeSnapshotBoundaryMicros);
+                luceneQuery = new BooleanQuery.Builder()
+                        .add(latestDocumentClause, Occur.MUST)
+                        .add(luceneQuery, Occur.FILTER).build();
+            }
+            qs.context.nativeQuery = luceneQuery;
+        }
+
+        if (luceneSort == null && task.querySpec.options != null
+                && task.querySpec.options.contains(QuerySpecification.QueryOption.SORT)) {
+            luceneSort = LuceneQueryConverter.convertToLuceneSort(task.querySpec, false);
+            task.querySpec.context.nativeSort = luceneSort;
+        }
+
+        if (qs.options.contains(QueryOption.CONTINUOUS) ||
+                qs.options.contains(QueryOption.CONTINUOUS_STOP_MATCH)) {
+            if (handleContinuousQueryTaskPatch(op, task, qs)) {
+                return;
+            }
+            // intentional fall through for tasks just starting and need to execute a query
+        }
+
+        if (qs.options.contains(QueryOption.GROUP_BY)) {
+            handleGroupByQueryTaskPatch(op, task);
+            return;
+        }
+
         LuceneQueryPage lucenePage = (LuceneQueryPage) qs.context.nativePage;
         IndexSearcher s = (IndexSearcher) qs.context.nativeSearcher;
         ServiceDocumentQueryResult rsp = new ServiceDocumentQueryResult();
 
-        if (qs.options.contains(QueryOption.CONTINUOUS)) {
-            switch (task.taskInfo.stage) {
-            case CREATED:
-                logWarning("Task %s is in invalid state: %s", task.taskInfo.stage);
-                op.fail(new IllegalStateException("Stage not supported"));
-                return;
-            case STARTED:
-                QueryTask clonedTask = new QueryTask();
-                clonedTask.documentSelfLink = task.documentSelfLink;
-                clonedTask.querySpec = task.querySpec;
-                clonedTask.querySpec.context.filter = QueryFilter.create(qs.query);
-                this.activeQueries.put(task.documentSelfLink, clonedTask);
-                this.setStat(STAT_NAME_ACTIVE_QUERY_FILTERS, this.activeQueries.size());
-                logInfo("Activated continuous query task: %s", task.documentSelfLink);
-                break;
-            case CANCELLED:
-            case FAILED:
-            case FINISHED:
-                this.activeQueries.remove(task.documentSelfLink);
-                this.setStat(STAT_NAME_ACTIVE_QUERY_FILTERS, this.activeQueries.size());
-                op.complete();
-                return;
-            default:
-                break;
-
-            }
+        if (s == null && qs.resultLimit != null && qs.resultLimit > 0
+                && qs.resultLimit != Integer.MAX_VALUE
+                && !qs.options.contains(QueryOption.TOP_RESULTS)) {
+            // this is a paginated query. If this is the start of the query, create a dedicated searcher
+            // for this query and all its pages. It will be expired when the query task itself expires.
+            // Since expiration of QueryPageService and index-searcher uses different mechanism, to guarantee
+            // that index-searcher still exists when QueryPageService expired, add some delay for searcher
+            // expiration time.
+            Set<String> documentKind = qs.context.kindScope;
+            long expiration = task.documentExpirationTimeMicros + DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY;
+            s = createOrUpdatePaginatedQuerySearcher(expiration, this.writer, documentKind, qs.options);
         }
 
-        if (!queryIndex(s, op, null, qs.options, luceneQuery, luceneSort, lucenePage,
+        if (!queryIndex(s, op, null, qs.options, luceneQuery, lucenePage,
                 qs.resultLimit,
-                task.documentExpirationTimeMicros, task.indexLink, rsp)) {
+                task.documentExpirationTimeMicros, task.indexLink, rsp, qs)) {
             op.setBodyNoCloning(rsp).complete();
         }
     }
 
-    public void handleGetImpl(Operation get) throws Throwable {
-        Map<String, String> params = UriUtils.parseUriQueryParams(get.getUri());
-        String cap = params.get(UriUtils.URI_PARAM_CAPABILITY);
-        EnumSet<QueryOption> options = EnumSet.noneOf(QueryOption.class);
-        ServiceOption targetIndex = ServiceOption.NONE;
+    private boolean handleContinuousQueryTaskPatch(Operation op, QueryTask task,
+            QueryTask.QuerySpecification qs) throws QueryFilterException {
+        switch (task.taskInfo.stage) {
+        case CREATED:
+            logWarning("Task %s is in invalid state: %s", task.taskInfo.stage);
+            op.fail(new IllegalStateException("Stage not supported"));
+            return true;
+        case STARTED:
+            QueryTask clonedTask = new QueryTask();
+            clonedTask.documentSelfLink = task.documentSelfLink;
+            clonedTask.querySpec = task.querySpec;
+            clonedTask.querySpec.context.filter = QueryFilter.create(qs.query);
+            clonedTask.querySpec.context.subjectLink = getSubject(op);
+            this.activeQueries.put(task.documentSelfLink, clonedTask);
+            adjustTimeSeriesStat(STAT_NAME_ACTIVE_QUERY_FILTERS, AGGREGATION_TYPE_SUM,
+                    1);
+            logInfo("Activated continuous query task: %s", task.documentSelfLink);
+            break;
+        case CANCELLED:
+        case FAILED:
+        case FINISHED:
+            if (this.activeQueries.remove(task.documentSelfLink) != null) {
+                adjustTimeSeriesStat(STAT_NAME_ACTIVE_QUERY_FILTERS, AGGREGATION_TYPE_SUM,
+                        -1);
+            }
+            op.complete();
+            return true;
+        default:
+            break;
+        }
+        return false;
+    }
+
+    private IndexSearcher createOrUpdatePaginatedQuerySearcher(long expirationMicros,
+            IndexWriter w, Set<String> kindScope, EnumSet<QueryOption> queryOptions)
+            throws IOException {
+
+        boolean doNotRefresh = queryOptions.contains(QueryOption.DO_NOT_REFRESH);
+        if (!doNotRefresh && kindScope == null) {
+            return createPaginatedQuerySearcher(expirationMicros, w);
+        }
+
+        IndexSearcher searcher;
+        synchronized (this.searchSync) {
+            searcher = getOrUpdateExistingSearcher(expirationMicros, kindScope, doNotRefresh);
+        }
+
+        if (searcher != null) {
+            return searcher;
+        }
+
+        return createPaginatedQuerySearcher(expirationMicros, w);
+    }
+
+    private IndexSearcher getOrUpdateExistingSearcher(long newExpirationMicros,
+            Set<String> kindScope, boolean doNotRefresh) {
+
+        if (this.paginatedSearcherManager.isEmpty()) {
+            return null;
+        }
+
+        int maxAttempts = SEARCHER_REUSE_MAX_ATTEMPTS;
+
+        IndexSearcher paginatedSearcher = null;
+        for (IndexSearcher searcher : this.paginatedSearcherManager.getSearchersOrderByCreationDesc()) {
+            if (maxAttempts-- < 0) {
+                break;
+            }
+
+            // check the searcher for kindScope update time
+            Long searcherUpdateTime = this.searcherUpdateTimesMicros.get(searcher.hashCode());
+            if (searcherUpdateTime == null) {
+                // under load, very rarely searcherUpdateTime may end up null
+                continue;
+            }
+            if (documentNeedsNewSearcher(null, kindScope, -1, searcherUpdateTime, doNotRefresh)) {
+                continue;
+            }
+
+            paginatedSearcher = searcher;
+            break;
+        }
+
+        if (paginatedSearcher == null) {
+            return null;
+        }
+
+        adjustTimeSeriesStat(STAT_NAME_SEARCHER_REUSE_BY_DOCUMENT_KIND_COUNT, AGGREGATION_TYPE_SUM, 1);
+
+        this.paginatedSearcherManager.updateExistingSearcher(paginatedSearcher, newExpirationMicros);
+
+        return paginatedSearcher;
+    }
+
+    private IndexSearcher createPaginatedQuerySearcher(long expirationMicros, IndexWriter w) throws IOException {
+        if (w == null) {
+            throw new IllegalStateException("Writer not available");
+        }
+
+        adjustTimeSeriesStat(STAT_NAME_PAGINATED_SEARCHER_UPDATE_COUNT, AGGREGATION_TYPE_SUM, 1);
+
+        long now = Utils.getNowMicrosUtc();
+
+        IndexSearcher s = new IndexSearcher(DirectoryReader.open(w, true, true));
+        s.setSimilarity(s.getSimilarity(false));
+
+        synchronized (this.searchSync) {
+            this.paginatedSearcherManager.addNewSearcher(s, now, expirationMicros);
+            this.searcherUpdateTimesMicros.put(s.hashCode(), now);
+        }
+
+        return s;
+    }
+
+    public void handleGetImpl(Operation get) throws Exception {
+        String selfLink = null;
         Long version = null;
+        ServiceOption serviceOption = ServiceOption.NONE;
 
-        if (cap != null) {
-            targetIndex = ServiceOption.valueOf(cap);
-        }
-
-        if (params.containsKey(UriUtils.URI_PARAM_INCLUDE_DELETED)) {
+        EnumSet<QueryOption> options = EnumSet.noneOf(QueryOption.class);
+        if (get.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK)) {
+            // fast path for checking if a service exists, and loading its latest state
+            serviceOption = ServiceOption.PERSISTENCE;
+            // the GET operation URI is set to the service we want to load, not the self link
+            // of the index service. This is only possible when the operation was directly
+            // dispatched from the local host, on the index service
+            selfLink = get.getUri().getPath();
             options.add(QueryOption.INCLUDE_DELETED);
-        }
+        } else {
+            // REST API for loading service state, given a set of URI query parameters
+            Map<String, String> params = UriUtils.parseUriQueryParams(get.getUri());
+            String cap = params.get(UriUtils.URI_PARAM_CAPABILITY);
 
-        if (params.containsKey(ServiceDocument.FIELD_NAME_VERSION)) {
-            version = Long.parseLong(params.get(ServiceDocument.FIELD_NAME_VERSION));
-        }
+            if (cap != null) {
+                serviceOption = ServiceOption.valueOf(cap);
+            }
 
-        String selfLink = params.get(ServiceDocument.FIELD_NAME_SELF_LINK);
-        String fieldToExpand = params.get(UriUtils.URI_PARAM_ODATA_EXPAND);
-        if (fieldToExpand == null) {
-            fieldToExpand = params.get(UriUtils.URI_PARAM_ODATA_EXPAND_NO_DOLLAR_SIGN);
-        }
-        if (fieldToExpand != null
-                && fieldToExpand.equals(ServiceDocumentQueryResult.FIELD_NAME_DOCUMENT_LINKS)) {
-            options.add(QueryOption.EXPAND_CONTENT);
+            if (serviceOption == ServiceOption.IMMUTABLE) {
+                options.add(QueryOption.INCLUDE_ALL_VERSIONS);
+                serviceOption = ServiceOption.PERSISTENCE;
+            }
+
+            if (params.containsKey(UriUtils.URI_PARAM_INCLUDE_DELETED)) {
+                options.add(QueryOption.INCLUDE_DELETED);
+            }
+
+            if (params.containsKey(ServiceDocument.FIELD_NAME_VERSION)) {
+                version = Long.parseLong(params.get(ServiceDocument.FIELD_NAME_VERSION));
+            }
+
+            selfLink = params.get(ServiceDocument.FIELD_NAME_SELF_LINK);
+            String fieldToExpand = params.get(UriUtils.URI_PARAM_ODATA_EXPAND);
+            if (fieldToExpand == null) {
+                fieldToExpand = params.get(UriUtils.URI_PARAM_ODATA_EXPAND_NO_DOLLAR_SIGN);
+            }
+            if (fieldToExpand != null
+                    && fieldToExpand
+                    .equals(ServiceDocumentQueryResult.FIELD_NAME_DOCUMENT_LINKS)) {
+                options.add(QueryOption.EXPAND_CONTENT);
+            }
         }
 
         if (selfLink == null) {
@@ -591,8 +1511,49 @@ public class LuceneDocumentIndexService extends StatelessService {
         }
 
         if (!selfLink.endsWith(UriUtils.URI_WILDCARD_CHAR)) {
+
+            // Enforce auth check for the returning document for remote GET requests.
+            // This is mainly for the direct client requests to the index-service such as
+            // "/core/document-index?documentSelfLink=...".
+            // Some other core services also perform remote GET (e.g.: NodeSelectorSynchronizationService),
+            // but they populate appropriate auth context such as system-user.
+            // For non-wildcard selfLink request, auth check is performed as part of queryIndex().
+            if (get.isRemote() && getHost().isAuthorizationEnabled()) {
+                get.nestCompletion((op, ex) -> {
+                    if (ex != null) {
+                        get.fail(ex);
+                        return;
+                    }
+
+                    if (get.getAuthorizationContext().isSystemUser() || !op.hasBody()) {
+                        // when there is no matching document, we cannot evaluate the auth, thus simply complete.
+                        get.complete();
+                        return;
+                    }
+
+                    // evaluate whether the matched document is authorized for the user
+                    QueryFilter queryFilter = get.getAuthorizationContext().getResourceQueryFilter(Action.GET);
+                    if (queryFilter == null) {
+                        // do not match anything
+                        queryFilter = QueryFilter.FALSE;
+                    }
+                    // This completion handler is called right after it retrieved the document from lucene and
+                    // deserialized it to its state type.
+                    // Since calling "op.getBody(ServiceDocument.class)" changes(down cast) the actual document object
+                    // to an instance of ServiceDocument, it will lose the additional data which might be required in
+                    // authorization filters; Therefore, here uses "op.getBodyRaw()" and just cast to ServiceDocument
+                    // which doesn't convert the document object.
+                    ServiceDocument doc = (ServiceDocument) op.getBodyRaw();
+                    if (!QueryFilterUtils.evaluate(queryFilter, doc, getHost())) {
+                        get.fail(Operation.STATUS_CODE_FORBIDDEN);
+                        return;
+                    }
+                    get.complete();
+                });
+            }
+
             // Most basic query is retrieving latest document at latest version for a specific link
-            queryIndexSingle(selfLink, options, get, version);
+            queryIndexSingle(selfLink, get, version);
             return;
         }
 
@@ -604,11 +1565,12 @@ public class LuceneDocumentIndexService extends StatelessService {
 
         ServiceDocumentQueryResult rsp = new ServiceDocumentQueryResult();
         rsp.documentLinks = new ArrayList<>();
-        if (queryIndex(null, get, selfLink, options, tq, null, null, resultLimit, 0, null, rsp)) {
+        if (queryIndex(null, get, selfLink, options, tq, null, resultLimit, 0, null, rsp,
+                null)) {
             return;
         }
 
-        if (targetIndex == ServiceOption.PERSISTENCE) {
+        if (serviceOption == ServiceOption.PERSISTENCE) {
             // specific index requested but no results, return empty response
             get.setBodyNoCloning(rsp).complete();
             return;
@@ -618,111 +1580,170 @@ public class LuceneDocumentIndexService extends StatelessService {
         queryServiceHost(selfLink + UriUtils.URI_WILDCARD_CHAR, options, get);
     }
 
+    /**
+     * retrieves the next available operation given the fairness scheme
+     */
+    private Operation pollQueryOperation() {
+        return this.queryQueue.poll();
+    }
+
+    private Operation pollUpdateOperation() {
+        return this.updateQueue.poll();
+    }
+
+    /**
+     * Queues operation in a multi-queue that uses the subject as the key per queue
+     */
+    private boolean offerQueryOperation(Operation op) {
+        String subject = getSubject(op);
+        return this.queryQueue.offer(subject, op);
+    }
+
+    private boolean offerUpdateOperation(Operation op) {
+        String subject = getSubject(op);
+        return this.updateQueue.offer(subject, op);
+    }
+
+    private String getSubject(Operation op) {
+
+        if (op.getAuthorizationContext() != null
+                && op.getAuthorizationContext().isSystemUser()) {
+            return SystemUserService.SELF_LINK;
+        }
+
+        if (getHost().isAuthorizationEnabled()) {
+            return op.getAuthorizationContext().getClaims().getSubject();
+        }
+
+        return GuestUserService.SELF_LINK;
+    }
+
     private boolean queryIndex(
             IndexSearcher s,
             Operation op,
             String selfLinkPrefix,
             EnumSet<QueryOption> options,
             Query tq,
-            Sort sort,
             LuceneQueryPage page,
             int count,
             long expiration,
             String indexLink,
-            ServiceDocumentQueryResult rsp) throws Throwable {
+            ServiceDocumentQueryResult rsp,
+            QuerySpecification qs) throws Exception {
         if (options == null) {
             options = EnumSet.noneOf(QueryOption.class);
         }
 
-        if (options.contains(QueryOption.COUNT) && options.contains(QueryOption.EXPAND_CONTENT)) {
-            op.fail(new IllegalArgumentException("COUNT can not be combined with EXPAND: %s"
-                    + options.toString()));
-            return true;
-        }
-
-        if (options.contains(QueryOption.EXPAND_CONTENT)) {
+        if (options.contains(QueryOption.EXPAND_CONTENT)
+                || options.contains(QueryOption.EXPAND_BINARY_CONTENT)
+                || options.contains(QueryOption.EXPAND_SELECTED_FIELDS)) {
             rsp.documents = new HashMap<>();
         }
 
         if (options.contains(QueryOption.COUNT)) {
             rsp.documentCount = 0L;
-            sort = null;
         } else {
             rsp.documentLinks = new ArrayList<>();
         }
 
         IndexWriter w = this.writer;
         if (w == null) {
-            op.fail(new CancellationException());
+            op.fail(new CancellationException("Index writer is null"));
             return true;
         }
 
-        if (sort == null) {
-            sort = this.versionSort;
+        Set<String> kindScope = null;
+
+        if (qs != null && qs.context != null) {
+            kindScope = qs.context.kindScope;
         }
 
         if (s == null) {
-            // If DO_NOT_REFRESH is set use the existing searcher.
-            s = this.searcher;
-            if (!options.contains(QueryOption.DO_NOT_REFRESH) || s == null) {
-                s = updateSearcher(selfLinkPrefix, count, w);
-            }
+            s = createOrRefreshSearcher(selfLinkPrefix, kindScope, count, w,
+                    options.contains(QueryOption.DO_NOT_REFRESH));
         }
 
-        tq = updateQuery(op, tq);
-
+        long queryStartTimeMicros = Utils.getNowMicrosUtc();
+        tq = updateQuery(op, qs, tq, queryStartTimeMicros, options);
         if (tq == null) {
             return false;
-        } else if (queryIndexWithWriter(op, options, tq, sort, page, count, expiration, indexLink,
-                rsp,
-                ServiceOption.PERSISTENCE, s)) {
-            // target index had results or request failed
-            return true;
         }
 
-        return false;
+        if (qs != null && qs.query != null && this.hasOption(ServiceOption.INSTRUMENTATION)) {
+            String queryStat = getQueryStatName(qs.query);
+            this.adjustStat(queryStat, 1);
+        }
+
+        ServiceDocumentQueryResult result;
+        if (options.contains(QueryOption.COUNT)) {
+            result = queryIndexCount(options, s, tq, rsp, qs, queryStartTimeMicros);
+        } else {
+            result = queryIndexPaginated(op, options, s, tq, page, count, expiration, indexLink,
+                    rsp, qs, queryStartTimeMicros);
+        }
+
+        result.documentOwner = getHost().getId();
+        if (!options.contains(QueryOption.COUNT) && result.documentLinks.isEmpty()) {
+            return false;
+        }
+        op.setBodyNoCloning(result).complete();
+        return true;
     }
 
-    private void queryIndexSingle(String selfLink, EnumSet<QueryOption> options, Operation op, Long version)
-            throws Throwable {
+    private void queryIndexSingle(String selfLink, Operation op, Long version)
+            throws Exception {
+        try {
+            ServiceDocument sd = getDocumentAtVersion(selfLink, version);
+            if (sd == null) {
+                op.complete();
+                return;
+            }
+            op.setBodyNoCloning(sd).complete();
+        } catch (CancellationException e) {
+            op.fail(e);
+        }
+    }
+
+    private ServiceDocument getDocumentAtVersion(String selfLink, Long version)
+            throws Exception {
         IndexWriter w = this.writer;
         if (w == null) {
-            op.fail(new CancellationException());
-            return;
+            throw new CancellationException("Index writer is null");
         }
 
-        IndexSearcher s = updateSearcher(selfLink, 1, w);
-        long start = Utils.getNowMicrosUtc();
-        TopDocs hits = searchByVersion(selfLink, s, version);
-        long end = Utils.getNowMicrosUtc();
-        if (hits.totalHits == 0) {
-            op.complete();
-            return;
-        }
+        IndexSearcher s = createOrRefreshSearcher(selfLink, null, 1, w, false);
+
+        long startNanos = System.nanoTime();
+        TopDocs hits = queryIndexForVersion(selfLink, s, version, null);
+        long durationNanos = System.nanoTime() - startNanos;
+        setTimeSeriesHistogramStat(STAT_NAME_QUERY_SINGLE_DURATION_MICROS,
+                AGGREGATION_TYPE_AVG_MAX, TimeUnit.NANOSECONDS.toMicros(durationNanos));
 
         if (hasOption(ServiceOption.INSTRUMENTATION)) {
-            ServiceStat st = getHistogramStat(STAT_NAME_QUERY_SINGLE_DURATION_MICROS);
-            setStat(st, end - start);
+            String factoryLink = UriUtils.getParentPath(selfLink);
+            if (factoryLink != null) {
+                String statKey = String.format(STAT_NAME_SINGLE_QUERY_BY_FACTORY_COUNT_FORMAT, factoryLink);
+                adjustStat(statKey, 1);
+            }
+        }
+        if (hits.totalHits == 0) {
+            return null;
         }
 
-        Document doc = s.getIndexReader().document(hits.scoreDocs[0].doc,
-                this.fieldsToLoadWithExpand);
+        DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
+        loadDoc(s, visitor, hits.scoreDocs[0].doc, this.fieldsToLoadWithExpand);
 
-        if (checkAndDeleteExpiratedDocuments(selfLink, s, hits.scoreDocs[0].doc, doc,
-                Utils.getNowMicrosUtc())) {
-            op.complete();
-            return;
+        boolean hasExpired = false;
+
+        Long expiration = visitor.documentExpirationTimeMicros;
+        if (expiration != null) {
+            hasExpired = expiration <= Utils.getSystemNowMicrosUtc();
         }
 
-        BytesRef binaryState = doc.getBinaryValue(LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE);
-
-        if (binaryState != null) {
-            ServiceDocument state = (ServiceDocument) Utils.fromDocumentBytes(binaryState.bytes,
-                    binaryState.offset,
-                    binaryState.length);
-            op.setBodyNoCloning(state);
+        if (hasExpired) {
+            return null;
         }
-        op.complete();
+        return getStateFromLuceneDocument(visitor, selfLink);
     }
 
     /**
@@ -744,18 +1765,22 @@ public class LuceneDocumentIndexService extends StatelessService {
      * If given version is null then function returns the latest version.
      * And if given version is not found then no document is returned.
      */
-    private TopDocs searchByVersion(String selfLink, IndexSearcher s, Long version) throws IOException {
+    private TopDocs queryIndexForVersion(String selfLink, IndexSearcher s, Long version, Long documentsUpdatedBeforeInMicros)
+            throws IOException {
         Query tqSelfLink = new TermQuery(new Term(ServiceDocument.FIELD_NAME_SELF_LINK, selfLink));
 
         BooleanQuery.Builder builder = new BooleanQuery.Builder();
         builder.add(tqSelfLink, Occur.MUST);
 
-        if (version != null) {
-            NumericRangeQuery<Long> versionQuery = NumericRangeQuery.newLongRange(
-                    ServiceDocument.FIELD_NAME_VERSION, version, version,
-                    true,
-                    true);
-
+        // when QueryOption.TIME_SNAPSHOT  is enabled (documentsUpdatedBeforeInMicros i.e. QuerySpecification.timeSnapshotBoundaryMicros is present)
+        // perform query to find a document with link updated before supplied time.
+        if (documentsUpdatedBeforeInMicros != null) {
+            Query documentsUpdatedBeforeInMicrosQuery = LongPoint.newRangeQuery(
+                    ServiceDocument.FIELD_NAME_UPDATE_TIME_MICROS, 0, documentsUpdatedBeforeInMicros);
+            builder.add(documentsUpdatedBeforeInMicrosQuery, Occur.MUST);
+        } else if (version != null) {
+            Query versionQuery = LongPoint.newRangeQuery(
+                    ServiceDocument.FIELD_NAME_VERSION, version, version);
             builder.add(versionQuery, Occur.MUST);
         }
 
@@ -774,61 +1799,49 @@ public class LuceneDocumentIndexService extends StatelessService {
         getHost().queryServiceUris(selfLink, op);
     }
 
-    boolean queryIndexWithWriter(Operation op,
-            EnumSet<QueryOption> options,
-            Query tq,
-            Sort sort,
-            LuceneQueryPage page,
-            int count,
-            long expiration,
-            String indexLink,
-            ServiceDocumentQueryResult rsp,
-            ServiceOption targetIndex,
-            IndexSearcher s) throws Throwable {
-        Object resultBody;
-
-        resultBody = queryIndex(op, targetIndex, options, s, tq, sort, page, count, expiration,
-                indexLink, rsp);
-        if (count == 1 && resultBody instanceof String) {
-            op.setBodyNoCloning(resultBody).complete();
-            return true;
-        }
-
-        ServiceDocumentQueryResult result = (ServiceDocumentQueryResult) resultBody;
-        if (result != null) {
-            result.documentOwner = getHost().getId();
-
-            if (!options.contains(QueryOption.COUNT) && result.documentLinks.isEmpty()) {
-                return false;
-            }
-
-            op.setBodyNoCloning(result).complete();
-            return true;
-        }
-
-        return false;
-    }
-
     /**
-     * Augment the query argument with the resource group query specified
-     * by the operation's authorization context.
+     * This routine modifies a user-specified query to include clauses which
+     * apply the resource group query specified by the operation's authorization
+     * context and which exclude expired documents.
      *
-     * If the operation was executed by the system user, the query argument
-     * is returned unmodified.
+     * If the operation was executed by the system user, no resource group query
+     * is applied.
      *
      * If no query needs to be executed return null
      *
      * @return Augmented query.
      */
-    private Query updateQuery(Operation op, Query tq) {
-        Query rq = null;
-        AuthorizationContext ctx = op.getAuthorizationContext();
+    private Query updateQuery(Operation op, QuerySpecification qs, Query tq, long now,
+            EnumSet<QueryOption> queryOptions) {
+        Query expirationClause = LongPoint.newRangeQuery(
+                ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS, 1, now);
+        BooleanQuery.Builder builder = new BooleanQuery.Builder()
+                .add(expirationClause, Occur.MUST_NOT)
+                .add(tq, Occur.FILTER);
 
-        // Allow operation if isAuthorizationEnabled is set to false
-        if (!this.getHost().isAuthorizationEnabled()) {
-            return tq;
+        if (queryOptions.contains(QueryOption.INDEXED_METADATA)) {
+            if (!queryOptions.contains(QueryOption.INCLUDE_ALL_VERSIONS)
+                    && !queryOptions.contains(QueryOption.TIME_SNAPSHOT)) {
+                Query currentClause = NumericDocValuesField.newExactQuery(
+                        LuceneIndexDocumentHelper.FIELD_NAME_INDEXING_METADATA_VALUE_TOMBSTONE_TIME,
+                        LuceneIndexDocumentHelper.ACTIVE_DOCUMENT_TOMBSTONE_TIME);
+                builder.add(currentClause, Occur.MUST);
+            }
+            // There is a bug in lucene where sort and numeric doc values don't play well
+            // apply the optimization to limit the resultset only when there is no sort specified
+            if ((qs != null && qs.sortTerm == null) &&
+                    queryOptions.contains(QueryOption.TIME_SNAPSHOT)) {
+                Query tombstoneClause = NumericDocValuesField.newRangeQuery(
+                        LuceneIndexDocumentHelper.FIELD_NAME_INDEXING_METADATA_VALUE_TOMBSTONE_TIME,
+                        qs.timeSnapshotBoundaryMicros, LuceneIndexDocumentHelper.ACTIVE_DOCUMENT_TOMBSTONE_TIME);
+                builder.add(tombstoneClause, Occur.MUST);
+            }
+        }
+        if (!getHost().isAuthorizationEnabled()) {
+            return builder.build();
         }
 
+        AuthorizationContext ctx = op.getAuthorizationContext();
         if (ctx == null) {
             // Don't allow operation if no authorization context and auth is enabled
             return null;
@@ -836,70 +1849,300 @@ public class LuceneDocumentIndexService extends StatelessService {
 
         // Allow unconditionally if this is the system user
         if (ctx.isSystemUser()) {
-            return tq;
+            return builder.build();
         }
 
         // If the resource query in the authorization context is unspecified,
         // use a Lucene query that doesn't return any documents so that every
         // result will be empty.
-        if (ctx.getResourceQuery(Action.GET) == null) {
+        QueryTask.Query resourceQuery = ctx.getResourceQuery(Action.GET);
+        Query rq = null;
+        if (resourceQuery == null) {
             rq = new MatchNoDocsQuery();
         } else {
-            rq = LuceneQueryConverter.convertToLuceneQuery(ctx.getResourceQuery(Action.GET));
+            rq = LuceneQueryConverter.convert(resourceQuery, null);
         }
 
-        BooleanQuery.Builder builder = new BooleanQuery.Builder()
-                .add(rq, Occur.FILTER)
-                .add(tq, Occur.FILTER);
+        builder.add(rq, Occur.FILTER);
         return builder.build();
     }
 
-    private Object queryIndex(Operation op, ServiceOption targetIndex,
+    private void handleGroupByQueryTaskPatch(Operation op, QueryTask task) throws IOException {
+        QuerySpecification qs = task.querySpec;
+        IndexSearcher s = (IndexSearcher) qs.context.nativeSearcher;
+        LuceneQueryPage page = (LuceneQueryPage) qs.context.nativePage;
+        Query tq = (Query) qs.context.nativeQuery;
+        Sort sort = (Sort) qs.context.nativeSort;
+        if (sort == null && qs.sortTerm != null) {
+            sort = LuceneQueryConverter.convertToLuceneSort(qs, false);
+        }
+
+        Sort groupSort = null;
+        if (qs.groupSortTerm != null) {
+            groupSort = LuceneQueryConverter.convertToLuceneSort(qs, true);
+        }
+
+        GroupingSearch groupingSearch;
+        if (qs.groupByTerm.propertyType == ServiceDocumentDescription.TypeName.LONG ||
+                qs.groupByTerm.propertyType == ServiceDocumentDescription.TypeName.DOUBLE) {
+            groupingSearch = new GroupingSearch(qs.groupByTerm.propertyName + GROUP_BY_PROPERTY_NAME_SUFFIX);
+        } else {
+            groupingSearch = new GroupingSearch(
+                    LuceneIndexDocumentHelper.createSortFieldPropertyName(qs.groupByTerm.propertyName));
+        }
+
+        groupingSearch.setGroupSort(groupSort);
+        groupingSearch.setSortWithinGroup(sort);
+
+        adjustTimeSeriesStat(STAT_NAME_GROUP_QUERY_COUNT, AGGREGATION_TYPE_SUM, 1);
+
+        int groupOffset = page != null ? page.groupOffset : 0;
+        int groupLimit = qs.groupResultLimit != null ? qs.groupResultLimit : 10000;
+
+        Set<String> kindScope = qs.context.kindScope;
+
+        if (s == null && qs.groupResultLimit != null) {
+            // Since expiration of QueryPageService and index-searcher uses different mechanism, to guarantee
+            // that index-searcher still exists when QueryPageService expired, add some delay for searcher
+            // expiration time.
+            long expiration = task.documentExpirationTimeMicros + DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY;
+            s = createOrUpdatePaginatedQuerySearcher(expiration, this.writer, kindScope, qs.options);
+        }
+
+        if (s == null) {
+            s = createOrRefreshSearcher(null, kindScope, Integer.MAX_VALUE, this.writer,
+                    qs.options.contains(QueryOption.DO_NOT_REFRESH));
+        }
+
+        ServiceDocumentQueryResult rsp = new ServiceDocumentQueryResult();
+        rsp.nextPageLinksPerGroup = new TreeMap<>();
+
+        // perform the actual search
+        long startNanos = System.nanoTime();
+        TopGroups<?> groups = groupingSearch.search(s, tq, groupOffset, groupLimit);
+        long durationNanos = System.nanoTime() - startNanos;
+        setTimeSeriesHistogramStat(STAT_NAME_GROUP_QUERY_DURATION_MICROS, AGGREGATION_TYPE_AVG_MAX,
+                TimeUnit.NANOSECONDS.toMicros(durationNanos));
+
+        // generate page links for each grouped result
+        for (GroupDocs<?> groupDocs : groups.groups) {
+            if (groupDocs.totalHits == 0) {
+                continue;
+            }
+            QueryTask.Query perGroupQuery = Utils.clone(qs.query);
+
+            String groupValue;
+
+            // groupValue can be ANY OF ( GROUPS, null )
+            // The "null" group signifies documents that do not have the property.
+            if (groupDocs.groupValue != null) {
+                groupValue = ((BytesRef) groupDocs.groupValue).utf8ToString();
+            } else {
+                groupValue = DOCUMENTS_WITHOUT_RESULTS;
+            }
+
+            // we need to modify the query to include a top level clause that restricts scope
+            // to documents with the groupBy field and value
+            QueryTask.Query clause = new QueryTask.Query()
+                    .setTermPropertyName(qs.groupByTerm.propertyName)
+                    .setTermMatchType(MatchType.TERM);
+            clause.occurance = QueryTask.Query.Occurance.MUST_OCCUR;
+
+            if (qs.groupByTerm.propertyType == ServiceDocumentDescription.TypeName.LONG
+                    && groupDocs.groupValue != null) {
+                clause.setNumericRange(QueryTask.NumericRange.createEqualRange(Long.parseLong(groupValue)));
+            } else if (qs.groupByTerm.propertyType == ServiceDocumentDescription.TypeName.DOUBLE
+                    && groupDocs.groupValue != null) {
+                clause.setNumericRange(QueryTask.NumericRange.createEqualRange(Double.parseDouble(groupValue)));
+            } else {
+                clause.setTermMatchValue(groupValue);
+            }
+
+            if (perGroupQuery.booleanClauses == null) {
+                QueryTask.Query topLevelClause = perGroupQuery;
+                perGroupQuery.addBooleanClause(topLevelClause);
+            }
+
+            perGroupQuery.addBooleanClause(clause);
+            Query lucenePerGroupQuery = LuceneQueryConverter.convert(perGroupQuery, qs.context);
+
+            // for each group generate a query page link
+            String pageLink = createNextPage(op, s, qs, lucenePerGroupQuery, sort,
+                    null, 0, null,
+                    task.documentExpirationTimeMicros, task.indexLink, false);
+
+            rsp.nextPageLinksPerGroup.put(groupValue, pageLink);
+        }
+
+        if (qs.groupResultLimit != null && groups.groups.length >= groupLimit) {
+            // check if we need to generate a next page for the next set of group results
+            groups = groupingSearch.search(s, tq, groupLimit + groupOffset, groupLimit);
+            if (groups.totalGroupedHitCount > 0) {
+                rsp.nextPageLink = createNextPage(op, s, qs, tq, sort,
+                        null, 0, groupLimit + groupOffset,
+                        task.documentExpirationTimeMicros, task.indexLink, page != null);
+            }
+        }
+
+        op.setBodyNoCloning(rsp).complete();
+    }
+
+    private ServiceDocumentQueryResult queryIndexCount(
+            EnumSet<QueryOption> queryOptions,
+            IndexSearcher searcher,
+            Query termQuery,
+            ServiceDocumentQueryResult response,
+            QuerySpecification querySpec,
+            long queryStartTimeMicros)
+            throws Exception {
+
+        if (queryOptions.contains(QueryOption.INCLUDE_ALL_VERSIONS)) {
+            // Special handling for queries which include all versions in order to avoid allocating
+            // a large, unnecessary ScoreDocs array.
+            response.documentCount = (long) searcher.count(termQuery);
+            long queryTimeMicros = Utils.getNowMicrosUtc() - queryStartTimeMicros;
+            response.queryTimeMicros = queryTimeMicros;
+            setTimeSeriesHistogramStat(STAT_NAME_QUERY_ALL_VERSIONS_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX, queryTimeMicros);
+            return response;
+        }
+
+        response.queryTimeMicros = 0L;
+        TopDocs results;
+        ScoreDoc after = null;
+        long start = queryStartTimeMicros;
+        int resultLimit = MIN_QUERY_RESULT_LIMIT;
+
+        do {
+            results = searcher.searchAfter(after, termQuery, resultLimit);
+            long queryEndTimeMicros = Utils.getNowMicrosUtc();
+            long luceneQueryDurationMicros = queryEndTimeMicros - start;
+            response.queryTimeMicros = queryEndTimeMicros - queryStartTimeMicros;
+
+            if (results == null || results.scoreDocs == null || results.scoreDocs.length == 0) {
+                break;
+            }
+
+            setTimeSeriesHistogramStat(STAT_NAME_QUERY_ALL_VERSIONS_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX, luceneQueryDurationMicros);
+
+            after = processQueryResults(querySpec, queryOptions, resultLimit, searcher,
+                    response,
+                    results.scoreDocs, start, false);
+
+            long now = Utils.getNowMicrosUtc();
+            setTimeSeriesHistogramStat(STAT_NAME_RESULT_PROCESSING_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX, now - queryEndTimeMicros);
+
+            start = now;
+            // grow the result limit
+            resultLimit = Math.min(resultLimit * 2, queryResultLimit);
+        } while (true);
+
+        response.documentLinks.clear();
+        return response;
+    }
+
+    private ServiceDocumentQueryResult queryIndexPaginated(Operation op,
             EnumSet<QueryOption> options,
             IndexSearcher s,
             Query tq,
-            Sort sort,
             LuceneQueryPage page,
             int count,
             long expiration,
             String indexLink,
-            ServiceDocumentQueryResult rsp) throws Throwable {
+            ServiceDocumentQueryResult rsp,
+            QuerySpecification qs,
+            long queryStartTimeMicros) throws Exception {
         ScoreDoc[] hits;
         ScoreDoc after = null;
-        boolean isPaginatedQuery = count != Integer.MAX_VALUE
+        boolean hasExplicitLimit = count != Integer.MAX_VALUE;
+        boolean isPaginatedQuery = hasExplicitLimit
                 && !options.contains(QueryOption.TOP_RESULTS);
         boolean hasPage = page != null;
         boolean shouldProcessResults = true;
+        boolean useDirectSearch = options.contains(QueryOption.TOP_RESULTS)
+                && options.contains(QueryOption.INCLUDE_ALL_VERSIONS);
         int resultLimit = count;
+        int hitCount;
+
+        if (isPaginatedQuery && !hasPage) {
+            // QueryTask.resultLimit was set, but we don't have a page param yet, which means this
+            // is the initial POST to create the queryTask. Since the initial query results will be
+            // discarded in this case, just set the limit to 1 and do not process results.
+            resultLimit = 1;
+            hitCount = 1;
+            shouldProcessResults = false;
+            rsp.documentCount = 1L;
+        } else if (!hasExplicitLimit) {
+            // The query does not have an explicit result limit set. We still specify an implicit
+            // limit in order to avoid out of memory conditions, since Lucene will use the limit in
+            // order to allocate a results array; however, if the number of hits returned by Lucene
+            // is higher than the default limit, we will fail the query later.
+            hitCount = queryResultLimit;
+        } else if (!options.contains(QueryOption.INCLUDE_ALL_VERSIONS)) {
+            // The query has an explicit result limit set, but the value is specified in terms of
+            // the number of desired results in the QueryTask.
+            // Assume twice as much data fill be fetched to account for the discrepancy.
+            // The do/while loop below will correct this estimate at every iteration
+            hitCount = Math.min(2 * resultLimit, queryPageResultLimit);
+        } else {
+            hitCount = resultLimit;
+        }
 
         if (hasPage) {
             // For example, via GET of QueryTask.nextPageLink
             after = page.after;
             rsp.prevPageLink = page.previousPageLink;
-        } else if (isPaginatedQuery) {
-            // QueryTask.resultLimit was set, but we don't have a page param yet,
-            // which means this is the initial POST to create the QueryTask.
-            // Since we are going to throw away TopDocs.hits in this case,
-            // just set the limit to 1 and do not process the results.
-            resultLimit = 1;
-            shouldProcessResults = false;
-            rsp.documentCount = 1L;
+        }
+
+        Sort sort = this.versionSort;
+        if (qs != null && qs.sortTerm != null) {
+            // see if query is part of a task and already has a cached sort
+            if (qs.context != null) {
+                sort = (Sort) qs.context.nativeSort;
+            }
+
+            if (sort == null) {
+                sort = LuceneQueryConverter.convertToLuceneSort(qs, false);
+            }
         }
 
         TopDocs results = null;
+        int queryCount = 0;
         rsp.queryTimeMicros = 0L;
-        long queryStartTimeMicros = Utils.getNowMicrosUtc();
         long start = queryStartTimeMicros;
+        int offset = (qs == null || qs.offset == null) ? 0 : qs.offset;
 
         do {
-            if (sort == null) {
-                results = s.searchAfter(after, tq, count);
+            // Special-case handling of single-version documents to use search() instead of
+            // searchAfter(). This will prevent Lucene from holding the full result set in memory.
+            if (useDirectSearch) {
+                if (sort == null) {
+                    results = s.search(tq, hitCount);
+                } else {
+                    results = s.search(tq, hitCount, sort, false, false);
+                }
             } else {
-                results = s.searchAfter(after, tq, count, sort, false, false);
+                if (sort == null) {
+                    results = s.searchAfter(after, tq, hitCount);
+                } else {
+                    results = s.searchAfter(after, tq, hitCount, sort, false, false);
+                }
             }
-            long end = Utils.getNowMicrosUtc();
+
             if (results == null) {
-                return null;
+                return rsp;
+            }
+
+            queryCount++;
+            long end = Utils.getNowMicrosUtc();
+
+            if (!hasExplicitLimit && !hasPage && !isPaginatedQuery
+                    && results.totalHits > hitCount) {
+                throw new IllegalStateException(
+                        "Query returned large number of results, please specify a resultLimit. Results:"
+                                + results.totalHits + ", QuerySpec: " + Utils.toJson(qs));
             }
 
             hits = results.scoreDocs;
@@ -910,24 +2153,41 @@ public class LuceneDocumentIndexService extends StatelessService {
             rsp.queryTimeMicros += queryTime;
             ScoreDoc bottom = null;
             if (shouldProcessResults) {
-                start = Utils.getNowMicrosUtc();
-                bottom = processQueryResults(targetIndex, options, count, s, rsp, hits,
-                        queryStartTimeMicros);
+                start = end;
+                bottom = processQueryResults(qs, options, count, s, rsp, hits,
+                        queryStartTimeMicros, true);
                 end = Utils.getNowMicrosUtc();
+
+                // remove docs for offset
+                int size = rsp.documentLinks.size();
+                if (size < offset) {
+                    rsp.documentLinks.clear();
+                    rsp.documentCount = 0L;
+                    if (rsp.documents != null) {
+                        rsp.documents.clear();
+                    }
+                    offset -= size;
+                } else {
+                    List<String> links = rsp.documentLinks.subList(0, offset);
+                    if (rsp.documents != null) {
+                        links.forEach(rsp.documents::remove);
+                    }
+                    rsp.documentCount -= links.size();
+                    links.clear();
+                    offset = 0;
+                }
 
                 if (hasOption(ServiceOption.INSTRUMENTATION)) {
                     String statName = options.contains(QueryOption.INCLUDE_ALL_VERSIONS)
                             ? STAT_NAME_QUERY_ALL_VERSIONS_DURATION_MICROS
                             : STAT_NAME_QUERY_DURATION_MICROS;
-                    ServiceStat st = getHistogramStat(statName);
-                    setStat(st, queryTime);
-
-                    st = getHistogramStat(STAT_NAME_RESULT_PROCESSING_DURATION_MICROS);
-                    setStat(st, end - start);
+                    setTimeSeriesHistogramStat(statName, AGGREGATION_TYPE_AVG_MAX, queryTime);
+                    setTimeSeriesHistogramStat(STAT_NAME_RESULT_PROCESSING_DURATION_MICROS,
+                            AGGREGATION_TYPE_AVG_MAX, end - start);
                 }
             }
 
-            if (!isPaginatedQuery && !options.contains(QueryOption.TOP_RESULTS)) {
+            if (count == Integer.MAX_VALUE || useDirectSearch) {
                 // single pass
                 break;
             }
@@ -935,7 +2195,6 @@ public class LuceneDocumentIndexService extends StatelessService {
             if (hits.length == 0) {
                 break;
             }
-
 
             if (isPaginatedQuery) {
                 if (!hasPage) {
@@ -945,64 +2204,162 @@ public class LuceneDocumentIndexService extends StatelessService {
                 if (!hasPage || rsp.documentLinks.size() >= count
                         || hits.length < resultLimit) {
                     // query had less results then per page limit or page is full of results
-                    expiration += queryTime;
-                    rsp.nextPageLink = createNextPage(op, s, options, tq, sort, bottom, count,
-                            expiration,
-                            indexLink,
-                            hasPage);
+
+                    boolean createNextPageLink = true;
+                    if (hasPage) {
+                        int numOfHits = hitCount + offset;
+                        createNextPageLink = checkNextPageHasEntry(bottom, options, s,
+                                tq, sort, numOfHits, qs, queryStartTimeMicros);
+                    }
+
+                    if (createNextPageLink) {
+                        rsp.nextPageLink = createNextPage(op, s, qs, tq, sort, bottom,
+                                offset, null, expiration, indexLink, hasPage);
+                    }
                     break;
                 }
             }
 
             after = bottom;
             resultLimit = count - rsp.documentLinks.size();
-        } while (true && resultLimit > 0);
+
+            // on the next iteration get twice as much data as in this iteration
+            // but never get more than queryResultLimit at once.
+            hitCount = Math.min(queryPageResultLimit, 2 * hitCount);
+        } while (resultLimit > 0);
+
+        if (hasOption(ServiceOption.INSTRUMENTATION)) {
+            ServiceStat st = ServiceStatUtils.getOrCreateHistogramStat(this, STAT_NAME_ITERATIONS_PER_QUERY);
+            setStat(st, queryCount);
+        }
 
         return rsp;
     }
 
-    private String createNextPage(Operation op, IndexSearcher s, EnumSet<QueryOption> options,
+    /**
+     * Checks next page exists or not.
+     *
+     * If there is a valid entry in searchAfter result, this returns true.
+     * If searchAfter result is empty or entries are all invalid(expired, etc), this returns false.
+     *
+     * For example, let's say there are 5 docs. doc=1,2,5 are valid and doc=3,4 are expired(invalid).
+     *
+     * When limit=2, the first page shows doc=1,2. In this logic, searchAfter will first fetch
+     * doc=3,4 but they are invalid(filtered out in `processQueryResults`).
+     * Next iteration will hit doc=5 and it is a valid entry. Therefore, it returns true.
+     *
+     * If doc=1,2 are valid and doc=3,4,5 are invalid, then searchAfter will hit doc=3,4 and
+     * doc=5. However, all entries are invalid. This returns false indicating there is no next page.
+     */
+    private boolean checkNextPageHasEntry(ScoreDoc after,
+            EnumSet<QueryOption> options,
+            IndexSearcher s,
+            Query tq,
+            Sort sort,
+            int count,
+            QuerySpecification qs,
+            long queryStartTimeMicros) throws Exception {
+
+        boolean hasValidNextPageEntry = false;
+
+        // Iterate searchAfter until it finds a *valid* entry.
+        // If loop reaches to the end and no valid entries found, then current page is the last page.
+        while (after != null) {
+            // fetch next page
+            TopDocs nextPageResults;
+            if (sort == null) {
+                nextPageResults = s.searchAfter(after, tq, count);
+            } else {
+                nextPageResults = s.searchAfter(after, tq, count, sort, false, false);
+            }
+            if (nextPageResults == null) {
+                break;
+            }
+
+            ScoreDoc[] hits = nextPageResults.scoreDocs;
+            if (hits.length == 0) {
+                // reached to the end
+                break;
+            }
+
+            ServiceDocumentQueryResult rspForNextPage = new ServiceDocumentQueryResult();
+            rspForNextPage.documents = new HashMap<>();
+            // use resultLimit=1 as even one found result means there has to be a next page
+            after = processQueryResults(qs, options, 1, s, rspForNextPage, hits,
+                    queryStartTimeMicros, false);
+
+            if (rspForNextPage.documentCount > 0) {
+                hasValidNextPageEntry = true;
+                break;
+            }
+        }
+
+        return hasValidNextPageEntry;
+    }
+
+    /**
+     * Starts a {@code QueryPageService} to track a partial search result set, associated with a
+     * index searcher and search pointers. The page can be used for both grouped queries or
+     * document queries
+     */
+    private String createNextPage(Operation op, IndexSearcher s, QuerySpecification qs,
             Query tq,
             Sort sort,
             ScoreDoc after,
-            int count,
+            int offset,
+            Integer groupOffset,
             long expiration,
             String indexLink,
             boolean hasPage) {
 
-        URI u = UriUtils.buildUri(getHost(), UriUtils.buildUriPath(
-                ServiceUriPaths.CORE,
-                "query-page",
-                Utils.getNowMicrosUtc() + ""));
+        String nextPageId = Utils.getNowMicrosUtc() + "";
+        URI u = UriUtils.buildUri(getHost(), UriUtils.buildUriPath(ServiceUriPaths.CORE_QUERY_PAGE,
+                nextPageId));
 
         // the page link must point to this node, since the index searcher and results have been
-        // computed locally. Transform the link to a forwarder link, which will transparently
-        // forward requests to this node
-        URI forwarderUri = UriUtils.buildForwardToPeerUri(u, getHost().getId(),
-                ServiceUriPaths.DEFAULT_NODE_SELECTOR, EnumSet.noneOf(ServiceOption.class));
+        // computed locally. Transform the link to a query page forwarder link, which will
+        // transparently forward requests to the current node.
+
+        URI forwarderUri = UriUtils.buildForwardToQueryPageUri(u, getHost().getId());
         String nextLink = forwarderUri.getPath() + UriUtils.URI_QUERY_CHAR
                 + forwarderUri.getQuery();
 
-        URI forwarderUriOfPrevLinkForNewPage = UriUtils.buildForwardToPeerUri(op.getReferer(),
-                getHost().getId(),
-                ServiceUriPaths.DEFAULT_NODE_SELECTOR, EnumSet.noneOf(ServiceOption.class));
-        String prevLinkForNewPage = forwarderUriOfPrevLinkForNewPage.getPath()
-                + UriUtils.URI_QUERY_CHAR + forwarderUriOfPrevLinkForNewPage.getQuery();
+        // Compute previous page link. When FORWARD_ONLY option is specified, do not create previous page link.
+        String prevLinkForNewPage = null;
+        boolean isForwardOnly = qs.options.contains(QueryOption.FORWARD_ONLY);
+        if (!isForwardOnly) {
+            URI forwarderUriOfPrevLinkForNewPage = UriUtils.buildForwardToQueryPageUri(op.getReferer(),
+                    getHost().getId());
+            prevLinkForNewPage = forwarderUriOfPrevLinkForNewPage.getPath()
+                    + UriUtils.URI_QUERY_CHAR + forwarderUriOfPrevLinkForNewPage.getQuery();
+        }
 
         // Requests to core/query-page are forwarded to document-index (this service) and
-        // referer of that forwarded request is set to original query-page request.
+        // referrer of that forwarded request is set to original query-page request.
         // This method is called when query-page wants to create new page for a paginated query.
         // If a new page is going to be created then it is safe to use query-page link
-        // from referer as previous page link of this new page being created.
-        LuceneQueryPage page = new LuceneQueryPage(hasPage ? prevLinkForNewPage : null, after);
+        // from referrer as previous page link of this new page being created.
+        LuceneQueryPage page = null;
+        if (after != null || groupOffset == null) {
+            // page for documents
+            page = new LuceneQueryPage(hasPage ? prevLinkForNewPage : null, after);
+        } else {
+            // page for group results
+            page = new LuceneQueryPage(hasPage ? prevLinkForNewPage : null, groupOffset);
+        }
 
         QuerySpecification spec = new QuerySpecification();
-        spec.options = options;
+        qs.copyTo(spec);
+
+        if (groupOffset == null) {
+            spec.options.remove(QueryOption.GROUP_BY);
+        }
+
+        spec.offset = offset;
         spec.context.nativeQuery = tq;
         spec.context.nativePage = page;
         spec.context.nativeSearcher = s;
         spec.context.nativeSort = sort;
-        spec.resultLimit = count;
 
         ServiceDocument body = new ServiceDocument();
         body.documentSelfLink = u.getPath();
@@ -1026,132 +2383,372 @@ public class LuceneDocumentIndexService extends StatelessService {
             setAuthorizationContext(startPost, ctx);
         }
 
-        getHost().startService(startPost, new LuceneQueryPageService(spec, indexLink));
+        getHost().startService(startPost, new QueryPageService(spec, indexLink));
         return nextLink;
     }
 
-    private ScoreDoc processQueryResults(ServiceOption targetIndex, EnumSet<QueryOption> options,
+    private ScoreDoc processQueryResults(QuerySpecification qs, EnumSet<QueryOption> options,
             int resultLimit, IndexSearcher s, ServiceDocumentQueryResult rsp, ScoreDoc[] hits,
-            long queryStartTimeMicros) throws Throwable {
+            long queryStartTimeMicros,
+            boolean populateResponse) throws Exception {
 
         ScoreDoc lastDocVisited = null;
         Set<String> fieldsToLoad = this.fieldsToLoadNoExpand;
-        if (options.contains(QueryOption.EXPAND_CONTENT)) {
+        if (populateResponse && (options.contains(QueryOption.EXPAND_CONTENT)
+                || options.contains(QueryOption.OWNER_SELECTION)
+                || options.contains(QueryOption.EXPAND_BINARY_CONTENT)
+                || options.contains(QueryOption.EXPAND_SELECTED_FIELDS))) {
             fieldsToLoad = this.fieldsToLoadWithExpand;
+        }
+
+        if (populateResponse && options.contains(QueryOption.SELECT_LINKS)) {
+            fieldsToLoad = new HashSet<>(fieldsToLoad);
+            for (QueryTask.QueryTerm link : qs.linkTerms) {
+                fieldsToLoad.add(link.propertyName);
+            }
         }
 
         // Keep duplicates out
         Set<String> uniques = new LinkedHashSet<>(rsp.documentLinks);
         final boolean hasCountOption = options.contains(QueryOption.COUNT);
+        boolean hasIncludeAllVersionsOption = options.contains(QueryOption.INCLUDE_ALL_VERSIONS);
+        Set<String> linkWhiteList = null;
+        long documentsUpdatedBefore = -1;
 
-        Map<String, Long> latestVersions = new HashMap<>();
+        // will contain the links for which post processing should to be skipped
+        // added to support TIME_SNAPSHOT, can be extended in future to represent qs.context.documentLinkBlackList
+        Set<String> linkBlackList = options.contains(QueryOption.TIME_SNAPSHOT)
+                ? Collections.emptySet() : null;
+        if (qs != null) {
+            if (qs.context != null && qs.context.documentLinkWhiteList != null) {
+                linkWhiteList = qs.context.documentLinkWhiteList;
+            }
+            if (qs.timeSnapshotBoundaryMicros != null) {
+                documentsUpdatedBefore = qs.timeSnapshotBoundaryMicros;
+            }
+        }
+
+        long searcherUpdateTime = getSearcherUpdateTime(s, queryStartTimeMicros);
+        Map<String, Long> latestVersionPerLink = new HashMap<>();
+
+        DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
         for (ScoreDoc sd : hits) {
-            if (uniques.size() >= resultLimit) {
+            if (!hasCountOption && uniques.size() >= resultLimit) {
                 break;
             }
 
             lastDocVisited = sd;
-            Document d = s.getIndexReader().document(sd.doc, fieldsToLoad);
-            String link = d.get(ServiceDocument.FIELD_NAME_SELF_LINK);
-            IndexableField versionField = d.getField(ServiceDocument.FIELD_NAME_VERSION);
-            Long documentVersion = versionField.numericValue().longValue();
+            loadDoc(s, visitor, sd.doc, fieldsToLoad);
+            String link = visitor.documentSelfLink;
+            String originalLink = link;
 
-            // We first determine what is the latest document version.
-            // We then use the latest version to determine if the current document result is relevant.
-            Long latestVersion = latestVersions.get(link);
-            if (latestVersion == null) {
-                latestVersion = getLatestVersion(s, link);
-                latestVersions.put(link, latestVersion);
-            }
-
-            boolean isDeleted = Action.DELETE.toString().equals(d
-                    .get(ServiceDocument.FIELD_NAME_UPDATE_ACTION));
-
-            if (isDeleted && !options.contains(QueryOption.INCLUDE_DELETED)) {
-                // ignore a document if its marked deleted and it has the latest version
-                if (documentVersion >= latestVersion) {
-                    uniques.remove(link);
-                    if (rsp.documents != null) {
-                        rsp.documents.remove(link);
-                    }
-                }
+            // ignore results not in supplied white list
+            // and also those are in blacklisted links
+            if ((linkWhiteList != null && !linkWhiteList.contains(link))
+                    || (linkBlackList != null && linkBlackList.contains(originalLink))) {
                 continue;
             }
 
-            if (!options.contains(QueryOption.INCLUDE_ALL_VERSIONS)) {
+            long documentVersion = visitor.documentVersion;
+
+            Long latestVersion = latestVersionPerLink.get(originalLink);
+
+            if (hasIncludeAllVersionsOption) {
+                // Decorate link with version. If a document is marked deleted, at any version,
+                // we will include it in the results
+                link = UriUtils.buildPathWithVersion(link, documentVersion);
+            } else {
+                // We first determine what is the latest document version.
+                // We then use the latest version to determine if the current document result is relevant.
+                if (latestVersion == null) {
+                    latestVersion = getLatestVersion(s, searcherUpdateTime, link, documentVersion,
+                            documentsUpdatedBefore);
+
+                    // latestVersion == -1 means there was no document version
+                    // in history, adding it to blacklist so as to avoid
+                    // processing the documents which were found later
+                    if (latestVersion == -1) {
+                        linkBlackList.add(originalLink);
+                        continue;
+                    }
+                    latestVersionPerLink.put(originalLink, latestVersion);
+                }
+
                 if (documentVersion < latestVersion) {
                     continue;
                 }
-            } else {
-                // decorate link with version
-                link = UriUtils.buildPathWithVersion(link, documentVersion);
+
+                boolean isDeleted = Action.DELETE.name()
+                        .equals(visitor.documentUpdateAction);
+
+                if (isDeleted && !options.contains(QueryOption.INCLUDE_DELETED)) {
+                    // ignore a document if its marked deleted and it has the latest version
+                    if (documentVersion >= latestVersion) {
+                        uniques.remove(link);
+                        if (rsp.documents != null) {
+                            rsp.documents.remove(link);
+                        }
+                        if (rsp.selectedLinksPerDocument != null) {
+                            rsp.selectedLinksPerDocument.remove(link);
+                        }
+                    }
+                    continue;
+                }
             }
 
-            if (checkAndDeleteExpiratedDocuments(link, s, sd.doc, d, queryStartTimeMicros)) {
-                // ignore all document versions if the link has expired
-                latestVersions.put(link, Long.MAX_VALUE);
-                continue;
-            }
-
-            if (hasCountOption) {
+            if (hasCountOption || !populateResponse) {
                 // count unique instances of this link
                 uniques.add(link);
-                // we only want to count the link once, so set version to highest
-                latestVersions.put(link, Long.MAX_VALUE);
                 continue;
             }
 
-            if (options.contains(QueryOption.EXPAND_CONTENT)) {
-                String json = null;
-                ServiceDocument state = getStateFromLuceneDocument(d, link);
+            String json = null;
+            ServiceDocument state = null;
+
+            if (options.contains(QueryOption.EXPAND_CONTENT)
+                    || options.contains(QueryOption.OWNER_SELECTION)
+                    || options.contains(QueryOption.EXPAND_SELECTED_FIELDS)) {
+                state = getStateFromLuceneDocument(visitor, originalLink);
                 if (state == null) {
                     // support reading JSON serialized state for backwards compatibility
-                    json = d.get(LUCENE_FIELD_NAME_JSON_SERIALIZED_STATE);
+                    augmentDoc(s, visitor, sd.doc, LUCENE_FIELD_NAME_JSON_SERIALIZED_STATE);
+                    json = visitor.jsonSerializedState;
                     if (json == null) {
                         continue;
                     }
-                } else {
-                    json = Utils.toJson(state);
-                }
-                if (!rsp.documents.containsKey(link)) {
-                    rsp.documents.put(link, new JsonParser().parse(json).getAsJsonObject());
                 }
             }
+
+            if (options.contains(QueryOption.OWNER_SELECTION)) {
+                if (!processQueryResultsForOwnerSelection(json, state)) {
+                    continue;
+                }
+            }
+
+
+            if (options.contains(QueryOption.EXPAND_BINARY_CONTENT) && !rsp.documents.containsKey(link)) {
+                byte[] binaryData = visitor.binarySerializedState;
+                if (binaryData != null) {
+                    ByteBuffer buffer = ByteBuffer.wrap(binaryData, 0, binaryData.length);
+                    rsp.documents.put(link, buffer);
+                } else {
+                    logWarning("Binary State not found for %s", link);
+                }
+            } else if (options.contains(QueryOption.EXPAND_CONTENT) && !rsp.documents.containsKey(link)) {
+                if (options.contains(QueryOption.EXPAND_BUILTIN_CONTENT_ONLY)) {
+                    ServiceDocument stateClone = new ServiceDocument();
+                    state.copyTo(stateClone);
+                    rsp.documents.put(link, stateClone);
+                } else if (state == null) {
+                    rsp.documents.put(link, Utils.fromJson(json, JsonElement.class));
+                } else {
+                    JsonObject jo = toJsonElement(state);
+                    rsp.documents.put(link, jo);
+                }
+            } else if (options.contains(QueryOption.EXPAND_SELECTED_FIELDS) && !rsp.documents.containsKey(link)) {
+                // filter out only the selected fields
+                Set<String> selectFields = new TreeSet<>();
+                if (qs != null) {
+                    qs.selectTerms.forEach(qt -> selectFields.add(qt.propertyName));
+                }
+
+                // create an uninitialized copy
+                ServiceDocument copy = state.getClass().newInstance();
+                for (String selectField : selectFields) {
+                    // transfer only needed fields
+                    Field field = ReflectionUtils.getField(state.getClass(), selectField);
+                    if (field != null) {
+                        Object value = field.get(state);
+                        if (value != null) {
+                            field.set(copy, value);
+                        }
+                    } else {
+                        logFine("Unknown field '%s' passed for EXPAND_SELECTED_FIELDS", selectField);
+                    }
+                }
+
+                JsonObject jo = toJsonElement(copy);
+                // this is called only for primitive-typed fields, the rest are nullified already
+                jo.entrySet().removeIf(entry -> !selectFields.contains(entry.getKey()));
+
+                rsp.documents.put(link, jo);
+            }
+
+            if (options.contains(QueryOption.SELECT_LINKS)) {
+                processQueryResultsForSelectLinks(s, qs, rsp, visitor, sd.doc, link, state);
+            }
+
             uniques.add(link);
         }
 
-        if (hasCountOption) {
-            rsp.documentCount = (long) uniques.size();
-        } else {
-            rsp.documentLinks.clear();
-            rsp.documentLinks.addAll(uniques);
-            rsp.documentCount = (long) rsp.documentLinks.size();
-        }
-
+        rsp.documentLinks.clear();
+        rsp.documentLinks.addAll(uniques);
+        rsp.documentCount = (long) rsp.documentLinks.size();
         return lastDocVisited;
     }
 
-    private ServiceDocument getStateFromLuceneDocument(Document doc, String link) {
-        BytesRef binaryStateField = doc.getBinaryValue(LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE);
+    private JsonObject toJsonElement(ServiceDocument state) {
+        return (JsonObject) GsonSerializers.getJsonMapperFor(state.getClass()).toJsonElement(state);
+    }
+
+    private void loadDoc(IndexSearcher s, DocumentStoredFieldVisitor visitor, int docId, Set<String> fields) throws IOException {
+        visitor.reset(fields);
+        s.doc(docId, visitor);
+    }
+
+    private void augmentDoc(IndexSearcher s, DocumentStoredFieldVisitor visitor, int docId, String field) throws IOException {
+        visitor.reset(field);
+        s.doc(docId, visitor);
+    }
+
+    private boolean processQueryResultsForOwnerSelection(String json, ServiceDocument state) {
+        String documentOwner;
+        if (state == null) {
+            documentOwner = Utils.fromJson(json, ServiceDocument.class).documentOwner;
+        } else {
+            documentOwner = state.documentOwner;
+        }
+        // omit the result if the documentOwner is not the same as the local owner
+        if (documentOwner != null && !documentOwner.equals(getHost().getId())) {
+            return false;
+        }
+        return true;
+    }
+
+    private ServiceDocument processQueryResultsForSelectLinks(IndexSearcher s,
+            QuerySpecification qs, ServiceDocumentQueryResult rsp, DocumentStoredFieldVisitor d, int docId,
+            String link,
+            ServiceDocument state) throws Exception {
+        if (rsp.selectedLinksPerDocument == null) {
+            rsp.selectedLinksPerDocument = new HashMap<>();
+            rsp.selectedLinks = new HashSet<>();
+        }
+        Map<String, String> linksPerDocument = rsp.selectedLinksPerDocument.get(link);
+        if (linksPerDocument == null) {
+            linksPerDocument = new HashMap<>();
+            rsp.selectedLinksPerDocument.put(link, linksPerDocument);
+        }
+
+        for (QueryTask.QueryTerm qt : qs.linkTerms) {
+            String linkValue = d.getLink(qt.propertyName);
+            if (linkValue != null) {
+                linksPerDocument.put(qt.propertyName, linkValue);
+                rsp.selectedLinks.add(linkValue);
+                continue;
+            }
+
+            // if there is no stored field with the link term property name, it might be
+            // a field with a collection of links. We do not store those in lucene, they are
+            // part of the binary serialized state.
+            if (state == null) {
+                DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
+                loadDoc(s, visitor, docId, this.fieldsToLoadWithExpand);
+                state = getStateFromLuceneDocument(visitor, link);
+                if (state == null) {
+                    logWarning("Skipping link term %s for %s, can not find serialized state",
+                            qt.propertyName, link);
+                    continue;
+                }
+            }
+
+            Field linkCollectionField = ReflectionUtils
+                    .getField(state.getClass(), qt.propertyName);
+            if (linkCollectionField == null) {
+                continue;
+            }
+            Object fieldValue = linkCollectionField.get(state);
+            if (fieldValue == null) {
+                continue;
+            }
+            if (!(fieldValue instanceof Collection<?>)) {
+                logWarning("Skipping link term %s for %s, field is not a collection",
+                        qt.propertyName, link);
+                continue;
+            }
+            @SuppressWarnings("unchecked")
+            Collection<String> linkCollection = (Collection<String>) fieldValue;
+            int index = 0;
+            for (String item : linkCollection) {
+                if (item != null) {
+                    linksPerDocument.put(
+                            QuerySpecification.buildLinkCollectionItemName(qt.propertyName, index++),
+                            item);
+                    rsp.selectedLinks.add(item);
+                }
+            }
+        }
+        return state;
+    }
+
+    private ServiceDocument getStateFromLuceneDocument(DocumentStoredFieldVisitor doc, String link) {
+        byte[] binaryStateField = doc.binarySerializedState;
         if (binaryStateField == null) {
             logWarning("State not found for %s", link);
             return null;
         }
-
-        ServiceDocument state = (ServiceDocument) Utils.fromDocumentBytes(
-                binaryStateField.bytes,
-                binaryStateField.offset, binaryStateField.length);
+        ServiceDocument state = (ServiceDocument) KryoSerializers.deserializeDocument(binaryStateField,
+                0, binaryStateField.length);
+        if (state.documentSelfLink == null) {
+            state.documentSelfLink = link;
+        }
+        if (state.documentKind == null) {
+            state.documentKind = Utils.buildKind(state.getClass());
+        }
         return state;
     }
 
-    private long getLatestVersion(IndexSearcher s, String link) throws IOException {
-        IndexableField versionField;
-        long latestVersion;
-        TopDocs td = searchByVersion(link, s, null);
-        Document latestVersionDoc = s.getIndexReader().document(td.scoreDocs[0].doc,
-                this.fieldsToLoadNoExpand);
-        versionField = latestVersionDoc.getField(ServiceDocument.FIELD_NAME_VERSION);
-        latestVersion = versionField.numericValue().longValue();
+    private long getSearcherUpdateTime(IndexSearcher s, long queryStartTimeMicros) {
+        if (s == null) {
+            return 0L;
+        }
+        return this.searcherUpdateTimesMicros.getOrDefault(s.hashCode(), queryStartTimeMicros);
+    }
+
+    private long getLatestVersion(IndexSearcher s,
+            long searcherUpdateTime,
+            String link, long version, long documentsUpdatedBeforeInMicros) throws IOException {
+        if (hasOption(ServiceOption.INSTRUMENTATION)) {
+            adjustStat(STAT_NAME_VERSION_CACHE_LOOKUP_COUNT, 1);
+        }
+
+        synchronized (this.searchSync) {
+            DocumentUpdateInfo dui = this.updatesPerLink.get(link);
+            if (documentsUpdatedBeforeInMicros == -1 && dui != null && dui.updateTimeMicros <= searcherUpdateTime) {
+                return Math.max(version, dui.version);
+            }
+
+            if (!this.immutableParentLinks.isEmpty()) {
+                String parentLink = UriUtils.getParentPath(link);
+                if (this.immutableParentLinks.containsKey(parentLink)) {
+                    // all immutable services have just a single, zero, version
+                    return 0;
+                }
+            }
+        }
+
+        if (hasOption(ServiceOption.INSTRUMENTATION)) {
+            adjustStat(STAT_NAME_VERSION_CACHE_MISS_COUNT, 1);
+        }
+
+        TopDocs td = queryIndexForVersion(link, s, null,
+                documentsUpdatedBeforeInMicros > 0 ? documentsUpdatedBeforeInMicros : null);
+        // Checking if total hits were Zero when QueryOption.TIME_SNAPSHOT is enabled
+        if (documentsUpdatedBeforeInMicros != -1 && td.totalHits == 0) {
+            return -1;
+        }
+
+        if (td.totalHits == 0) {
+            return version;
+        }
+
+        DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
+        loadDoc(s, visitor, td.scoreDocs[0].doc, this.fieldToLoadVersionLookup);
+
+        long latestVersion = visitor.documentVersion;
+        long updateTime = visitor.documentUpdateTimeMicros;
+        // attempt to refresh or create new version cache entry, from the entry in the query results
+        // The update method will reject the update if the version is stale
+        updateLinkInfoCache(null, link, null, latestVersion, updateTime);
         return latestVersion;
     }
 
@@ -1183,12 +2780,11 @@ public class LuceneDocumentIndexService extends StatelessService {
 
         for (String selfLink : r.documentLinks) {
             sendRequest(Operation.createGet(this, selfLink)
-                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_QUEUING)
                     .setCompletion(c));
         }
     }
 
-    public void handleDeleteImpl(Operation delete) throws Throwable {
+    public void handleDeleteImpl(Operation delete) throws Exception {
         setProcessingStage(ProcessingStage.STOPPED);
 
         this.privateIndexingExecutor.shutdown();
@@ -1200,7 +2796,7 @@ public class LuceneDocumentIndexService extends StatelessService {
         delete.complete();
     }
 
-    private void close(IndexWriter wr) {
+    void close(IndexWriter wr) {
         try {
             if (wr == null) {
                 return;
@@ -1208,22 +2804,12 @@ public class LuceneDocumentIndexService extends StatelessService {
             logInfo("Document count: %d ", wr.maxDoc());
             wr.commit();
             wr.close();
-        } catch (Throwable e) {
+        } catch (Exception e) {
 
         }
     }
 
-    public static FieldType numericDocType(FieldType.NumericType type, boolean store) {
-        FieldType t = new FieldType();
-        t.setStored(store);
-        t.setDocValuesType(DocValuesType.NUMERIC);
-        t.setIndexOptions(IndexOptions.DOCS);
-        t.setNumericType(type);
-        t.setNumericPrecisionStep(QueryTask.DEFAULT_PRECISION_STEP);
-        return t;
-    }
-
-    protected void updateIndex(Operation updateOp) throws Throwable {
+    protected void updateIndex(Operation updateOp) throws Exception {
         UpdateIndexRequest r = updateOp.getBody(UpdateIndexRequest.class);
         ServiceDocument s = r.document;
         ServiceDocumentDescription desc = r.description;
@@ -1256,322 +2842,100 @@ public class LuceneDocumentIndexService extends StatelessService {
             return;
         }
 
+        IndexWriter wr = this.writer;
+        if (wr == null) {
+            updateOp.fail(new CancellationException("Index writer is null"));
+            return;
+        }
         s.documentDescription = null;
 
-        Document doc = new Document();
+        LuceneIndexDocumentHelper indexDocHelper = this.indexDocumentHelper.get();
 
-        Field updateActionField = new StoredField(ServiceDocument.FIELD_NAME_UPDATE_ACTION,
-                s.documentUpdateAction);
-        doc.add(updateActionField);
-
-        addBinaryStateFieldToDocument(s, desc, doc);
-
-        Field selfLinkField = new StringField(ServiceDocument.FIELD_NAME_SELF_LINK,
-                link,
-                Field.Store.YES);
-        doc.add(selfLinkField);
-        Field sortedSelfLinkField = new SortedDocValuesField(ServiceDocument.FIELD_NAME_SELF_LINK,
-                new BytesRef(link));
-        doc.add(sortedSelfLinkField);
-
+        indexDocHelper.addSelfLinkField(link);
         if (s.documentKind != null) {
-            Field kindField = new StringField(ServiceDocument.FIELD_NAME_KIND,
-                    s.documentKind,
-                    Field.Store.NO);
-            doc.add(kindField);
+            indexDocHelper.addKindField(s.documentKind);
         }
-
+        indexDocHelper.addUpdateActionField(s.documentUpdateAction);
+        indexDocHelper.addBinaryStateFieldToDocument(s, r.serializedDocument, desc);
         if (s.documentAuthPrincipalLink != null) {
-            Field principalField = new StringField(ServiceDocument.FIELD_NAME_AUTH_PRINCIPAL_LINK,
-                    s.documentAuthPrincipalLink,
-                    Field.Store.NO);
-            doc.add(principalField);
+            indexDocHelper.addAuthPrincipalLinkField(s.documentAuthPrincipalLink);
         }
-
         if (s.documentTransactionId != null) {
-            Field transactionField = new StringField(ServiceDocument.FIELD_NAME_TRANSACTION_ID,
-                    s.documentTransactionId,
-                    Field.Store.NO);
-            doc.add(transactionField);
+            indexDocHelper.addTxIdField(s.documentTransactionId);
         }
-
-        Field timestampField = new LongField(ServiceDocument.FIELD_NAME_UPDATE_TIME_MICROS,
-                s.documentUpdateTimeMicros, this.longStoredField);
-        doc.add(timestampField);
-
+        indexDocHelper.addUpdateTimeField(s.documentUpdateTimeMicros);
         if (s.documentExpirationTimeMicros > 0) {
-            Field expirationTimeMicrosField = new LongField(
-                    ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS,
-                    s.documentExpirationTimeMicros, this.longStoredField);
-            doc.add(expirationTimeMicrosField);
+            indexDocHelper.addExpirationTimeField(s.documentExpirationTimeMicros);
+        }
+        indexDocHelper.addVersionField(s.documentVersion);
+
+        if (desc.documentIndexingOptions.contains(DocumentIndexingOption.INDEX_METADATA)) {
+            indexDocHelper.addIndexingIdField(link, s.documentEpoch, s.documentVersion);
+            indexDocHelper.addTombstoneTimeField();
         }
 
-        Field versionField = new LongField(ServiceDocument.FIELD_NAME_VERSION,
-                s.documentVersion, this.longStoredField);
-
-        doc.add(versionField);
-
-        if (desc.propertyDescriptions == null
-                || desc.propertyDescriptions.isEmpty()) {
-            // no additional property type information, so we will add the
-            // document with common fields indexed plus the full body
-            addDocumentToIndex(updateOp, doc, s, desc);
-            return;
-        }
-
-        addIndexableFieldsToDocument(doc, s, desc);
-        addDocumentToIndex(updateOp, doc, s, desc);
-
-        if (hasOption(ServiceOption.INSTRUMENTATION)) {
-            int fieldCount = doc.getFields().size();
-            ServiceStat st = getStat(STAT_NAME_INDEXED_FIELD_COUNT);
-            adjustStat(st, fieldCount);
-            st = getHistogramStat(STAT_NAME_FIELD_COUNT_PER_DOCUMENT);
-            setStat(st, fieldCount);
-        }
-    }
-
-    private void addBinaryStateFieldToDocument(ServiceDocument s,
-            ServiceDocumentDescription desc, Document doc) {
+        Document threadLocalDoc = indexDocHelper.getDoc();
         try {
-            byte[] content = Utils.getBuffer(desc.serializedStateSizeLimit);
-            int count = Utils.toBytes(s, content, 0);
-            Field bodyField = new StoredField(LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE,
-                    content, 0, count);
-            doc.add(bodyField);
-        } catch (KryoException ke) {
-            throw new IllegalArgumentException(
-                    "Failure serializing state of service " + s.documentSelfLink
-                            + ", possibly due to size limit."
-                            + " Service author should override getDocumentTemplate() and adjust"
-                            + " ServiceDocumentDescription.serializedStateSizeLimit. Cause: "
-                            + ke.toString());
-        }
-    }
-
-    private void addIndexableFieldsToDocument(Document doc, Object podo,
-            ServiceDocumentDescription sd) {
-        for (Entry<String, PropertyDescription> e : sd.propertyDescriptions.entrySet()) {
-            String name = e.getKey();
-            PropertyDescription pd = e.getValue();
-            if (pd.usageOptions != null
-                    && pd.usageOptions.contains(PropertyUsageOption.INFRASTRUCTURE)) {
-                continue;
-            }
-            Object v = ReflectionUtils.getPropertyValue(pd, podo);
-            addIndexableFieldToDocument(doc, v, pd, name);
-        }
-    }
-
-    /**
-     * Add single indexable field to the Lucene {@link Document}.
-     * This function recurses if the field value is a PODO, map, array, or collection.
-     */
-    private void addIndexableFieldToDocument(Document doc, Object podo, PropertyDescription pd,
-            String fieldName) {
-        Field luceneField = null;
-        Field luceneDocValuesField = null;
-        Field.Store fsv = Field.Store.NO;
-        boolean isSorted = false;
-        Object v = podo;
-        if (v == null) {
-            return;
-        }
-
-        EnumSet<PropertyIndexingOption> opts = pd.indexingOptions;
-
-        if (opts != null && opts.contains(PropertyIndexingOption.STORE_ONLY)) {
-            return;
-        }
-
-        if (opts != null && opts.contains(PropertyIndexingOption.SORT)) {
-            isSorted = true;
-        }
-
-        boolean expandField = opts != null && opts.contains(PropertyIndexingOption.EXPAND);
-
-        if (v instanceof String) {
-            if (opts != null && opts.contains(PropertyIndexingOption.TEXT)) {
-                luceneField = new TextField(fieldName, v.toString(), fsv);
-            } else {
-                luceneField = new StringField(fieldName, v.toString(), fsv);
-            }
-            if (isSorted) {
-                luceneDocValuesField = new SortedDocValuesField(fieldName, new BytesRef(
-                        v.toString()));
-            }
-        } else if (v instanceof URI) {
-            String uriValue = QuerySpecification.toMatchValue((URI) v);
-            luceneField = new StringField(fieldName, uriValue, fsv);
-            if (isSorted) {
-                luceneDocValuesField = new SortedDocValuesField(fieldName, new BytesRef(
-                        v.toString()));
-            }
-        } else if (pd.typeName.equals(TypeName.ENUM)) {
-            String enumValue = QuerySpecification.toMatchValue((Enum<?>) v);
-            luceneField = new StringField(fieldName, enumValue, fsv);
-            if (isSorted) {
-                luceneDocValuesField = new SortedDocValuesField(fieldName, new BytesRef(
-                        v.toString()));
-            }
-        } else if (pd.typeName.equals(TypeName.LONG)) {
-            luceneField = new LongField(fieldName, ((Number) v).longValue(),
-                    fsv == Store.NO ? this.longUnStoredField : this.longStoredField);
-        } else if (pd.typeName.equals(TypeName.DATE)) {
-            // Index as microseconds since UNIX epoch
-            Date dt = (Date) v;
-            luceneField = new LongField(fieldName, dt.getTime() * 1000,
-                    fsv == Store.NO ? this.longUnStoredField : this.longStoredField);
-        } else if (pd.typeName.equals(TypeName.DOUBLE)) {
-            luceneField = new DoubleField(fieldName, ((Number) v).doubleValue(),
-                    fsv == Store.NO ? this.doubleUnStoredField : this.doubleStoredField);
-        } else if (pd.typeName.equals(TypeName.BOOLEAN)) {
-            String booleanValue = QuerySpecification.toMatchValue((boolean) v);
-            luceneField = new StringField(fieldName, booleanValue, fsv);
-            if (isSorted) {
-                luceneDocValuesField = new SortedDocValuesField(fieldName, new BytesRef(
-                        (booleanValue)));
-            }
-        } else if (pd.typeName.equals(TypeName.BYTES)) {
-            // Don't store bytes in the index
-        } else if (pd.typeName.equals(TypeName.PODO)) {
-            // Ignore all complex fields if they are not explicitly marked with EXPAND.
-            // We special case all fields of TaskState to ensure task based services have
-            // a guaranteed minimum level indexing and query behavior
-            if (!(v instanceof TaskState) && !expandField) {
-                return;
-            }
-            addObjectIndexableFieldToDocument(doc, v, pd, fieldName);
-            return;
-        } else if (expandField && pd.typeName.equals(TypeName.MAP)) {
-            addMapIndexableFieldToDocument(doc, v, pd, fieldName);
-            return;
-        } else if (expandField && (pd.typeName.equals(TypeName.COLLECTION))) {
-            addCollectionIndexableFieldToDocument(doc, v, pd, fieldName);
-            return;
-        } else {
-            luceneField = new StringField(fieldName, v.toString(), fsv);
-            if (isSorted) {
-                luceneDocValuesField = new SortedDocValuesField(fieldName, new BytesRef(
-                        v.toString()));
-            }
-        }
-
-        if (luceneField != null) {
-            doc.add(luceneField);
-        }
-
-        if (luceneDocValuesField != null) {
-            doc.add(luceneDocValuesField);
-        }
-    }
-
-    private void addObjectIndexableFieldToDocument(Document doc, Object v, PropertyDescription pd,
-            String fieldNamePrefix) {
-        for (Entry<String, PropertyDescription> e : pd.fieldDescriptions.entrySet()) {
-            PropertyDescription fieldDescription = e.getValue();
-            if (pd.indexingOptions.contains(PropertyIndexingOption.SORT)) {
-                fieldDescription.indexingOptions.add(PropertyIndexingOption.SORT);
-            }
-            Object fieldValue = ReflectionUtils.getPropertyValue(fieldDescription, v);
-            String fieldName = QuerySpecification.buildCompositeFieldName(fieldNamePrefix,
-                    e.getKey());
-            addIndexableFieldToDocument(doc, fieldValue, fieldDescription, fieldName);
-        }
-    }
-
-    @SuppressWarnings({ "rawtypes" })
-    private void addMapIndexableFieldToDocument(Document doc, Object v, PropertyDescription pd,
-            String fieldNamePrefix) {
-        final String errorMsg = "Field not supported. Map keys must be of type String.";
-
-        Map m = (Map) v;
-        if (pd.indexingOptions.contains(PropertyIndexingOption.SORT)) {
-            pd.elementDescription.indexingOptions.add(PropertyIndexingOption.SORT);
-        }
-        for (Object o : m.entrySet()) {
-            Entry entry = (Entry) o;
-            Object mapKey = entry.getKey();
-            if (!(mapKey instanceof String)) {
-                throw new IllegalArgumentException(errorMsg);
-            }
-            addIndexableFieldToDocument(doc,
-                    entry.getValue(),
-                    pd.elementDescription,
-                    QuerySpecification.buildCompositeFieldName(fieldNamePrefix, (String) mapKey));
-        }
-    }
-
-    @SuppressWarnings("rawtypes")
-    private void addCollectionIndexableFieldToDocument(Document doc, Object v,
-            PropertyDescription pd, String fieldNamePrefix) {
-        fieldNamePrefix = QuerySpecification.buildCollectionItemName(fieldNamePrefix);
-
-        Collection c;
-        if (v instanceof Collection) {
-            c = (Collection) v;
-        } else {
-            c = Arrays.asList((Object[]) v);
-        }
-        if (pd.indexingOptions.contains(PropertyIndexingOption.SORT)) {
-            pd.elementDescription.indexingOptions.add(PropertyIndexingOption.SORT);
-        }
-        for (Object cv : c) {
-            if (cv == null) {
-                continue;
-            }
-
-            addIndexableFieldToDocument(doc, cv, pd.elementDescription, fieldNamePrefix);
-        }
-    }
-
-    private boolean checkAndDeleteExpiratedDocuments(String link, IndexSearcher searcher,
-            Integer docId,
-            Document doc, long now)
-                    throws Throwable {
-        long expiration = 0;
-        boolean hasExpired = false;
-        IndexableField expirationValue = doc
-                .getField(ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS);
-        if (expirationValue != null) {
-            expiration = expirationValue.numericValue().longValue();
-            hasExpired = expiration <= now;
-        }
-
-        if (!hasExpired) {
-            return false;
-        }
-
-        adjustStat(STAT_NAME_DOCUMENT_EXPIRATION_COUNT, 1);
-
-        // update document with one that has all fields, including binary state
-        doc = searcher.getIndexReader().document(docId, this.fieldsToLoadWithExpand);
-
-        ServiceDocument s = null;
-        try {
-            s = getStateFromLuceneDocument(doc, link);
-        } catch (Throwable e) {
-            logWarning("Error deserializing state for %s: %s", link, e.getMessage());
-        }
-
-        deleteAllDocumentsForSelfLink(Operation.createDelete(null), link, s);
-        return true;
-    }
-
-    private void checkDocumentRetentionLimit(ServiceDocument state,
-            ServiceDocumentDescription desc) {
-        synchronized (this.linkDocumentRetentionEstimates) {
-            if (this.linkDocumentRetentionEstimates.containsKey(state.documentSelfLink)) {
+            if (desc.propertyDescriptions == null
+                    || desc.propertyDescriptions.isEmpty()) {
+                // no additional property type information, so we will add the
+                // document with common fields indexed plus the full body
+                addDocumentToIndex(wr, updateOp, threadLocalDoc, s, desc);
                 return;
             }
 
-            long limit = Math.max(1, desc.versionRetentionLimit);
-            if (state.documentVersion < limit) {
-                return;
+            indexDocHelper.addIndexableFieldsToDocument(s, desc);
+
+            if (hasOption(ServiceOption.INSTRUMENTATION)) {
+                int fieldCount = indexDocHelper.getDoc().getFields().size();
+                setTimeSeriesStat(STAT_NAME_INDEXED_FIELD_COUNT, AGGREGATION_TYPE_SUM, fieldCount);
+                ServiceStat st = ServiceStatUtils.getOrCreateHistogramStat(this, STAT_NAME_FIELD_COUNT_PER_DOCUMENT);
+                setStat(st, fieldCount);
             }
 
-            // schedule this self link for retention policy: it might have exceeded the version limit
-            this.linkDocumentRetentionEstimates.put(state.documentSelfLink, limit);
+            addDocumentToIndex(wr, updateOp, threadLocalDoc, s, desc);
+        } finally {
+            // NOTE: The Document is a thread local managed by the index document helper. Its fields
+            // must be cleared *after* its added to the index (above) and *before* its re-used.
+            // After the fields are cleared, the document can not be used in this scope
+            threadLocalDoc.clear();
+        }
+    }
+
+    private void checkDocumentRetentionLimit(ServiceDocument state, ServiceDocumentDescription desc)
+            throws IOException {
+
+        if (desc.versionRetentionLimit
+                == ServiceDocumentDescription.FIELD_VALUE_DISABLED_VERSION_RETENTION) {
+            return;
+        }
+
+        long limit = Math.max(1L, desc.versionRetentionLimit);
+        if (state.documentVersion < limit) {
+            return;
+        }
+
+        // If the addition of the new document version has not pushed the current document across
+        // a retention threshold boundary, then return. A retention boundary is reached when the
+        // addition of a new document means that more versions of the document are present in the
+        // index than the versionRetentionLimit specified in the service document description.
+        long floor = Math.max(1L, desc.versionRetentionFloor);
+        if (floor > limit) {
+            floor = limit;
+        }
+
+        long chunkThreshold = Math.max(1L, limit - floor);
+        if (((state.documentVersion - limit) % chunkThreshold) != 0) {
+            return;
+        }
+
+        String link = state.documentSelfLink;
+        long newValue = state.documentVersion - floor;
+        synchronized (this.liveVersionsPerLink) {
+            Long currentValue = this.liveVersionsPerLink.get(link);
+            if (currentValue == null || newValue > currentValue) {
+                this.liveVersionsPerLink.put(link, newValue);
+            }
         }
     }
 
@@ -1579,160 +2943,271 @@ public class LuceneDocumentIndexService extends StatelessService {
      * Will attempt to re-open index writer to recover from a specific exception. The method
      * assumes the caller has acquired the writer semaphore
      */
-    private void checkFailureAndRecover(Throwable e) {
+    private void checkFailureAndRecover(Exception e) {
+
+        // When document create or update fails with an exception. Clear the threadLocalDoc.
+        Document threadLocalDoc = this.indexDocumentHelper.get().getDoc();
+        threadLocalDoc.clear();
+
+        if (getHost().isStopping()) {
+            logInfo("Exception after host stop, on index service thread: %s", e.toString());
+            return;
+        }
         if (!(e instanceof AlreadyClosedException)) {
-            if (this.writer != null && !getHost().isStopping()) {
-                logSevere(e);
-            }
+            logSevere("Exception on index service thread: %s", Utils.toString(e));
             return;
         }
 
+        IndexWriter w = this.writer;
+        if ((w != null && w.isOpen()) || e.getMessage().contains("IndexReader")) {
+            // The already closed exception can happen due to an expired searcher, simply
+            // log in that case
+            adjustStat(STAT_NAME_READER_ALREADY_CLOSED_EXCEPTION_COUNT, 1);
+            logWarning("Exception on index service thread: %s", Utils.toString(e));
+            return;
+        }
+
+        logSevere("Exception on index service thread: %s", Utils.toString(e));
         this.adjustStat(STAT_NAME_WRITER_ALREADY_CLOSED_EXCEPTION_COUNT, 1);
-        reOpenWriterSynchronously();
+        applyFileLimitRefreshWriter(true);
+    }
+
+    private void deleteAllDocumentsForSelfLinkForcedPost(IndexWriter wr, ServiceDocument sd)
+            throws IOException {
+        // Delete all previous versions from the index. If we do not, we will end up with
+        // duplicate version history
+        adjustStat(STAT_NAME_FORCED_UPDATE_DOCUMENT_DELETE_COUNT, 1);
+        wr.deleteDocuments(new Term(ServiceDocument.FIELD_NAME_SELF_LINK, sd.documentSelfLink));
+        synchronized (this.searchSync) {
+            // Clean previous cached entry
+            this.updatesPerLink.remove(sd.documentSelfLink);
+            long now = Utils.getNowMicrosUtc();
+            this.writerUpdateTimeMicros = now;
+            this.serviceRemovalDetectedTimeMicros = now;
+        }
+        updateLinkInfoCache(getHost().buildDocumentDescription(sd.documentSelfLink),
+                sd.documentSelfLink, sd.documentKind, 0, Utils.getNowMicrosUtc());
     }
 
     private void deleteAllDocumentsForSelfLink(Operation postOrDelete, String link,
             ServiceDocument state)
-                    throws Throwable {
-        deleteDocumentsFromIndex(postOrDelete, link, 0);
-        ServiceStat st = getStat(STAT_NAME_SERVICE_DELETE_COUNT);
-        adjustStat(st, 1);
+            throws Exception {
+        deleteDocumentsFromIndex(postOrDelete,
+                state != null ? getHost().buildDocumentDescription(state.documentSelfLink) : null,
+                link, state != null ? state.documentKind : null, 0, Long.MAX_VALUE);
+        synchronized (this.searchSync) {
+            // Remove previous cached entry
+            this.updatesPerLink.remove(link);
+            long now = Utils.getNowMicrosUtc();
+            this.writerUpdateTimeMicros = now;
+            this.serviceRemovalDetectedTimeMicros = now;
+        }
+        adjustTimeSeriesStat(STAT_NAME_SERVICE_DELETE_COUNT, AGGREGATION_TYPE_SUM, 1);
         logFine("%s expired", link);
         if (state == null) {
             return;
         }
 
-        applyActiveQueries(state, null);
+        applyActiveQueries(postOrDelete, state, null);
         // remove service, if its running
         sendRequest(Operation.createDelete(this, state.documentSelfLink)
                 .setBodyNoCloning(state)
+                .disableFailureLogging(true)
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE));
     }
 
-    /**
-     * Deletes all indexed documents with range of deleteCount,indexed with the specified self link
-     *
-     * @throws Throwable
-     */
-    private void deleteDocumentsFromIndex(Operation delete, String link,
-            long versionsToKeep) throws Throwable {
+    private void deleteDocumentsFromIndex(Operation delete, ServiceDocumentDescription desc, String link, String kind, long oldestVersion,
+            long newestVersion) throws Exception {
+
         IndexWriter wr = this.writer;
         if (wr == null) {
-            delete.fail(new CancellationException());
+            delete.fail(new CancellationException("Index writer is null"));
             return;
         }
 
-        Query linkQuery = new TermQuery(new Term(ServiceDocument.FIELD_NAME_SELF_LINK,
-                link));
-
-        IndexSearcher s = updateSearcher(link, Integer.MAX_VALUE, wr);
-        if (s == null) {
-            delete.fail(new CancellationException());
-            return;
-        }
-
-        TopDocs results;
-
-        results = s.search(linkQuery, Integer.MAX_VALUE, this.versionSort, false, false);
-        if (results == null) {
-            return;
-        }
-
-        ScoreDoc[] hits = results.scoreDocs;
-
-        if (hits == null || hits.length == 0) {
-            return;
-        }
-
-        Document hitDoc = s.doc(hits[0].doc);
-
-        if (versionsToKeep == 0) {
-            // we are asked to delete everything, no need to sort or query
-            wr.deleteDocuments(linkQuery);
-            this.indexUpdateTimeMicros = Utils.getNowMicrosUtc();
-            delete.complete();
-            return;
-        }
-
-        if (hits.length < versionsToKeep) {
-            return;
-        }
-
-        BooleanQuery.Builder builder = new BooleanQuery.Builder();
-
-        // grab the document at the tail of the results, and use it to form a new query
-        // that will delete all documents from that document up to the version at the
-        // retention limit
-        hitDoc = s.doc(hits[hits.length - 1].doc);
-        long versionLowerBound = Long.parseLong(hitDoc.get(ServiceDocument.FIELD_NAME_VERSION));
-        hitDoc = s.doc(hits[(int) versionsToKeep - 1].doc);
-        long versionUpperBound = Long.parseLong(hitDoc.get(ServiceDocument.FIELD_NAME_VERSION));
-
-        NumericRangeQuery<Long> versionQuery = NumericRangeQuery.newLongRange(
-                ServiceDocument.FIELD_NAME_VERSION, versionLowerBound, versionUpperBound,
-                true,
-                true);
-
-        builder.add(versionQuery, Occur.MUST);
-        builder.add(linkQuery, Occur.MUST);
-        BooleanQuery bq = builder.build();
-
-        results = s.search(bq, Integer.MAX_VALUE);
-
-        logInfo("trimming index for %s from %d to %d, query returned %d", link, hits.length,
-                versionsToKeep, results.totalHits);
-
-        wr.deleteDocuments(bq);
-        long now = Utils.getNowMicrosUtc();
+        deleteDocumentFromIndex(link, oldestVersion, newestVersion, wr);
 
         // Use time AFTER index was updated to be sure that it can be compared
         // against the time the searcher was updated and have this change
         // be reflected in the new searcher. If the start time would be used,
         // it is possible to race with updating the searcher and NOT have this
         // change be reflected in the searcher.
-        updateLinkAccessTime(now, link);
-
+        updateLinkInfoCache(desc, link, kind, newestVersion, Utils.getNowMicrosUtc());
         delete.complete();
     }
 
-    private void addDocumentToIndex(Operation op, Document doc, ServiceDocument sd,
+    private void deleteDocumentFromIndex(String link, long oldestVersion, long newestVersion,
+            IndexWriter wr) throws IOException {
+        Query linkQuery = new TermQuery(new Term(ServiceDocument.FIELD_NAME_SELF_LINK, link));
+        Query versionQuery = LongPoint.newRangeQuery(ServiceDocument.FIELD_NAME_VERSION,
+                oldestVersion, newestVersion);
+
+        BooleanQuery.Builder builder = new BooleanQuery.Builder();
+        builder.add(versionQuery, Occur.MUST);
+        builder.add(linkQuery, Occur.MUST);
+        BooleanQuery bq = builder.build();
+        wr.deleteDocuments(bq);
+    }
+
+    private void addDocumentToIndex(IndexWriter wr, Operation op, Document doc, ServiceDocument sd,
             ServiceDocumentDescription desc) throws IOException {
-        IndexWriter wr = this.writer;
-        if (wr == null) {
-            op.fail(new CancellationException());
-            return;
+        long startNanos = 0;
+        if (hasOption(ServiceOption.INSTRUMENTATION)) {
+            startNanos = System.nanoTime();
         }
 
-        long start = Utils.getNowMicrosUtc();
+        if (op.getAction() == Action.POST
+                && op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)) {
+
+            // DocumentIndexingOption.INDEX_METADATA instructs the index service to maintain
+            // additional metadata attributes in the index, such as whether a particular Lucene
+            // document represents the "current" version of a service, or whether the service is
+            // deleted.
+            //
+            // Since these attributes are updated out of band, there is the potential of a race
+            // between this update and the metadata attribute updates, which occur during index
+            // service maintenance. This race cannot be avoided by the caller, so we use a lock
+            // here to force metadata indexing updates to be flushed before deleting the existing
+            // documents.
+            //
+            // Note this may cause significant additional latency under load for this particular
+            // combination of options (PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE and INDEX_METADATA). My
+            // original preference was to fail operations in this category; however, supporting
+            // this scenario is required in order to support migration for the time being, where
+            // services with INDEX_METADATA may be deleted and recreated.
+            if (desc.documentIndexingOptions.contains(DocumentIndexingOption.INDEX_METADATA)) {
+                synchronized (this.metadataUpdateSync) {
+                    synchronized (this.metadataUpdates) {
+                        this.metadataUpdatesPerLink.remove(sd.documentSelfLink);
+                        this.metadataUpdates.removeIf((info) ->
+                                info.selfLink.equals(sd.documentSelfLink));
+                    }
+                }
+            }
+
+            deleteAllDocumentsForSelfLinkForcedPost(wr, sd);
+        }
+
         wr.addDocument(doc);
-        long end = Utils.getNowMicrosUtc();
+
+        if (hasOption(ServiceOption.INSTRUMENTATION)) {
+            long durationNanos = System.nanoTime() - startNanos;
+            setTimeSeriesStat(STAT_NAME_INDEXED_DOCUMENT_COUNT, AGGREGATION_TYPE_SUM, 1);
+            setTimeSeriesHistogramStat(STAT_NAME_INDEXING_DURATION_MICROS, AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(durationNanos));
+        }
 
         // Use time AFTER index was updated to be sure that it can be compared
         // against the time the searcher was updated and have this change
         // be reflected in the new searcher. If the start time would be used,
         // it is possible to race with updating the searcher and NOT have this
         // change be reflected in the searcher.
-        updateLinkAccessTime(end, sd.documentSelfLink);
-
-        if (hasOption(ServiceOption.INSTRUMENTATION)) {
-            ServiceStat s = getHistogramStat(STAT_NAME_INDEXING_DURATION_MICROS);
-            setStat(s, end - start);
-        }
-
+        long updateTime = Utils.getNowMicrosUtc();
+        updateLinkInfoCache(desc, sd.documentSelfLink, sd.documentKind, sd.documentVersion,
+                updateTime);
         op.setBody(null).complete();
         checkDocumentRetentionLimit(sd, desc);
-        applyActiveQueries(sd, desc);
+        checkDocumentIndexingMetadata(sd, desc, updateTime);
+        applyActiveQueries(op, sd, desc);
     }
 
-    private void updateLinkAccessTime(long t, String link) {
+    private void checkDocumentIndexingMetadata(ServiceDocument sd, ServiceDocumentDescription desc,
+            long updateTimeMicros) {
+
+        if (!desc.documentIndexingOptions.contains(DocumentIndexingOption.INDEX_METADATA)) {
+            return;
+        }
+
+        if (sd.documentVersion == 0) {
+            return;
+        }
+
+        synchronized (this.metadataUpdates) {
+            MetadataUpdateInfo info = this.metadataUpdatesPerLink.get(sd.documentSelfLink);
+            if (info != null) {
+                if (info.updateTimeMicros < updateTimeMicros) {
+                    this.metadataUpdates.remove(info);
+                    info.updateTimeMicros = updateTimeMicros;
+                    this.metadataUpdates.add(info);
+                }
+                return;
+            }
+
+            info = new MetadataUpdateInfo();
+            info.selfLink = sd.documentSelfLink;
+            info.kind = sd.documentKind;
+            info.updateTimeMicros = updateTimeMicros;
+
+            this.metadataUpdatesPerLink.put(sd.documentSelfLink, info);
+            this.metadataUpdates.add(info);
+        }
+    }
+
+    private void updateLinkInfoCache(ServiceDocumentDescription desc,
+            String link, String kind, long version, long lastAccessTime) {
+        boolean isImmutable = desc != null
+                && desc.serviceCapabilities != null
+                && desc.serviceCapabilities.contains(ServiceOption.IMMUTABLE);
         synchronized (this.searchSync) {
-            // This map is cleared in applyMemoryLimit while holding this lock,
-            // so it is added to here while also holding the lock for symmetry.
-            this.linkAccessTimes.put(link, t);
+            if (isImmutable) {
+                String parent = UriUtils.getParentPath(link);
+                this.immutableParentLinks.compute(parent, (k, time) -> {
+                    if (time == null) {
+                        time = lastAccessTime;
+                    } else {
+                        time = Math.max(time, lastAccessTime);
+                    }
+                    return time;
+                });
+            } else {
+                this.updatesPerLink.compute(link, (k, entry) -> {
+                    if (entry == null) {
+                        entry = new DocumentUpdateInfo();
+                    }
+                    if (version >= entry.version) {
+                        entry.updateTimeMicros = Math.max(entry.updateTimeMicros, lastAccessTime);
+                        entry.version = version;
+                    }
+                    return entry;
+                });
+            }
+
+            if (kind != null) {
+                this.documentKindUpdateInfo.compute(kind, (k, entry) -> {
+                    if (entry == null) {
+                        entry = 0L;
+                    }
+                    entry = Math.max(entry, lastAccessTime);
+                    return entry;
+                });
+            }
 
             // The index update time may only be increased.
-            if (this.indexUpdateTimeMicros < t) {
-                this.indexUpdateTimeMicros = t;
+            if (this.writerUpdateTimeMicros < lastAccessTime) {
+                this.writerUpdateTimeMicros = lastAccessTime;
+            }
+        }
+    }
+
+    private void updateLinkInfoCacheForMetadataUpdates(long updateTimeMicros,
+            Collection<MetadataUpdateInfo> entries) {
+        synchronized (this.searchSync) {
+            for (MetadataUpdateInfo info : entries) {
+                this.updatesPerLink.compute(info.selfLink, (k, entry) -> {
+                    if (entry != null) {
+                        entry.updateTimeMicros = Math.max(entry.updateTimeMicros, updateTimeMicros);
+                    }
+                    return entry;
+                });
+
+                this.documentKindUpdateInfo.compute(info.kind, (k, entry) -> {
+                    entry = Math.max(entry, updateTimeMicros);
+                    return entry;
+                });
+            }
+
+            if (this.writerUpdateTimeMicros < updateTimeMicros) {
+                this.writerUpdateTimeMicros = updateTimeMicros;
             }
         }
     }
@@ -1758,47 +3233,107 @@ public class LuceneDocumentIndexService extends StatelessService {
      * @return an {@link IndexSearcher} that is fresh enough to execute the specified query
      * @throws IOException
      */
-    private IndexSearcher updateSearcher(String selfLink, int resultLimit, IndexWriter w) throws IOException {
+    private IndexSearcher createOrRefreshSearcher(String selfLink, Set<String> kindScope,
+            int resultLimit, IndexWriter w,
+            boolean doNotRefresh)
+            throws IOException {
+
         IndexSearcher s;
         boolean needNewSearcher = false;
+        long threadId = Thread.currentThread().getId();
         long now = Utils.getNowMicrosUtc();
-
         synchronized (this.searchSync) {
-            s = this.searcher;
+            s = this.searchers.get(threadId);
+            long searcherUpdateTime = getSearcherUpdateTime(s, 0);
             if (s == null) {
                 needNewSearcher = true;
-            } else if (selfLink != null && resultLimit == 1) {
-                Long latestUpdate = this.linkAccessTimes.get(selfLink);
-                if (latestUpdate != null
-                        && latestUpdate.compareTo(this.searcherUpdateTimeMicros) >= 0) {
-                    needNewSearcher = true;
+            } else {
+                needNewSearcher = documentNeedsNewSearcher(selfLink, kindScope, resultLimit,
+                        searcherUpdateTime, doNotRefresh);
+            }
+        }
+
+        if (s != null && !needNewSearcher) {
+            adjustTimeSeriesStat(STAT_NAME_SEARCHER_REUSE_BY_DOCUMENT_KIND_COUNT, AGGREGATION_TYPE_SUM, 1);
+            return s;
+        }
+
+        if (s != null) {
+            IndexReader oldReader = s.getIndexReader();
+            IndexReader newReader = DirectoryReader.openIfChanged((DirectoryReader) oldReader, w);
+            if (newReader == null || newReader == oldReader) {
+                return s;
+            }
+
+            oldReader.close();
+            this.searcherUpdateTimesMicros.remove(s.hashCode());
+            s = new IndexSearcher(newReader);
+        } else {
+            s = new IndexSearcher(DirectoryReader.open(w, true, true));
+        }
+
+        s.setSimilarity(s.getSimilarity(false));
+
+        adjustTimeSeriesStat(STAT_NAME_SEARCHER_UPDATE_COUNT, AGGREGATION_TYPE_SUM, 1);
+        synchronized (this.searchSync) {
+            this.searchers.put(threadId, s);
+            this.searcherUpdateTimesMicros.put(s.hashCode(), now);
+            return s;
+        }
+    }
+
+    private boolean documentNeedsNewSearcher(String selfLink, Set<String> kindScope,
+            int resultLimit, long searcherUpdateTime, boolean doNotRefresh) {
+        if (selfLink != null && resultLimit == 1) {
+            DocumentUpdateInfo du = this.updatesPerLink.get(selfLink);
+
+            // ODL services may be created and removed due to memory pressure while searcher was not updated.
+            // Then, retrieval of those services will fail because searcher doesn't know the creation yet.
+            // To incorporate such service removal, also check the serviceRemovalDetectedTimeMicros.
+            if (du == null && (searcherUpdateTime < this.serviceRemovalDetectedTimeMicros)) {
+                return true;
+            }
+
+            if (du != null && du.updateTimeMicros >= searcherUpdateTime) {
+                return true;
+            } else {
+                String parent = UriUtils.getParentPath(selfLink);
+                Long updateTime = this.immutableParentLinks.get(parent);
+                if (updateTime != null && updateTime >= searcherUpdateTime) {
+                    return true;
                 }
-            } else if (this.searcherUpdateTimeMicros < this.indexUpdateTimeMicros) {
+            }
+        } else {
+            boolean needNewSearcher = false;
+
+            long indexUpdateTime;
+            if (kindScope == null) {
+                indexUpdateTime = this.writerUpdateTimeMicros;
+            } else {
+                // Retrieve the most recent updatetime for given kinds.
+                // If not exists(no update happened for the kinds), return Long.MIN to reuse existing searcher
+                indexUpdateTime = kindScope.stream()
+                        .map(this.documentKindUpdateInfo::get)
+                        .filter(Objects::nonNull)
+                        .max(Long::compare)
+                        .orElse(Long.MIN_VALUE);
+            }
+
+            if (searcherUpdateTime < indexUpdateTime) {
                 needNewSearcher = true;
             }
 
-            if (!needNewSearcher) {
-                return s;
+            // for a query with DO_NOT_REFRESH, if all other checks suggest
+            // we need a new searcher check to see if enough time has elapsed
+            // since the index was updated
+            if (doNotRefresh && needNewSearcher) {
+                if ((indexUpdateTime + searcherRefreshIntervalMicros) >= Utils.getSystemNowMicrosUtc()) {
+                    return false;
+                }
             }
+            return needNewSearcher;
         }
-
-        // Create a new searcher outside the lock. Another thread might race us and
-        // also create a searcher, but that is OK: the most recent one will be used.
-        s = new IndexSearcher(DirectoryReader.open(w, true));
-
-        if (hasOption(ServiceOption.INSTRUMENTATION)) {
-            ServiceStat st = getStat(STAT_NAME_SEARCHER_UPDATE_COUNT);
-            adjustStat(st, 1);
-        }
-
-        synchronized (this.searchSync) {
-            this.searchersPendingClose.add(s);
-            if (this.searcherUpdateTimeMicros < now) {
-                this.searcher = s;
-                this.searcherUpdateTimeMicros = now;
-            }
-            return s;
-        }
+        return false;
     }
 
     @Override
@@ -1807,143 +3342,388 @@ public class LuceneDocumentIndexService extends StatelessService {
     }
 
     @Override
-    public void handleMaintenance(final Operation post) {
-        this.privateIndexingExecutor.execute(() -> {
-            try {
-                this.writerAvailable.acquire();
-                handleMaintenanceImpl(false);
-                post.complete();
-            } catch (Throwable e) {
-                post.fail(e);
-            } finally {
-                this.writerAvailable.release();
-            }
+    public void handleMaintenance(Operation post) {
+        if (this.fieldInfoCache != null) {
+            this.fieldInfoCache.handleMaintenance();
+        }
 
-        });
+        Operation maintenanceOp = Operation
+                .createPost(this.getUri())
+                .setBodyNoCloning(new MaintenanceRequest())
+                .setCompletion((o, ex) -> {
+                    if (ex != null) {
+                        post.fail(ex);
+                        return;
+                    }
+                    post.complete();
+                });
+
+        setAuthorizationContext(maintenanceOp, getSystemAuthorizationContext());
+        handleRequest(maintenanceOp);
     }
 
-    private void handleMaintenanceImpl(boolean forceMerge) throws Throwable {
+    private void handleMaintenanceImpl(Operation op) throws Exception {
         try {
-            long start = Utils.getNowMicrosUtc();
+            IndexWriter w = this.writer;
+            if (w == null) {
+                op.fail(new CancellationException("Index writer is null"));
+                return;
+            }
 
+            long searcherCreationTime = Utils.getNowMicrosUtc();
+
+            synchronized (this.metadataUpdates) {
+                this.metadataUpdatesPerLink.clear();
+            }
+
+            long startNanos = System.nanoTime();
+            IndexSearcher s = createOrRefreshSearcher(null, null, Integer.MAX_VALUE, w, false);
+            long endNanos = System.nanoTime();
+            setTimeSeriesHistogramStat(STAT_NAME_MAINTENANCE_SEARCHER_REFRESH_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(endNanos - startNanos));
+
+            long deadline = Utils.getSystemNowMicrosUtc() + getMaintenanceIntervalMicros();
+
+            startNanos = endNanos;
+            applyDocumentExpirationPolicy(s, deadline);
+            endNanos = System.nanoTime();
+            setTimeSeriesHistogramStat(STAT_NAME_MAINTENANCE_DOCUMENT_EXPIRATION_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(endNanos - startNanos));
+
+            startNanos = endNanos;
+            applyDocumentVersionRetentionPolicy(deadline);
+            endNanos = System.nanoTime();
+            setTimeSeriesHistogramStat(STAT_NAME_MAINTENANCE_VERSION_RETENTION_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(endNanos - startNanos));
+
+            startNanos = endNanos;
+            synchronized (this.metadataUpdateSync) {
+                applyMetadataIndexingUpdates(s, searcherCreationTime, deadline);
+            }
+            endNanos = System.nanoTime();
+            setTimeSeriesHistogramStat(STAT_NAME_MAINTENANCE_METADATA_INDEXING_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(endNanos - startNanos));
+
+            startNanos = endNanos;
+            applyMemoryLimit();
+            endNanos = System.nanoTime();
+            setTimeSeriesHistogramStat(STAT_NAME_MAINTENANCE_MEMORY_LIMIT_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(endNanos - startNanos));
+
+            startNanos = endNanos;
+            long sequenceNumber = w.commit();
+            endNanos = System.nanoTime();
+            adjustTimeSeriesStat(STAT_NAME_COMMIT_COUNT, AGGREGATION_TYPE_SUM, 1);
+            setTimeSeriesHistogramStat(STAT_NAME_COMMIT_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(endNanos - startNanos));
+
+            // Only send notification when something has committed.
+            // When there was nothing to commit, sequence number is -1.
+            if (sequenceNumber > -1) {
+                CommitInfo commitInfo = new CommitInfo();
+                commitInfo.sequenceNumber = sequenceNumber;
+                publish(Operation.createPatch(null).setBody(commitInfo));
+            }
+
+            startNanos = endNanos;
+            applyFileLimitRefreshWriter(false);
+            endNanos = System.nanoTime();
+            setTimeSeriesHistogramStat(STAT_NAME_MAINTENANCE_FILE_LIMIT_REFRESH_DURATION_MICROS,
+                    AGGREGATION_TYPE_AVG_MAX,
+                    TimeUnit.NANOSECONDS.toMicros(endNanos - startNanos));
+
+            if (this.hasOption(ServiceOption.INSTRUMENTATION)) {
+                setStat(LuceneDocumentIndexService.STAT_NAME_INDEXED_DOCUMENT_COUNT, w.numDocs());
+                logQueueDepthStat(this.updateQueue, STAT_NAME_FORMAT_UPDATE_QUEUE_DEPTH);
+                logQueueDepthStat(this.queryQueue, STAT_NAME_FORMAT_QUERY_QUEUE_DEPTH);
+            }
+
+            op.complete();
+        } catch (Exception e) {
+            if (this.getHost().isStopping()) {
+                op.fail(new CancellationException("Host is stopping"));
+                return;
+            }
+            logWarning("Attempting recovery due to error: %s", Utils.toString(e));
+            applyFileLimitRefreshWriter(true);
+            op.fail(e);
+        }
+    }
+
+    private void logQueueDepthStat(RoundRobinOperationQueue queue, String format) {
+        Map<String, Integer> sizes = queue.sizesByKey();
+        for (Entry<String, Integer> e : sizes.entrySet()) {
+            String statName = String.format(format, e.getKey());
+            setTimeSeriesStat(statName, AGGREGATION_TYPE_AVG_MAX, e.getValue());
+        }
+    }
+
+    private void applyMetadataIndexingUpdates(IndexSearcher searcher, long searcherCreationTime,
+            long deadline) throws IOException {
+        Map<String, MetadataUpdateInfo> entries = new HashMap<>();
+        synchronized (this.metadataUpdates) {
+            Iterator<MetadataUpdateInfo> it = this.metadataUpdates.iterator();
+            while (it.hasNext()) {
+                MetadataUpdateInfo info = it.next();
+                if (info.updateTimeMicros > searcherCreationTime) {
+                    break;
+                }
+
+                entries.put(info.selfLink, info);
+                it.remove();
+            }
+        }
+
+        if (entries.isEmpty()) {
+            return;
+        }
+
+        Collection<MetadataUpdateInfo> entriesToProcess = entries.values();
+        int queueDepth = entriesToProcess.size();
+        Iterator<MetadataUpdateInfo> it = entriesToProcess.iterator();
+        int updateCount = 0;
+        while (it.hasNext() && --queueDepth > metadataUpdateMaxQueueDepth) {
+            IndexWriter wr = this.writer;
+            if (wr == null) {
+                break;
+            }
+            updateCount += applyMetadataIndexingUpdate(searcher, wr, it.next());
+        }
+
+        while (it.hasNext() && Utils.getSystemNowMicrosUtc() < deadline) {
+            IndexWriter wr = this.writer;
+            if (wr == null) {
+                break;
+            }
+            updateCount += applyMetadataIndexingUpdate(searcher, wr, it.next());
+        }
+
+        if (it.hasNext()) {
+            synchronized (this.metadataUpdates) {
+                while (it.hasNext()) {
+                    MetadataUpdateInfo info = it.next();
+                    it.remove();
+                    this.metadataUpdatesPerLink.putIfAbsent(info.selfLink, info);
+                    this.metadataUpdates.add(info);
+                }
+            }
+        }
+
+        updateLinkInfoCacheForMetadataUpdates(Utils.getNowMicrosUtc(), entriesToProcess);
+
+        if (updateCount > 0) {
+            setTimeSeriesHistogramStat(STAT_NAME_METADATA_INDEXING_UPDATE_COUNT,
+                    AGGREGATION_TYPE_SUM, updateCount);
+        }
+    }
+
+    private long applyMetadataIndexingUpdate(IndexSearcher searcher, IndexWriter wr,
+            MetadataUpdateInfo info) throws IOException {
+
+        Query selfLinkClause = new TermQuery(new Term(ServiceDocument.FIELD_NAME_SELF_LINK,
+                info.selfLink));
+        Query currentClause = NumericDocValuesField.newExactQuery(
+                LuceneIndexDocumentHelper.FIELD_NAME_INDEXING_METADATA_VALUE_TOMBSTONE_TIME,
+                LuceneIndexDocumentHelper.ACTIVE_DOCUMENT_TOMBSTONE_TIME);
+
+        Query booleanQuery = new BooleanQuery.Builder()
+                .add(selfLinkClause, Occur.MUST)
+                .add(currentClause, Occur.MUST)
+                .build();
+
+        //
+        // In a perfect world, we'd sort the results here and examine the first result to determine
+        // whether the document has been deleted. Unfortunately, Lucene 6.5 has a bug where, for
+        // queries which specify sorts, NumericDocValuesField query clauses are ignored (these
+        // queries are new and experimental in 6.5). As a result, we must traverse the unordered
+        // results and track the highest result that we've seen.
+        //
+
+        long highestVersion = -1;
+        String lastUpdateAction = null;
+
+        final int pageSize = 10000;
+
+        long updateCount = 0;
+        ScoreDoc after = null;
+        // DocumentStoredFieldVisitor is a list as we can have multiple entries for the same
+        // version because of how synchronization works
+        Map<Long, List<DocumentStoredFieldVisitor>> versionToDocsMap = new HashMap<>();
+        while (true) {
+            TopDocs results = searcher.searchAfter(after, booleanQuery, pageSize);
+            if (results == null || results.scoreDocs == null || results.scoreDocs.length == 0) {
+                break;
+            }
+
+            for (ScoreDoc scoreDoc : results.scoreDocs) {
+                DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
+                loadDoc(searcher, visitor, scoreDoc.doc, this.fieldsToLoadIndexingIdLookup);
+                List<DocumentStoredFieldVisitor> versionDocList = versionToDocsMap
+                        .computeIfAbsent(visitor.documentVersion, k -> new ArrayList<>());
+                versionDocList.add(visitor);
+
+                if (visitor.documentVersion > highestVersion) {
+                    highestVersion = visitor.documentVersion;
+                    lastUpdateAction = visitor.documentUpdateAction;
+                }
+            }
+            // check to see if the next version is available for all documents returned in the query above
+            Set<Long> missingVersions = new HashSet<>();
+            for (Long version : versionToDocsMap.keySet()) {
+                if (version == highestVersion) {
+                    continue;
+                }
+                if (!versionToDocsMap.containsKey(version + 1)) {
+                    missingVersions.add(version + 1);
+                }
+            }
+            // fetch docs for the missing versions
+            Query versionClause = LongPoint.newSetQuery(ServiceDocument.FIELD_NAME_VERSION, missingVersions);
+            Query missingVersionQuery = new BooleanQuery.Builder()
+                    .add(selfLinkClause, Occur.MUST)
+                    .add(versionClause, Occur.MUST)
+                    .build();
+            TopDocs missingVersionResult = searcher.searchAfter(after, missingVersionQuery, pageSize);
+            if (missingVersionResult != null && missingVersionResult.scoreDocs != null
+                    && missingVersionResult.scoreDocs.length != 0) {
+                for (ScoreDoc scoreDoc : missingVersionResult.scoreDocs) {
+                    DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
+                    loadDoc(searcher, visitor, scoreDoc.doc, this.fieldsToLoadIndexingIdLookup);
+                    List<DocumentStoredFieldVisitor> versionDocList = versionToDocsMap
+                            .computeIfAbsent(visitor.documentVersion, k -> new ArrayList<>());
+                    versionDocList.add(visitor);
+                }
+            }
+            // update the metadata for fields as necessary
+            for (List<DocumentStoredFieldVisitor> visitorDocs : versionToDocsMap.values()) {
+                for (DocumentStoredFieldVisitor visitor : visitorDocs) {
+                    if ((visitor.documentVersion == highestVersion &&
+                            !Action.DELETE.toString().equals(lastUpdateAction)) ||
+                            visitor.documentTombstoneTimeMicros != LuceneIndexDocumentHelper.ACTIVE_DOCUMENT_TOMBSTONE_TIME) {
+                        continue;
+                    }
+                    Long nextVersionCreationTime = null;
+                    if (visitor.documentVersion == highestVersion) {
+                        // pick the update time on the first entry. They should be the same for all docs of the same version
+                        DocumentStoredFieldVisitor firstDoc = versionToDocsMap.get(visitor.documentVersion).get(0);
+                        nextVersionCreationTime = firstDoc.documentUpdateTimeMicros;
+                    } else {
+                        List<DocumentStoredFieldVisitor> list = versionToDocsMap.get(visitor.documentVersion + 1);
+                        if (list != null) {
+                            nextVersionCreationTime = list.get(0).documentUpdateTimeMicros;
+                        }
+                    }
+                    if (nextVersionCreationTime != null) {
+                        updateTombstoneTime(wr, visitor.documentIndexingId, nextVersionCreationTime);
+                        updateCount++;
+                    }
+                }
+            }
+            if (results.scoreDocs.length < pageSize) {
+                break;
+            }
+
+            after = results.scoreDocs[results.scoreDocs.length - 1];
+        }
+
+        return updateCount;
+    }
+
+    private void updateTombstoneTime(IndexWriter wr, String indexingId, long documentUpdateTimeMicros) throws IOException {
+        Term indexingIdTerm = new Term(LuceneIndexDocumentHelper.FIELD_NAME_INDEXING_ID,
+                indexingId);
+        wr.updateNumericDocValue(indexingIdTerm,
+                LuceneIndexDocumentHelper.FIELD_NAME_INDEXING_METADATA_VALUE_TOMBSTONE_TIME, documentUpdateTimeMicros);
+    }
+
+    private void applyFileLimitRefreshWriter(boolean force) {
+        if (getHost().isStopping()) {
+            return;
+        }
+
+        if (!isDurable()) {
+            return;
+        }
+
+        long now = Utils.getNowMicrosUtc();
+        if (now - this.writerCreationTimeMicros < getHost()
+                .getMaintenanceIntervalMicros()) {
+            logInfo("Skipping writer re-open, it was created recently");
+            return;
+        }
+
+        File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
+        Stream<Path> stream = null;
+        long count;
+        try {
+            stream = Files.list(directory.toPath());
+            count = stream.count();
+            if (!force && count < indexFileCountThresholdForWriterRefresh) {
+                return;
+            }
+        } catch (IOException e1) {
+            logSevere(e1);
+            return;
+        } finally {
+            if (stream != null) {
+                stream.close();
+            }
+        }
+
+        final int acquireReleaseCount = QUERY_THREAD_COUNT + UPDATE_THREAD_COUNT;
+        try {
+            // Do not proceed unless we have blocked all reader+writer threads. We assume
+            // the semaphore is already acquired by the current thread
+            this.writerSync.release();
+            this.writerSync.acquire(acquireReleaseCount);
             IndexWriter w = this.writer;
             if (w == null) {
                 return;
             }
 
-            setStat(STAT_NAME_INDEXED_DOCUMENT_COUNT, w.maxDoc());
+            logInfo("(%s) closing all %d searchers, document count: %d, file count: %d",
+                    this.writerSync, this.searchers.size(), w.maxDoc(), count);
 
-            adjustStat(STAT_NAME_COMMIT_COUNT, 1.0);
-            long end = Utils.getNowMicrosUtc();
-            setStat(STAT_NAME_COMMIT_DURATION_MICROS, end - start);
+            for (IndexSearcher s : this.searchers.values()) {
+                s.getIndexReader().close();
+                this.searcherUpdateTimesMicros.remove(s.hashCode());
+            }
 
-            applyDocumentExpirationPolicy(w);
-            applyDocumentVersionRetentionPolicy(w);
-            w.commit();
+            this.searchers.clear();
 
-            applyMemoryLimit();
-
-            boolean reOpenWriter = applyIndexFileLimit();
-
-            if (!forceMerge && !reOpenWriter) {
+            if (!force) {
                 return;
             }
-            reOpenWriterSynchronously();
-        } catch (Throwable e) {
-            logWarning("Attempting recovery due to error: %s", e.getMessage());
-            reOpenWriterSynchronously();
-            throw e;
-        }
-    }
 
-    private boolean applyIndexFileLimit() {
-        File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
-        String[] list = directory.list();
-        int count = list == null ? 0 : list.length;
+            logInfo("Closing all paginated searchers (%d)", this.paginatedSearcherManager.getSearcherSize());
 
-        boolean reOpenWriter = count >= INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH;
-
-        int searcherCount = this.searchersPendingClose.size();
-        if (searcherCount < INDEX_SEARCHER_COUNT_THRESHOLD && !reOpenWriter) {
-            return reOpenWriter;
-        }
-
-        // We always close index searchers before re-opening the index writer, otherwise we risk
-        // loosing pending commits on writer re-open. Notice this code executes if we either have
-        // too many index files on disk, thus we need to re-open the writer to consolidate, or
-        // when we have too many pending searchers
-
-        final int acquireReleaseCount = QUERY_THREAD_COUNT + UPDATE_THREAD_COUNT;
-        try {
-            if (getHost().isStopping()) {
-                return false;
-            }
-
-            this.writerAvailable.release();
-            this.writerAvailable.acquire(acquireReleaseCount);
-            this.searcher = null;
-
-            logInfo("Closing %d pending searchers, index file count: %d", searcherCount, count);
-
-            for (IndexSearcher s : this.searchersPendingClose) {
+            for (IndexSearcher searcher : this.paginatedSearcherManager.getAllSearchers()) {
                 try {
-                    s.getIndexReader().close();
-                } catch (Throwable e) {
+                    searcher.getIndexReader().close();
+                } catch (Exception ignored) {
                 }
+                this.searcherUpdateTimesMicros.remove(searcher.hashCode());
             }
-            this.searchersPendingClose.clear();
-            IndexWriter w = this.writer;
-            if (w != null) {
-                try {
-                    w.deleteUnusedFiles();
-                } catch (Throwable e) {
-                }
-            }
+            this.paginatedSearcherManager.clear();
+            this.searcherUpdateTimesMicros.clear();
 
-        } catch (InterruptedException e1) {
-            logSevere(e1);
-        } finally {
-            // release all but one, so we stay owning one reference to the semaphore
-            this.writerAvailable.release(acquireReleaseCount - 1);
-        }
-
-        return reOpenWriter;
-    }
-
-    private void reOpenWriterSynchronously() {
-
-        final int acquireReleaseCount = QUERY_THREAD_COUNT + UPDATE_THREAD_COUNT;
-        try {
-
-            if (getHost().isStopping()) {
-                return;
-            }
-
-            // Do not proceed unless we have blocked all reader+writer threads. We assume
-            // the semaphore is already acquired by the current thread
-            this.writerAvailable.release();
-            this.writerAvailable.acquire(acquireReleaseCount);
-
-            IndexWriter w = this.writer;
-
-            long now = Utils.getNowMicrosUtc();
-            if (now - this.indexWriterCreationTimeMicros < getHost()
-                    .getMaintenanceIntervalMicros()) {
-                logInfo("Skipping writer re-open, it was created recently");
-                return;
-            }
-
-            File directory = new File(new File(getHost().getStorageSandbox()), this.indexDirectory);
             try {
-                if (w != null) {
-                    w.close();
-                }
-            } catch (Throwable e) {
+                w.close();
+            } catch (Exception ignored) {
             }
 
             w = createWriter(directory, false);
-            logInfo("Reopened writer, document count: %d", w.maxDoc());
-        } catch (Throwable e) {
+            stream = Files.list(directory.toPath());
+            count = stream.count();
+            logInfo("(%s) reopened writer, document count: %d, file count: %d",
+                    this.writerSync, w.maxDoc(), count);
+        } catch (Exception e) {
             // If we fail to re-open we should stop the host, since we can not recover.
             logSevere(e);
             logWarning("Stopping local host since index is not accessible");
@@ -1952,119 +3732,202 @@ public class LuceneDocumentIndexService extends StatelessService {
             sendRequest(Operation.createDelete(this, ServiceUriPaths.CORE_MANAGEMENT));
         } finally {
             // release all but one, so we stay owning one reference to the semaphore
-            this.writerAvailable.release(acquireReleaseCount - 1);
+            this.writerSync.release(acquireReleaseCount - 1);
+            if (stream != null) {
+                stream.close();
+            }
         }
     }
 
-    private void applyDocumentVersionRetentionPolicy(IndexWriter w)
-            throws Throwable {
-        IndexWriter wr = this.writer;
-        if (wr == null) {
-            return;
-        }
-
-        Operation dummyDelete = Operation.createDelete(null);
-        int count = 0;
+    private void applyDocumentVersionRetentionPolicy(long deadline) throws Exception {
         Map<String, Long> links = new HashMap<>();
-        synchronized (this.linkDocumentRetentionEstimates) {
-            links.putAll(this.linkDocumentRetentionEstimates);
-            this.linkDocumentRetentionEstimates.clear();
-        }
+        Iterator<Entry<String, Long>> it;
 
-        IndexSearcher s = updateSearcher(null, Integer.MAX_VALUE, wr);
-        if (s == null) {
-            return;
-        }
-
-        for (Entry<String, Long> e : links.entrySet()) {
-            Query linkQuery = new TermQuery(new Term(ServiceDocument.FIELD_NAME_SELF_LINK,
-                    e.getKey()));
-            int documentCount = s.count(linkQuery);
-
-            int pastRetentionLimitVersions = (int) (documentCount - e.getValue());
-            if (pastRetentionLimitVersions <= 0) {
-                continue;
+        do {
+            int count = 0;
+            synchronized (this.liveVersionsPerLink) {
+                it = this.liveVersionsPerLink.entrySet().iterator();
+                while (it.hasNext() && count < versionRetentionServiceThreshold) {
+                    Entry<String, Long> e = it.next();
+                    links.put(e.getKey(), e.getValue());
+                    it.remove();
+                    count++;
+                }
             }
 
-            // trim durable index for this link
-            deleteDocumentsFromIndex(dummyDelete, e.getKey(), e.getValue());
-            count++;
-        }
+            if (links.isEmpty()) {
+                break;
+            }
 
-        if (!links.isEmpty()) {
-            logInfo("Applied retention policy to %d links", count);
-        }
+            adjustTimeSeriesStat(STAT_NAME_VERSION_RETENTION_SERVICE_COUNT, AGGREGATION_TYPE_SUM,
+                    links.size());
+
+            Operation dummyDelete = Operation.createDelete(null);
+            for (Entry<String, Long> e : links.entrySet()) {
+                IndexWriter wr = this.writer;
+                if (wr == null) {
+                    return;
+                }
+                deleteDocumentsFromIndex(dummyDelete, null, e.getKey(), null,  0, e.getValue());
+            }
+
+            links.clear();
+
+        } while (Utils.getSystemNowMicrosUtc() < deadline);
     }
 
     private void applyMemoryLimit() {
         if (getHost().isStopping()) {
             return;
         }
+        // close any paginated query searchers that have expired
+        long now = Utils.getNowMicrosUtc();
+        applyMemoryLimitToDocumentUpdateInfo();
 
-        long memThresholdBytes = this.linkAccessMemoryLimitMB * 1024 * 1024;
-        final int bytesPerLinkEstimate = 256;
-        int count = 0;
+        long activePaginatedQueries;
+        Map<IndexSearcher, Long> entriesToClose;
+
         synchronized (this.searchSync) {
-            if (this.linkAccessTimes.isEmpty()) {
+            entriesToClose = this.paginatedSearcherManager.removeExpiredSearchers(now);
+            for (IndexSearcher searcher : entriesToClose.keySet()) {
+                this.searcherUpdateTimesMicros.remove(searcher.hashCode());
+            }
+            activePaginatedQueries = this.paginatedSearcherManager.getSearcherSize();
+        }
+
+        setTimeSeriesStat(STAT_NAME_ACTIVE_PAGINATED_QUERIES, AGGREGATION_TYPE_AVG_MAX, activePaginatedQueries);
+
+        for (Entry<IndexSearcher, Long> entry : entriesToClose.entrySet()) {
+            logFine("Closing paginated query searcher, expired at %d", entry.getValue());
+            try {
+                entry.getKey().getIndexReader().close();
+            } catch (Exception ignored) {
+            }
+
+        }
+
+    }
+
+    void applyMemoryLimitToDocumentUpdateInfo() {
+        long memThresholdBytes = this.updateMapMemoryLimit;
+        final int bytesPerLinkEstimate = 64;
+        int count = 0;
+
+        if (hasOption(ServiceOption.INSTRUMENTATION)) {
+            setStat(STAT_NAME_VERSION_CACHE_ENTRY_COUNT, this.updatesPerLink.size());
+        }
+        // Note: this code will be updated in the future. It currently calls a host
+        // method, inside a lock, which is always a bad idea. The getServiceStage()
+        // method is lock free, but its still brittle.
+        synchronized (this.searchSync) {
+            if (this.updatesPerLink.isEmpty()) {
                 return;
             }
-            if (memThresholdBytes < this.linkAccessTimes.size() * bytesPerLinkEstimate) {
-                count = this.linkAccessTimes.size();
-                this.linkAccessTimes.clear();
-                // force searcher update next time updateSearcher is called
-                if (this.searcher != null) {
-                    this.searchersPendingClose.add(this.searcher);
+            if (memThresholdBytes > this.updatesPerLink.size() * bytesPerLinkEstimate) {
+                return;
+            }
+            Iterator<Entry<String, DocumentUpdateInfo>> li = this.updatesPerLink.entrySet()
+                    .iterator();
+            while (li.hasNext()) {
+                Entry<String, DocumentUpdateInfo> e = li.next();
+                // remove entries for services no longer attached / started on host
+                if (getHost().getServiceStage(e.getKey()) == null) {
+                    count++;
+                    li.remove();
                 }
-                this.searcher = null;
             }
+            // update index time to force searcher update, per thread
+            this.writerUpdateTimeMicros = Utils.getNowMicrosUtc();
         }
 
-        if (count > 0) {
-            logInfo("Cleared %d link access times", count);
-        }
-    }
-
-    private void applyDocumentExpirationPolicy(IndexWriter w) throws Throwable {
-        IndexSearcher s = updateSearcher(null, Integer.MAX_VALUE, w);
-        if (s == null) {
+        if (count == 0) {
             return;
         }
+        this.serviceRemovalDetectedTimeMicros = Utils.getNowMicrosUtc();
 
-        long expirationUpperBound = Utils.getNowMicrosUtc();
-
-        NumericRangeQuery<Long> versionQuery = NumericRangeQuery.newLongRange(
-                ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS, 1L, expirationUpperBound,
-                true,
-                true);
-
-        TopDocs results = s.search(versionQuery, Integer.MAX_VALUE);
-        if (results.totalHits == 0) {
-            return;
-        }
-
-        // The expiration query will return all versions for a link. Use a set so we only delete once per link
-        Set<String> links = new HashSet<>();
-        long now = Utils.getNowMicrosUtc();
-        for (ScoreDoc sd : results.scoreDocs) {
-            Document d = s.getIndexReader().document(sd.doc, this.fieldsToLoadNoExpand);
-            String link = d.get(ServiceDocument.FIELD_NAME_SELF_LINK);
-            IndexableField versionField = d.getField(ServiceDocument.FIELD_NAME_VERSION);
-            long versionExpired = versionField.numericValue().longValue();
-            long latestVersion = this.getLatestVersion(s, link);
-            if (versionExpired < latestVersion) {
-                continue;
-            }
-            if (!links.add(link)) {
-                continue;
-            }
-            checkAndDeleteExpiratedDocuments(link, s, sd.doc, d, now);
-        }
+        logInfo("Cleared %d document update entries", count);
     }
 
-    private void applyActiveQueries(ServiceDocument latestState, ServiceDocumentDescription desc) {
+    private void applyDocumentExpirationPolicy(IndexSearcher s, long deadline) throws Exception {
+
+        Query versionQuery = LongPoint.newRangeQuery(
+                ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS, 1L, Utils.getNowMicrosUtc());
+
+        ScoreDoc after = null;
+        Operation dummyDelete = null;
+        boolean firstQuery = true;
+        Map<String, Long> latestVersions = new HashMap<>();
+
+        do {
+            TopDocs results = s.searchAfter(after, versionQuery, expiredDocumentSearchThreshold,
+                    this.versionSort, false, false);
+            if (results.scoreDocs == null || results.scoreDocs.length == 0) {
+                return;
+            }
+
+            after = results.scoreDocs[results.scoreDocs.length - 1];
+
+            if (firstQuery && results.totalHits > expiredDocumentSearchThreshold) {
+                adjustTimeSeriesStat(STAT_NAME_DOCUMENT_EXPIRATION_FORCED_MAINTENANCE_COUNT,
+                        AGGREGATION_TYPE_SUM, 1);
+            }
+
+            firstQuery = false;
+
+            DocumentStoredFieldVisitor visitor = new DocumentStoredFieldVisitor();
+            for (ScoreDoc scoreDoc : results.scoreDocs) {
+                loadDoc(s, visitor, scoreDoc.doc, this.fieldsToLoadNoExpand);
+                String documentSelfLink = visitor.documentSelfLink;
+                Long latestVersion = latestVersions.get(documentSelfLink);
+                if (latestVersion == null) {
+                    long searcherUpdateTime = getSearcherUpdateTime(s, 0);
+                    latestVersion = getLatestVersion(s, searcherUpdateTime, documentSelfLink, 0,
+                            -1);
+                    latestVersions.put(documentSelfLink, latestVersion);
+                }
+
+                if (visitor.documentVersion < latestVersion) {
+                    continue;
+                }
+
+                // update document with one that has all fields, including binary state
+                augmentDoc(s, visitor, scoreDoc.doc, LUCENE_FIELD_NAME_BINARY_SERIALIZED_STATE);
+                ServiceDocument serviceDocument = null;
+                try {
+                    serviceDocument = getStateFromLuceneDocument(visitor, documentSelfLink);
+                } catch (Exception e) {
+                    logWarning("Error deserializing state for %s: %s", documentSelfLink,
+                            e.getMessage());
+                }
+
+                if (dummyDelete == null) {
+                    dummyDelete = Operation.createDelete(null);
+                }
+
+                deleteAllDocumentsForSelfLink(dummyDelete, documentSelfLink, serviceDocument);
+
+                adjustTimeSeriesStat(STAT_NAME_DOCUMENT_EXPIRATION_COUNT, AGGREGATION_TYPE_SUM, 1);
+            }
+        } while (Utils.getSystemNowMicrosUtc() < deadline);
+    }
+
+    private void applyActiveQueries(Operation op, ServiceDocument latestState,
+            ServiceDocumentDescription desc) {
         if (this.activeQueries.isEmpty()) {
             return;
         }
+
+        if (op.getAction() == Action.DELETE) {
+            // This code path is reached for document expiration, but the last update action for
+            // expired documents is usually a PATCH or PUT. Dummy up a document body with a last
+            // update action of DELETE for the purpose of providing notifications.
+            latestState = Utils.clone(latestState);
+            latestState.documentUpdateAction = Action.DELETE.name();
+        }
+
+        // set current context from the operation so all active query task notifications carry the
+        // same context as the operation that updated the index
+        OperationContext.setFrom(op);
 
         // TODO Optimize. We currently traverse each query independently. We can collapse the queries
         // and evaluate clauses keeping track which clauses applied, then skip any queries accordingly.
@@ -2076,14 +3939,15 @@ public class LuceneDocumentIndexService extends StatelessService {
 
             QueryTask activeTask = taskEntry.getValue();
             QueryFilter filter = activeTask.querySpec.context.filter;
-            if (desc == null) {
-                if (!QueryFilterUtils.evaluate(filter, latestState, getHost())) {
-                    continue;
-                }
-            } else {
-                if (!filter.evaluate(latestState, desc)) {
-                    continue;
-                }
+            boolean notify = false;
+            if (activeTask.querySpec.options.contains(QueryOption.CONTINUOUS)) {
+                notify = evaluateQuery(desc, filter, latestState);
+            }
+            if (!notify && activeTask.querySpec.options.contains(QueryOption.CONTINUOUS_STOP_MATCH)) {
+                notify = evaluateQuery(desc, filter, getPreviousStateForDoc(activeTask, latestState));
+            }
+            if (!notify) {
+                continue;
             }
 
             QueryTask patchBody = new QueryTask();
@@ -2091,15 +3955,57 @@ public class LuceneDocumentIndexService extends StatelessService {
             patchBody.querySpec = null;
             patchBody.results = new ServiceDocumentQueryResult();
             patchBody.results.documentLinks.add(latestState.documentSelfLink);
-            if (activeTask.querySpec.options.contains(QueryOption.EXPAND_CONTENT)) {
+            if (activeTask.querySpec.options.contains(QueryOption.EXPAND_CONTENT) ||
+                    activeTask.querySpec.options.contains(QueryOption.COUNT)) {
                 patchBody.results.documents = new HashMap<>();
                 patchBody.results.documents.put(latestState.documentSelfLink, latestState);
             }
 
             // Send PATCH to continuous query task with document that passed the query filter.
             // Any subscribers will get notified with the body containing just this document
-            sendRequest(Operation.createPatch(this, activeTask.documentSelfLink).setBodyNoCloning(
-                    patchBody));
+            Operation patchOperation = Operation.createPatch(this, activeTask.documentSelfLink)
+                    .setBodyNoCloning(
+                            patchBody);
+            // Set the authorization context to the user who created the continous query.
+            OperationContext currentContext = OperationContext.getOperationContext();
+            if (activeTask.querySpec.context.subjectLink != null) {
+                setAuthorizationContext(patchOperation,
+                        getAuthorizationContextForSubject(
+                                activeTask.querySpec.context.subjectLink));
+            }
+            sendRequest(patchOperation);
+            OperationContext.restoreOperationContext(currentContext);
         }
+    }
+
+    private boolean evaluateQuery(ServiceDocumentDescription desc, QueryFilter filter, ServiceDocument serviceState) {
+        if (serviceState == null) {
+            return false;
+        }
+        if (desc == null) {
+            if (!QueryFilterUtils.evaluate(filter, serviceState, getHost())) {
+                return false;
+            }
+        } else if (!filter.evaluate(serviceState, desc)) {
+            return false;
+        }
+        return true;
+    }
+
+    private ServiceDocument getPreviousStateForDoc(QueryTask activeTask, ServiceDocument latestState) {
+        boolean hasPreviousVersion = latestState.documentVersion > 0 ? true : false;
+        ServiceDocument previousState = null;
+        try {
+            if (hasPreviousVersion) {
+                previousState = getDocumentAtVersion(latestState.documentSelfLink, latestState.documentVersion - 1);
+            }
+        } catch (Exception e) {
+            logWarning("Exception getting previous state: %s", e.getMessage());
+        }
+        return previousState;
+    }
+
+    void setWriterUpdateTimeMicros(long writerUpdateTimeMicros) {
+        this.writerUpdateTimeMicros = writerUpdateTimeMicros;
     }
 }

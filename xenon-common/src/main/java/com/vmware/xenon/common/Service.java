@@ -17,6 +17,7 @@ import java.net.URI;
 import java.util.EnumSet;
 import java.util.concurrent.TimeUnit;
 
+import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 
 public interface Service extends ServiceRequestSender {
@@ -75,7 +76,8 @@ public interface Service extends ServiceRequestSender {
          * The runtime will route requests to the owner, regardless to which node receives a client
          * request.
          *
-         * These service handlers are invoked only on the service instance on the owner node:
+         * These service handlers are invoked only
+         * on the service instance on the owner node:
          * handleStart, handleMaintenance, handleGet, handleDelete, handlePut, handlePatch
          *
          * Service instances (replicas) on the other nodes will see replicated updates, as part of the
@@ -149,13 +151,27 @@ public interface Service extends ServiceRequestSender {
         IDEMPOTENT_POST,
 
         /**
-         * Runtime will load factory child services the first time a client attempts to access
-         * them. Replication services might load due to synchronization, when joining node groups.
+         * Deprecated
          *
-         * Requires: FACTORY_ITEM (services created through factories)
+         * All stateful persistent services are now started on-demand
          *
          */
         ON_DEMAND_LOAD,
+
+        /**
+         * Service has a single, initial version and will not accept any action other then DELETE
+         * for its entire lifetime. This option should be used to model immutable items such as logs,
+         * metrics where a high creation rate (high factory POST throughput) is desired but version
+         * tracking is not.
+         * The framework does not enforce a single version, but makes assumptions, to gain performance,
+         * that the service will only ever be created once, and deleted once. If the service developer
+         * violates these assumptions (by using {@link Operation#PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE}
+         * for example), behavior is unspecified.
+         *
+         * Requires: PERSISTENCE
+         * Not compatible with: PERIODIC_MAINTENANCE, INSTRUMENTATION
+         */
+        IMMUTABLE,
 
         /**
          * Service will queue operation in last in first out order. If limit on operation queue is
@@ -176,6 +192,14 @@ public interface Service extends ServiceRequestSender {
         URI_NAMESPACE_OWNER,
 
         /**
+         * Advanced option, reserved.
+         *
+         * Service is a core runtime service that requires isolation and higher guarantees from
+         * other services
+         */
+        CORE,
+
+        /**
          * Set by runtime. Service is associated with another service providing functionality for
          * one of the utility REST APIs.
          */
@@ -192,12 +216,21 @@ public interface Service extends ServiceRequestSender {
          */
         FACTORY_ITEM,
 
-
         /**
          * Set by runtime. Service is currently assigned ownership of the replicated document. Any
          * work initiated through an update should only happen on this instance
          */
         DOCUMENT_OWNER,
+
+        /**
+         * Set by runtime. Service has one or more pending transactions.
+         */
+        TRANSACTION_PENDING,
+
+        /**
+         * Set by runtime. Service is stateless.
+         */
+        STATELESS,
 
         NONE
     }
@@ -242,16 +275,15 @@ public interface Service extends ServiceRequestSender {
         INDEXING_INITIAL_STATE,
 
         /**
-         * Service is ready for operation processing. Any operations received while in the STARTED
-         * or INITIALIZED stage will be dequeued.
+         * Replicate the state to peer replicas.
          */
-        AVAILABLE,
+        REPLICATE_STATE,
 
         /**
-         * Service is paused due to memory pressure. Its detached from the service host and its
-         * runtime context is persisted to disk.
+         * Service is available. Any operations received before it became
+         * available will be dequeued and processed.
          */
-        PAUSED,
+        AVAILABLE,
 
         /**
          * Service is stopped and its resources have been released
@@ -285,32 +317,40 @@ public interface Service extends ServiceRequestSender {
     static final String STAT_NAME_AVAILABLE = "isAvailable";
     static final String STAT_NAME_FAILURE_COUNT = "failureCount";
     static final String STAT_NAME_REQUEST_OUT_OF_ORDER_COUNT = "requestOutOfOrderCount";
+    static final String STAT_NAME_REQUEST_FAILURE_QUEUE_LIMIT_EXCEEDED_COUNT = "requestFailureQueueLimitExceededCount";
     static final String STAT_NAME_STATE_PERSIST_LATENCY = "statePersistLatencyMicros";
     static final String STAT_NAME_OPERATION_QUEUEING_LATENCY = "operationQueueingLatencyMicros";
     static final String STAT_NAME_SERVICE_HANDLER_LATENCY = "operationHandlerProcessingLatencyMicros";
     static final String STAT_NAME_CREATE_COUNT = "createCount";
     static final String STAT_NAME_OPERATION_DURATION = "operationDuration";
+    static final String STAT_NAME_SERVICE_HOST_MAINTENANCE_COUNT = "hostMaintenanceCount";
     static final String STAT_NAME_MAINTENANCE_COUNT = "maintenanceCount";
     static final String STAT_NAME_NODE_GROUP_CHANGE_MAINTENANCE_COUNT = "maintenanceForNodeGroupChangeCount";
     static final String STAT_NAME_NODE_GROUP_SYNCH_DELAYED_COUNT = "maintenanceForNodeGroupDelayedCount";
     static final String STAT_NAME_MAINTENANCE_COMPLETION_DELAYED_COUNT = "maintenanceCompletionDelayedCount";
-    static final String STAT_NAME_CACHE_MISS_COUNT = "stateCacheMissCount";
-    static final String STAT_NAME_CACHE_CLEAR_COUNT = "stateCacheClearCount";
+    static final String STAT_NAME_DOCUMENT_OWNER_TOGGLE_ON_MAINT_COUNT = "maintenanceDocumentOwnerToggleOnCount";
+    static final String STAT_NAME_DOCUMENT_OWNER_TOGGLE_OFF_MAINT_COUNT = "maintenanceDocumentOwnerToggleOffCount";
     static final String STAT_NAME_VERSION_CONFLICT_COUNT = "stateVersionConflictCount";
     static final String STAT_NAME_VERSION_IN_CONFLICT = "stateVersionInConflict";
-    static final String STAT_NAME_PAUSE_COUNT = "pauseCount";
-    static final String STAT_NAME_RESUME_COUNT = "resumeCount";
+    static final String STAT_NAME_MAINTENANCE_DURATION = "maintenanceDuration";
+    static final String STAT_NAME_SYNCH_TASK_RETRY_COUNT = "synchTaskRetryCount";
+    static final String STAT_NAME_CHILD_SYNCH_FAILURE_COUNT = "childSynchFailureCount";
 
     /**
      * Estimate on run time context cost in bytes, per service instance. Services should not use instanced
      * fields, so, other than queuing context and utility service usage, the memory overhead should be small
      */
-    static final int MAX_SERIALIZED_SIZE_BYTES = 8192;
+    int MAX_SERIALIZED_SIZE_BYTES = 1024 * 64;
 
     /**
      * Default operation queue limit
      */
-    static final int OPERATION_QUEUE_DEFAULT_LIMIT = 10000;
+    int OPERATION_QUEUE_DEFAULT_LIMIT = 10000;
+
+    /**
+     * Default Synchronization queue limit
+     */
+    int SYNCH_QUEUE_DEFAULT_LIMIT = 100;
 
     /**
      * Equivalent to {@code getSelfId} and {@code UriUtils.getLastPathSegment}
@@ -391,6 +431,7 @@ public interface Service extends ServiceRequestSender {
     /**
      * Sends a request using the default service client associated with the host
      */
+    @Override
     void sendRequest(Operation op);
 
     /**
@@ -421,6 +462,10 @@ public interface Service extends ServiceRequestSender {
 
     long getMaintenanceIntervalMicros();
 
+    void setCacheClearDelayMicros(long micros);
+
+    long getCacheClearDelayMicros();
+
     ServiceHost getHost();
 
     String getSelfLink();
@@ -444,12 +489,25 @@ public interface Service extends ServiceRequestSender {
      * The default node selector services uses a consistent hashing scheme and
      * picks among all available nodes.
      */
-    void setPeerNodeSelectorPath(String link);
+    void setPeerNodeSelectorPath(String path);
 
     /**
-     * If replication is enabled, returns the URI path for the replication selector associated with the service
+     * Returns the URI path for the replication selector associated with the service
      */
     String getPeerNodeSelectorPath();
+
+    /**
+     * Sets the URI path to a document index service instance.
+     *
+     * The default document index is durable (disk backed) and is used when {@link ServiceOption#PERSISTENCE}
+     * is enabled
+     */
+    void setDocumentIndexPath(String path);
+
+    /**
+     * Returns the URI path for the document index service associated with the service
+     */
+    String getDocumentIndexPath();
 
     ServiceStat getStat(String name);
 
@@ -469,7 +527,7 @@ public interface Service extends ServiceRequestSender {
 
     void setProcessingStage(ProcessingStage initialized);
 
-    ServiceDocument setInitialState(String jsonState, Long initialVersion);
+    ServiceDocument setInitialState(Object state, Long initialVersion);
 
     void setState(Operation op, ServiceDocument newState);
 
@@ -481,4 +539,7 @@ public interface Service extends ServiceRequestSender {
 
     ServiceDocument getDocumentTemplate();
 
+    AuthorizationContext getSystemAuthorizationContext();
+
+    void setAuthorizationContext(Operation op, AuthorizationContext ctx);
 }

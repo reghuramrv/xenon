@@ -18,7 +18,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
 import java.util.HashSet;
-import java.util.UUID;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import org.junit.After;
@@ -46,13 +46,15 @@ public class TestRoleService extends BasicReusableHostTestCase {
     }
 
     RoleState validRoleState() {
-        RoleState state = new RoleState();
-        state.userGroupLink = "/mock-user-group-link";
-        state.resourceGroupLink = "/mock-resource-group-link";
-        state.verbs = new HashSet<>();
-        state.verbs.add(Action.GET);
-        state.verbs.add(Action.POST);
-        state.policy = Policy.ALLOW;
+        Set<Action> verbs = new HashSet<>();
+        verbs.add(Action.GET);
+        verbs.add(Action.POST);
+        RoleState state = RoleState.Builder.create()
+                .withUserGroupLink("/mock-user-group-link")
+                .withResourceGroupLink("/mock-resource-group-link")
+                .withVerbs(verbs)
+                .withPolicy(Policy.ALLOW)
+                .build();
         return state;
     }
 
@@ -84,9 +86,24 @@ public class TestRoleService extends BasicReusableHostTestCase {
     @Test
     public void testFactoryIdempotentPost() throws Throwable {
         RoleState state = validRoleState();
-        state.documentSelfLink = UUID.randomUUID().toString();
+        String servicePath = UriUtils.buildUriPath(RoleService.FACTORY_LINK, "my-role");
+        state.documentSelfLink = servicePath;
 
-        RoleState responseState = (RoleState) this.host.verifyPost(RoleState.class,
+        RoleState responseState = this.host.verifyPost(RoleState.class,
+                ServiceUriPaths.CORE_AUTHZ_ROLES,
+                state,
+                Operation.STATUS_CODE_OK);
+
+        assertEquals(state.userGroupLink, responseState.userGroupLink);
+        assertEquals(state.resourceGroupLink, responseState.resourceGroupLink);
+        assertEquals(state.verbs, responseState.verbs);
+        assertEquals(state.priority, responseState.priority);
+        assertEquals(state.policy, responseState.policy);
+        long initialVersion = responseState.documentVersion;
+
+        // second post should be converted to put
+        // Since sending same document, this post/put should not persist(increment) the document
+        responseState = this.host.verifyPost(RoleState.class,
                 ServiceUriPaths.CORE_AUTHZ_ROLES,
                 state,
                 Operation.STATUS_CODE_OK);
@@ -97,20 +114,12 @@ public class TestRoleService extends BasicReusableHostTestCase {
         assertEquals(state.priority, responseState.priority);
         assertEquals(state.policy, responseState.policy);
 
-        responseState = (RoleState) this.host.verifyPost(RoleState.class,
-                ServiceUriPaths.CORE_AUTHZ_ROLES,
-                state,
-                Operation.STATUS_CODE_NOT_MODIFIED);
+        RoleState getState = this.sender.sendAndWait(Operation.createGet(this.host, servicePath), RoleState.class);
+        assertEquals("version should not increase", initialVersion, getState.documentVersion);
 
-        assertEquals(state.userGroupLink, responseState.userGroupLink);
-        assertEquals(state.resourceGroupLink, responseState.resourceGroupLink);
-        assertEquals(state.verbs, responseState.verbs);
-        assertEquals(state.priority, responseState.priority);
-        assertEquals(state.policy, responseState.policy);
-
+        // modify document
         state.verbs.add(Action.PATCH);
-
-        responseState = (RoleState) this.host.verifyPost(RoleState.class,
+        responseState = this.host.verifyPost(RoleState.class,
                 ServiceUriPaths.CORE_AUTHZ_ROLES,
                 state,
                 Operation.STATUS_CODE_OK);
@@ -120,6 +129,7 @@ public class TestRoleService extends BasicReusableHostTestCase {
         assertEquals(state.verbs, responseState.verbs);
         assertEquals(state.priority, responseState.priority);
         assertEquals(state.policy, responseState.policy);
+        assertTrue("version should increase", initialVersion < responseState.documentVersion);
     }
 
     void testFactoryPostFailure(Supplier<RoleState> sup) throws Throwable {

@@ -13,10 +13,9 @@
 
 package com.vmware.xenon.common;
 
-import static com.vmware.xenon.common.TransactionServiceHelper.abortTransactions;
 import static com.vmware.xenon.common.TransactionServiceHelper.handleGetWithinTransaction;
 import static com.vmware.xenon.common.TransactionServiceHelper.handleOperationInTransaction;
-import static com.vmware.xenon.common.TransactionServiceHelper.notifyTransactionCoordinator;
+import static com.vmware.xenon.common.TransactionServiceHelper.notifyTransactionCoordinatorOp;
 
 import java.net.URI;
 import java.util.Collection;
@@ -24,15 +23,19 @@ import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.InstrumentationContext;
+import com.vmware.xenon.common.OperationProcessingChain.OperationProcessingContext;
+import com.vmware.xenon.common.RequestRouter.Route.RouteDocumentation;
+import com.vmware.xenon.common.RequestRouter.Route.SupportLevel;
+import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
 import com.vmware.xenon.common.ServiceErrorResponse.ErrorDetail;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
-import com.vmware.xenon.common.ServiceStats.ServiceStatLogHistogram;
 import com.vmware.xenon.common.jwt.Signer;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 
@@ -42,6 +45,15 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
  */
 public class StatefulService implements Service {
 
+    private static class AdditionalContext {
+        public long maintenanceInterval;
+        private Long cacheClearDelayMicros;
+        public transient OperationProcessingChain opProcessingChain;
+        public String nodeSelectorLink = ServiceUriPaths.DEFAULT_NODE_SELECTOR;
+        public String documentIndexLink = ServiceUriPaths.CORE_DOCUMENT_INDEX;
+        public Set<String> txCoordinatorLinks;
+    }
+
     private static class RuntimeContext {
         public ProcessingStage processingStage = ProcessingStage.CREATED;
         public String selfLink;
@@ -50,18 +62,17 @@ public class StatefulService implements Service {
 
         public EnumSet<ServiceOption> options = EnumSet.noneOf(ServiceOption.class);
         public Class<? extends ServiceDocument> stateType;
-        public long maintenanceInterval;
+
+        public OperationQueue synchQueue;
         public OperationQueue operationQueue;
         public boolean isUpdateActive;
         public int getActiveCount;
 
         public transient ServiceHost host;
-        public transient OperationProcessingChain opProcessingChain;
-
         public UtilityService utilityService;
-        public String nodeSelectorLink = ServiceUriPaths.DEFAULT_NODE_SELECTOR;
+        public long lastCommitTimeMicros;
 
-        public Set<String> txCoordinatorLinks;
+        public AdditionalContext extras;
     }
 
     private final RuntimeContext context = new RuntimeContext();
@@ -82,7 +93,10 @@ public class StatefulService implements Service {
 
     @Override
     public OperationProcessingChain getOperationProcessingChain() {
-        return this.context.opProcessingChain;
+        if (this.context.extras == null) {
+            return null;
+        }
+        return this.context.extras.opProcessingChain;
     }
 
     @Override
@@ -127,9 +141,8 @@ public class StatefulService implements Service {
         if (op.getAction() != Action.DELETE
                 && this.context.processingStage != ProcessingStage.AVAILABLE) {
 
-            if (this.context.processingStage == ProcessingStage.PAUSED) {
-                logWarning("Service in stage %s, retrying request", this.context.processingStage);
-                getHost().handleRequest(this, op);
+            if (this.context.processingStage == ProcessingStage.STOPPED) {
+                getHost().retryOnDemandLoadConflict(op, this);
                 return true;
             }
 
@@ -137,21 +150,20 @@ public class StatefulService implements Service {
             // available
             logWarning("Service in %s stage, cancelling operation",
                     this.context.processingStage);
-            op.fail(new CancellationException());
+            op.fail(new CancellationException("Service is not available"));
             return true;
         }
 
         if (hasOption(Service.ServiceOption.INSTRUMENTATION)) {
-            op.setEnqueueTime(Utils.getNowMicrosUtc());
+            op.setEnqueueTime(System.nanoTime() / 1000);
         }
 
-        URI referer = op.getReferer();
-        if (referer == null) {
+        if (!op.hasReferer()) {
             op.fail(new IllegalArgumentException("Referer is required"));
             return true;
         }
 
-        if (!hasOption(ServiceOption.CONCURRENT_UPDATE_HANDLING) && queueSynchronizedRequest(op)) {
+        if (!hasOption(ServiceOption.CONCURRENT_UPDATE_HANDLING) && queueRequestInternal(op)) {
             return true;
         }
 
@@ -160,13 +172,16 @@ public class StatefulService implements Service {
 
     private boolean checkServiceStopped(Operation op, boolean stop) {
         boolean isAlreadyStopped = this.context.processingStage == ProcessingStage.STOPPED;
+        boolean isDeleteAndStop = ServiceHost.isServiceDeleteAndStop(op);
+        boolean hasActiveUpdates = false;
 
-        if (isAlreadyStopped) {
-            if (op.getAction() != Action.DELETE) {
-                logWarning("Service is stopped, cancelling operation");
-                op.fail(new CancellationException());
-            } else {
-                op.complete();
+        synchronized (this.context) {
+            isAlreadyStopped = this.context.processingStage == ProcessingStage.STOPPED;
+            if (!hasActiveUpdates && this.context.synchQueue != null) {
+                hasActiveUpdates = true;
+            }
+            if (!hasActiveUpdates && !this.context.operationQueue.isEmpty()) {
+                hasActiveUpdates = true;
             }
         }
 
@@ -174,92 +189,150 @@ public class StatefulService implements Service {
             return false;
         }
 
-        // even if service is stopped, check the pending queue for operations
+        if (isAlreadyStopped) {
+            if (op.getAction() == Action.DELETE && !isDeleteAndStop) {
+                // this is a pure stop, and the service has already stopped
+                op.complete();
+            } else {
+                // this is an incoming request and the service has just stopped - retry
+                getHost().retryOnDemandLoadConflict(op, this);
+            }
+            return true;
+        }
+
+        if (hasActiveUpdates && !isDeleteAndStop) {
+            // This method was called with the intent to stop the service. However, a
+            // service with active updates should NOT stop. This can cause DELETEs to fail from
+            // the periodic logic that stops idle services.
+            // Client DELETE operations will not be cancelled: we will fall through below
+            // and accept the DELETE but cancel any queued/pending operations
+            op.fail(new CancellationException("Service is active"));
+            return true;
+        }
+
+        // we can stop the service and cancel pending requests
         setProcessingStage(Service.ProcessingStage.STOPPED);
+        cancelPendingRequests(op);
+        return false;
+    }
+
+    private void cancelPendingRequests(Operation op) {
         Collection<Operation> opsToCancel = null;
-        Set<String> txCoordinators = null;
+        boolean isDeleteAndStop = ServiceHost.isServiceDeleteAndStop(op);
+
         synchronized (this.context) {
             opsToCancel = this.context.operationQueue.toCollection();
             this.context.operationQueue.clear();
-            if (hasPendingTransactions()) {
-                txCoordinators = new HashSet<>(this.context.txCoordinatorLinks);
-                txCoordinators.clear();
+
+            if (this.context.synchQueue != null) {
+                opsToCancel.addAll(this.context.synchQueue.toCollection());
+                this.context.synchQueue.clear();
             }
         }
-
-        abortTransactions(this, txCoordinators);
 
         for (Operation o : opsToCancel) {
             if (o.isFromReplication() && o.getAction() == Action.DELETE) {
                 o.complete();
             } else {
-                o.fail(new CancellationException(getSelfLink()));
+                if (!isDeleteAndStop) {
+                    // Pending requests need to be retried on services that are being stopped.
+                    getHost().retryOnDemandLoadConflict(o, this);
+                } else {
+                    o.fail(new CancellationException(getSelfLink()));
+                }
             }
         }
-
-        // return true only if service was stopped before we tried to stop it
-        return isAlreadyStopped;
     }
+
+    // Set of local flags to avoid allocation and use of EnumSet in the fast path
+    // for queueRequestInternal. The use of integer flags is the exception, not the norm
+    // and only justified in very few places
+    private static final int STOP_FLAG = 0x00000002;
+    private static final int RETURN_TRUE_FLAG = 0x10000000;
 
     /**
      * Returns true if a request was handled (caller should not attempt to dispatch it)
      */
-    private boolean queueSynchronizedRequest(final Operation op) {
-        boolean isPaused = false;
-        if (op.getAction() != Action.GET && op.getAction() != Action.OPTIONS) {
-            // serialize updates
-            synchronized (this.context) {
-                if (this.context.processingStage == ProcessingStage.PAUSED) {
-                    isPaused = true;
-                } else if (this.context.processingStage == ProcessingStage.STOPPED) {
-                    // fall through, request will be cancelled
-                } else if ((this.context.isUpdateActive || this.context.getActiveCount != 0)) {
-                    if (!this.context.operationQueue.offer(op)) {
-                        getHost().failRequestLimitExceeded(op);
-                    }
-                    return true;
-                } else {
-                    this.context.isUpdateActive = true;
-                }
-            }
+    private boolean queueRequestInternal(final Operation op) {
+        int stopped = 0;
+        Action a = op.getAction();
+
+        if (a == Action.PATCH
+                || a == Action.PUT
+                || a == Action.DELETE
+                || a == Action.POST) {
+            stopped = queueUpdateRequestInternal(op, stopped);
         } else {
-            if (op.getAction() == Action.OPTIONS) {
+            if (a == Action.OPTIONS) {
                 return false;
             } else if (hasOption(ServiceOption.CONCURRENT_GET_HANDLING)) {
                 // Indexed services serve GET directly from document store so they
                 // can run in parallel with updates and each other
                 return false;
             } else {
-                // queue GETs, if updates are pending
-                synchronized (this.context) {
-                    if (this.context.processingStage == ProcessingStage.PAUSED) {
-                        isPaused = true;
-                    } else if (this.context.processingStage == ProcessingStage.STOPPED) {
-                        // fall through, request will be cancelled
-                    } else if (this.context.isUpdateActive) {
-                        if (!this.context.operationQueue.offer(op)) {
-                            getHost().failRequestLimitExceeded(op);
-                        }
-                        return true;
-                    } else {
-                        this.context.getActiveCount++;
-                    }
-                }
+                stopped = queueGetRequestInternal(op, stopped);
             }
         }
 
-        if (isPaused && !getHost().isStopping()) {
-            logWarning("Service in stage %s, retrying request", this.context.processingStage);
-            getHost().handleRequest(this, op);
+        if ((stopped & RETURN_TRUE_FLAG) != 0) {
             return true;
         }
 
-        // ask to stop service, even if it might be stopped, so we can drain any pending queues
+        if (stopped != 0 && !getHost().isStopping()) {
+            logWarning("Service in stage %s, retrying request", this.context.processingStage);
+            getHost().retryOnDemandLoadConflict(op, this);
+            return true;
+        }
+
         if (checkServiceStopped(op, false)) {
             return true;
         }
 
         return false;
+    }
+
+    private int queueGetRequestInternal(final Operation op, int stopped) {
+        // queue GETs, if updates are pending
+        synchronized (this.context) {
+            if (this.context.processingStage == ProcessingStage.STOPPED) {
+                stopped |= STOP_FLAG;
+            } else if (this.context.isUpdateActive) {
+                if (!this.context.operationQueue.offer(op)) {
+                    failRequestLimitExceeded(op, "operationQueue for GET on " + getSelfLink());
+                }
+                return RETURN_TRUE_FLAG;
+            } else {
+                this.context.getActiveCount++;
+            }
+        }
+        return stopped;
+    }
+
+    private int queueUpdateRequestInternal(final Operation op, int stopped) {
+        // serialize updates
+        synchronized (this.context) {
+            if (this.context.processingStage == ProcessingStage.STOPPED) {
+                stopped |= STOP_FLAG;
+            } else if ((this.context.isUpdateActive || this.context.getActiveCount != 0)) {
+                if (op.isSynchronizeOwner()) {
+                    // Synchronization requests are queued in a separate queue
+                    // so that they can prioritized higher than other updates.
+                    if (this.context.synchQueue == null) {
+                        this.context.synchQueue = OperationQueue
+                                .createFifo(Service.SYNCH_QUEUE_DEFAULT_LIMIT);
+                    }
+                    if (!this.context.synchQueue.offer(op)) {
+                        failRequestLimitExceeded(op, "synchQueue on " + getSelfLink());
+                    }
+                } else if (!this.context.operationQueue.offer(op)) {
+                    failRequestLimitExceeded(op, "operationQueue for update on " + getSelfLink());
+                }
+                return RETURN_TRUE_FLAG;
+            } else {
+                this.context.isUpdateActive = true;
+            }
+        }
+        return stopped;
     }
 
     @Override
@@ -272,6 +345,15 @@ public class StatefulService implements Service {
         boolean isCompletionNested = false;
         try {
             if (opProcessingStage == OperationProcessingStage.LOADING_STATE) {
+
+                if (hasOption(ServiceOption.IMMUTABLE)
+                        && (request.getAction() == Action.PATCH
+                                || request.getAction() == Action.PUT)) {
+                    processPending(request);
+                    Operation.failActionNotSupported(request);
+                    return;
+                }
+
                 if (ServiceHost.isServiceStop(request)) {
                     // local shutdown induced delete. By pass two stage operation processing
                     request.nestCompletion((o, e) -> {
@@ -299,15 +381,17 @@ public class StatefulService implements Service {
             }
 
             if (opProcessingStage == OperationProcessingStage.PROCESSING_FILTERS) {
+
                 if (request.getAction() != Action.GET && validateOwnerSelectedUpdate(request)) {
                     return;
                 }
 
                 request.nestCompletion(this::handleRequestCompletion);
+
                 isCompletionNested = true;
 
                 if (handleOperationInTransaction(this, this.context.stateType,
-                        this.context.txCoordinatorLinks, request)) {
+                        request, getHost().getSystemAuthorizationContext())) {
                     return;
                 }
 
@@ -323,64 +407,79 @@ public class StatefulService implements Service {
                 }
 
                 OperationProcessingChain opProcessingChain = getOperationProcessingChain();
-                if (opProcessingChain != null && !opProcessingChain.processRequest(request)) {
+                if (opProcessingChain != null) {
+                    OperationProcessingContext context = opProcessingChain.createContext(getHost());
+                    context.setService(this);
+                    opProcessingChain.processRequest(request, context, o -> {
+                        handleRequest(request, OperationProcessingStage.EXECUTING_SERVICE_HANDLER);
+                    });
                     return;
                 }
-
                 opProcessingStage = OperationProcessingStage.EXECUTING_SERVICE_HANDLER;
             }
 
-            if (opProcessingStage == OperationProcessingStage.EXECUTING_SERVICE_HANDLER) {
-                isCompletionNested = true;
+            handleRequestStageExecutingServiceHandler(request,
+                    opProcessingStage, isCompletionNested);
+        } catch (Exception e) {
+            handleRequestUnhandledException(request, isCompletionNested, e);
+        }
+    }
 
-                switch (request.getAction()) {
-                case DELETE:
-                    if (ServiceHost.isServiceStop(request)) {
+    private void handleRequestUnhandledException(Operation request, boolean isCompletionNested,
+            Throwable e) {
+        if (Utils.isValidationError(e)) {
+            logFine("Validation Error: %s", Utils.toString(e));
+        } else {
+            logWarning("Uncaught exception: %s", e.toString());
+            // log stack trace in a new log messages in case out of memory prevents us from forming
+            // the stack trace string
+            logWarning("Exception trace: %s", Utils.toString(e));
+        }
+        if (isCompletionNested) {
+            request.fail(e);
+        } else {
+            handleRequestCompletion(request, e);
+        }
+    }
+
+    private boolean handleRequestStageExecutingServiceHandler(Operation request,
+            OperationProcessingStage opProcessingStage, boolean isCompletionNested) {
+        if (opProcessingStage == OperationProcessingStage.EXECUTING_SERVICE_HANDLER) {
+            isCompletionNested = true;
+            switch (request.getAction()) {
+            case DELETE:
+                if (ServiceHost.isServiceStop(request)) {
+                    handleStop(request);
+                } else {
+                    // after handleDelete completes the operation with success, run handleStop. If that
+                    // succeeds, we proceed with normal processing
+                    request.nestCompletion((o) -> {
                         handleStop(request);
-                    } else {
-                        // after handleDelete completes the operation with success, run handleStop. If that
-                        // succeeds, we proceed with normal processing
-                        request.nestCompletion((o) -> {
-                            handleStop(request);
-                        });
-                        handleDelete(request);
-                    }
-                    break;
-                case GET:
-                    handleGet(request);
-                    break;
-                case PATCH:
-                    handlePatch(request);
-                    break;
-                case POST:
-                    handlePost(request);
-                    break;
-                case PUT:
-                    handlePut(request);
-                    break;
-                case OPTIONS:
-                    handleOptions(request);
-                    break;
-                default:
-                    getHost().failRequestActionNotSupported(request);
-                    break;
+                    });
+                    handleDelete(request);
                 }
-            }
-        } catch (Throwable e) {
-            if (Utils.isValidationError(e)) {
-                logFine("Validation Error: %s", Utils.toString(e));
-            } else {
-                logWarning("Uncaught exception: %s", e.toString());
-                // log stack trace in a new log messages in case out of memory prevents us from forming
-                // the stack trace string
-                logWarning("Exception trace: %s", Utils.toString(e));
-            }
-            if (isCompletionNested) {
-                request.fail(e);
-            } else {
-                handleRequestCompletion(request, e);
+                break;
+            case GET:
+                handleGet(request);
+                break;
+            case PATCH:
+                handlePatch(request);
+                break;
+            case POST:
+                handlePost(request);
+                break;
+            case PUT:
+                handlePut(request);
+                break;
+            case OPTIONS:
+                handleOptions(request);
+                break;
+            default:
+                Operation.failActionNotSupported(request);
+                break;
             }
         }
+        return isCompletionNested;
     }
 
     /**
@@ -391,8 +490,8 @@ public class StatefulService implements Service {
      */
     private boolean handleRequestLoadingAndLinkingState(Operation request) {
         if (hasOption(Service.ServiceOption.INSTRUMENTATION)) {
-            request.setHandlerInvokeTime(Utils.getNowMicrosUtc());
-            adjustStat(request.getAction() + Service.STAT_NAME_REQUEST_COUNT, 1.0);
+            request.setHandlerInvokeTime(System.nanoTime() / 1000);
+            adjustStat(ServiceStatUtils.getPerActionRequestCountName(request.getAction()), 1.0);
         }
 
         if (checkServiceStopped(request, false)) {
@@ -404,6 +503,8 @@ public class StatefulService implements Service {
             // as the body. No need to load local state.
             ServiceDocument state = request.getBody(this.context.stateType);
             request.linkState(state);
+            // signal service has been accessed to delay stopping
+            getHost().getCachedServiceState(this, request);
             return false;
         }
 
@@ -419,15 +520,15 @@ public class StatefulService implements Service {
         // do basic version checking, regardless of service options
         ServiceDocument stateFromOwner = request.getLinkedState();
         if (!request.isFromReplication()) {
-            if (request.isSynchronize()) {
+            if (request.isSynchronizeOwner()) {
                 synchronizeWithPeers(request, null);
                 return true;
             }
 
             if (hasOption(ServiceOption.OWNER_SELECTION)) {
                 if (!hasOption(ServiceOption.DOCUMENT_OWNER)) {
-                    synchronizeWithPeers(request, new IllegalStateException(
-                            "not marked as owner"));
+                    // most likely we have just become the owner - synch and re-process request
+                    synchWithPeersAndReProcess(request);
                     return true;
                 } else {
                     return false;
@@ -477,16 +578,47 @@ public class StatefulService implements Service {
             return true;
         }
 
-        if (hasOption(ServiceOption.DOCUMENT_OWNER)
-                && !stateFromOwner.documentOwner.equals(getHost().getId())) {
+        if (stateFromOwner.documentOwner.equals(getHost().getId())) {
+            if (request.isSynchronizePeer()) {
+                // a request can be marked replicated AND synchronize, if its a synchronization attempt
+                // from a remote node, that was not owner for the service. Enable the DOCUMENT_OWNER
+                // option since we agree on who the owner is
+                toggleOption(ServiceOption.DOCUMENT_OWNER, true);
+            }
+        } else {
             // The local host is no longer the owner. The service host would have failed the
             // request if we disagreed with the sender, on who the owner is. Here we simply
             // toggle the owner option off
             toggleOption(ServiceOption.DOCUMENT_OWNER, false);
-            return false;
         }
 
         return false;
+    }
+
+    private void synchWithPeersAndReProcess(Operation op) {
+        ServiceDocument d = new ServiceDocument();
+        d.documentSelfLink = UriUtils.getLastPathSegment(getSelfLink());
+        Operation synchOwnerRequest = Operation.createPost(getUri())
+                .setBody(d)
+                .linkState(op.getLinkedState())
+                .setReferer(getUri())
+                .setConnectionSharing(true)
+                .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER)
+                .setRetryCount(0)
+                .setExpiration(op.getExpirationMicrosUtc())
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        op.fail(e);
+                        return;
+                    }
+
+                    // now that we have the latest state, and are marked as owner,
+                    // we can re-process the request
+                    handleRequest(op);
+                });
+
+        synchronizeWithPeers(synchOwnerRequest, null);
     }
 
     /**
@@ -505,6 +637,11 @@ public class StatefulService implements Service {
         if (request.isFromReplication()) {
             // Skip update checking. We only do strict update matching on the node performing the
             // update (owner or entry node)
+            return false;
+        }
+
+        if (request.getRequestHeaderAsIs(Operation.TRANSACTION_HEADER) != null) {
+            // Skip update checking in case of a transaction control operation
             return false;
         }
 
@@ -547,22 +684,26 @@ public class StatefulService implements Service {
         return false;
     }
 
+    @RouteDocumentation(supportLevel = SupportLevel.NOT_SUPPORTED)
     public void handlePost(Operation post) {
-        getHost().failRequestActionNotSupported(post);
+        Operation.failActionNotSupported(post);
     }
 
+    @RouteDocumentation(description = "Delete this service instance")
     public void handleDelete(Operation delete) {
         delete.complete();
     }
 
+    @Override
     public void handleStop(Operation delete) {
         // nested completion from Service will take care of actually shutting
         // down the service
         delete.complete();
     }
 
+    @RouteDocumentation(supportLevel = SupportLevel.NOT_SUPPORTED)
     public void handlePatch(Operation patch) {
-        getHost().failRequestActionNotSupported(patch);
+        Operation.failActionNotSupported(patch);
     }
 
     public void handleOptions(Operation options) {
@@ -572,18 +713,21 @@ public class StatefulService implements Service {
     /**
      * Replace current state, with the body of the request, in one step
      */
+    @RouteDocumentation(description = "Replace current state with the body of the request")
     public void handlePut(Operation put) {
         ServiceDocument newState = put.getBody(this.context.stateType);
         setState(put, newState);
         put.complete();
     }
 
+    @RouteDocumentation(description = "Read the service document")
     public void handleGet(Operation get) {
         if (!hasPendingTransactions()) {
             handleGetSimple(get);
             return;
         }
-        handleGetWithinTransaction(this, get, this::handleGetSimple, this::failRequest);
+        handleGetWithinTransaction(this, get, this::handleGetSimple, this::failRequest,
+                getHost().getSystemAuthorizationContext());
     }
 
     /**
@@ -620,7 +764,7 @@ public class StatefulService implements Service {
      *
      * 3) Index (save state)
      *
-     * 4) Notify transaction coordinator
+     * 4) When under a transaction, notify the coordinator before the client receives the response
      *
      * 5) Update operation stats
      *
@@ -633,22 +777,28 @@ public class StatefulService implements Service {
      */
     private void handleRequestCompletion(Operation op, Throwable e) {
         if (hasOption(Service.ServiceOption.INSTRUMENTATION)) {
-            op.setHandlerCompletionTime(Utils.getNowMicrosUtc());
+            op.setHandlerCompletionTime(System.nanoTime() / 1000);
         }
 
         ServiceDocument linkedState = op.getLinkedState();
-        boolean isUpdate = op.getAction() != Action.GET && op.getAction() != Action.OPTIONS;
-        boolean isStateUpdated = isUpdate;
+        boolean isStateUpdated = op.getAction() != Action.GET && op.getAction() != Action.OPTIONS;
 
         if (op.isFromReplication()) {
             isStateUpdated = true;
         }
 
-        if (op.getStatusCode() == Operation.STATUS_CODE_NOT_MODIFIED) {
+        if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED)) {
             isStateUpdated = false;
         } else if (op.getTransactionId() != null && linkedState != null &&
                 op.getTransactionId().equals(linkedState.documentTransactionId)) {
             isStateUpdated = true;
+        }
+
+        if (op.getStatusCode() == Operation.STATUS_CODE_NOT_MODIFIED) {
+            // nullify the body since HTTP-304 cannot have body in response.
+            // It is defined for GET, but not defined for other actions.
+            // For now, apply the same behavior to all http actions.
+            op.setBody(null);
         }
 
         // evolve the common properties such as version
@@ -664,94 +814,78 @@ public class StatefulService implements Service {
                 }
                 applyUpdate(op);
                 linkedState = op.getLinkedState();
-            } catch (Throwable e1) {
+            } catch (Exception e1) {
                 logSevere(e1);
                 // set failure so we fail operation below
                 e = e1;
             }
         }
 
-        if (op.isWithinTransaction() && this.getHost().getTransactionServiceUri() != null) {
-            synchronized (this.context) {
-                if (this.context.txCoordinatorLinks == null) {
-                    this.context.txCoordinatorLinks = new HashSet<>();
-                }
-            }
-            notifyTransactionCoordinator(this, this.context.txCoordinatorLinks, op, e);
+        if (handleRequestCompletionSpecialCases(op, e)) {
+            return;
         }
 
+        if (isStateUpdated && linkedState != null) {
+            // defense in depth: conform state so core fields are properly set
+            if (linkedState.documentDescription != null) {
+                linkedState.documentDescription = null;
+            }
+
+            linkedState.documentSelfLink = this.context.selfLink;
+            linkedState.documentUpdateAction = op.getAction().name();
+            if (linkedState.documentKind == null) {
+                linkedState.documentKind = Utils.buildKind(this.context.stateType);
+            }
+            if (op.getTransactionId() != null && linkedState.documentTransactionId == null) {
+                // reset transaction id in case it got overwritten by the service handler;
+                // unless it's a transaction control op
+                if (op.getRequestHeader(Operation.TRANSACTION_HEADER) == null) {
+                    linkedState.documentTransactionId = op.getTransactionId();
+                }
+            }
+
+            if (processCompletionStageReplicationProposal(op)) {
+                return;
+            }
+
+            // next stage will process pending operations, disable finally clause from
+            // duplicating work
+            processCompletionStageIndexing(op);
+        } else {
+            processCompletionStagePublishAndComplete(op);
+            processPending(op);
+        }
+    }
+
+    private boolean handleRequestCompletionSpecialCases(Operation op, Throwable e) {
         if (e != null) {
             if (hasOption(Service.ServiceOption.INSTRUMENTATION)) {
                 adjustStat(op.getAction() + Service.STAT_NAME_FAILURE_COUNT, 1);
             }
             // operation has failed, complete and process any queued operations
-            failRequest(op, e);
-            return;
+            // If the request is in a transaction, notify the coordinator first.
+            processCompletionStageTransactionNotification(op, e);
+            return true;
         }
 
-        boolean processPending = true;
-        try {
-            if (op.getAction() == Action.DELETE && op.getTransactionId() == null
-                    && handleDeleteCompletion(op)) {
-                processPending = false;
-                return;
-            }
-
-            if (op.getAction() == Action.OPTIONS) {
-                handleOptionsCompletion(op);
-                return;
-            }
-
-            if (isStateUpdated && linkedState != null) {
-                // defense in depth: conform state so core fields are properly set
-                if (linkedState.documentDescription != null) {
-                    linkedState.documentDescription = null;
-                }
-
-                linkedState.documentSelfLink = this.context.selfLink;
-                if (linkedState.documentKind == null) {
-                    linkedState.documentKind = Utils.buildKind(this.context.stateType);
-                }
-
-                if (replicateRequest(op)) {
-                    processPending = false;
-                    return;
-                }
-
-                saveState(op);
-            } else {
-                completeRequest(op);
-            }
-        } finally {
-            if (processPending) {
-                // this must always be called after state is saved / cloned (for SYNCHRONIZED
-                // services
-                processPending(op);
-            }
+        if (op.getAction() == Action.DELETE && op.getTransactionId() == null
+                && handleDeleteCompletion(op)) {
+            return true;
         }
+
+        if (op.getAction() == Action.OPTIONS) {
+            handleOptionsCompletion(op);
+            processPending(op);
+            return true;
+        }
+        return false;
     }
 
     protected void handleOptionsCompletion(Operation options) {
         if (!options.hasBody()) {
             options.setBodyNoCloning(getDocumentTemplate());
         }
-        completeRequest(options);
-    }
-
-    private void failRequest(Operation op, Throwable e) {
-        failRequest(op, e, false);
-    }
-
-    private void failRequest(Operation op, Throwable e, boolean shouldRetry) {
-        if (shouldRetry) {
-            // Request client side retries on state or consensus conflict
-            ServiceErrorResponse rsp = ServiceErrorResponse.create(e, op.getStatusCode(),
-                    EnumSet.of(ErrorDetail.SHOULD_RETRY));
-            op.setBodyNoCloning(rsp);
-        }
-
-        processPending(op);
-        op.fail(e);
+        processCompletionStagePublishAndComplete(options);
     }
 
     private boolean isIndexed() {
@@ -772,7 +906,7 @@ public class StatefulService implements Service {
         // DELETE completion runs when a DELETE was issued by a client, not local host shutdown.
         // It needs to stop the service now, since the handleDelete() and handleStop() handlers
         // have already run.
-
+        getHost().markAsPendingDelete(this);
         getHost().stopService(this);
         return false;
     }
@@ -786,7 +920,13 @@ public class StatefulService implements Service {
         op.complete();
     }
 
-    private boolean replicateRequest(Operation op) {
+    /**
+     * Part of operation completion processing. If the service requires replication, we ask
+     * the host to invoke the proper node selector service to replicate the update to peers.
+     * On completion, we determine if we need to issue a commit. Then we invoke the next stage,
+     * indexing of state.
+     */
+    private boolean processCompletionStageReplicationProposal(Operation op) {
         if (!hasOption(ServiceOption.REPLICATION)) {
             return false;
         }
@@ -800,26 +940,32 @@ public class StatefulService implements Service {
             return false;
         }
 
+        if (op.getAction() == Action.DELETE && !op.hasBody()) {
+            ServiceDocument body = op.getLinkedState();
+            op.setBodyNoCloning(body);
+        }
+
         if (!op.hasBody()) {
-            // we do not replicate operations without a body. The only such
-            // operation that is valid is a DELETE to stop a service locally,
-            // but local service stops do not replicate. A DELETE with a body,
-            // which causes both a stop and the service document to be removed,
-            // will be replicated
+            // we replicate the linked state but only do so if there is a request body
+            // associated with the update. So even if we don't replicate the body, we
+            // still require it to be there.
             return false;
         }
 
         op.nestCompletion((o, e) -> {
             if (e != null) {
-                synchronizeWithPeers(op, e);
+                ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
+                // only proceed with synchronization if a retry is requested
+                if (rsp != null && rsp.details != null
+                        && rsp.details.contains(ErrorDetail.SHOULD_RETRY)) {
+                    synchronizeWithPeers(op, e);
+                } else {
+                    failRequest(op, e);
+                }
                 return;
             }
             op.setReplicationDisabled(true);
-            try {
-                saveState(op);
-            } finally {
-                processPending(op);
-            }
+            processCompletionStageCommit(op);
         });
 
         getHost().replicateRequest(this.context.options, op.getLinkedState(),
@@ -827,20 +973,203 @@ public class StatefulService implements Service {
         return true;
     }
 
-    private void saveState(Operation op) {
-        op.nestCompletion((o, e) -> {
-            if (e != null) {
-                failRequest(op, e);
+    /**
+     * Part of operation completion processing. If the service is about to idle, advertise last
+     * request, as a commit, to all peers.
+     * Only applies to services with {@link ServiceOption#OWNER_SELECTION}
+     */
+    private void processCompletionStageCommit(Operation op) {
+        boolean indexState = true;
+        try {
+            if (op.getStatusCode() >= Operation.STATUS_CODE_FAILURE_THRESHOLD) {
+                // we only commit updates that were accepted by the owner, so ignore this
+                // failed update
                 return;
             }
-            completeRequest(op);
-        });
 
-        ServiceDocument mergedState = op.getLinkedState();
-        this.context.host.saveServiceState(this, op, mergedState);
+            if (op.isFromReplication() || op.getAction() == Action.GET) {
+                // only owners advertise commits, on updates
+                return;
+            }
+
+            if (!hasOption(ServiceOption.DOCUMENT_OWNER)) {
+                // Explicit commit messages are only sent from this instance on the owner node
+                return;
+            }
+
+            // The owner has the responsibility to advertise the most recent committed state
+            // to all the peers. If operations are flowing, operation at version N, informs services to
+            // commit proposal at N-1. However, if no new operations occur, the owner
+            // must still communicate the last commit in a timely fashion otherwise the replicas
+            // will be behind. Here we re-issue the current state (committed) when we notice the
+            // pending operation queue is empty
+            if (op.getAction() != Action.DELETE) {
+                if (!this.context.operationQueue.isEmpty()) {
+                    return;
+                }
+            } else {
+                if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)) {
+                    // Directive indicates this update should have no persistence side-effects. Do not
+                    // forward to peers. This is often due to local stop from host shutting down.
+                    return;
+                }
+            }
+
+            ServiceDocument latestState = op.getLinkedState();
+            long delta = latestState.documentUpdateTimeMicros - this.context.lastCommitTimeMicros;
+            // for delete, services on replica only stop by commit op. thus skipping the delta check.
+            if (op.getAction() != Action.DELETE && delta < getHost().getMaintenanceIntervalMicros()) {
+                return;
+            }
+
+            if (latestState.documentVersion < this.context.version
+                    || (latestState.documentEpoch != null
+                            && latestState.documentEpoch < this.context.epoch)) {
+                return;
+            }
+
+            this.context.lastCommitTimeMicros = latestState.documentUpdateTimeMicros;
+
+            URI u = getUri();
+            Operation commitOp = Operation
+                    .createPut(u)
+                    .addRequestHeader(Operation.REPLICATION_PHASE_HEADER,
+                            Operation.REPLICATION_PHASE_COMMIT)
+                    .setReferer(u)
+                    .setExpiration(
+                            Utils.fromNowMicrosUtc(getHost().getOperationTimeoutMicros()));
+
+            if (op.getAction() == Action.DELETE) {
+                commitOp.setAction(op.getAction());
+            }
+
+            commitOp.linkState(latestState);
+
+            String replQuorum = op.getRequestHeaderAsIs(Operation.REPLICATION_QUORUM_HEADER);
+            if (Operation.REPLICATION_QUORUM_HEADER_VALUE_ALL.equals(replQuorum)) {
+                // skip next processing stage until we get commit completion
+                indexState = false;
+                // Do not complete request until commit is done. Client will see completion after
+                // replicas have committed
+                commitOp.addRequestHeader(Operation.REPLICATION_QUORUM_HEADER, replQuorum);
+                commitOp.setCompletion((o, e) -> {
+                    // regardless of commit success, we need to proceed with operation processing
+                    processCompletionStageIndexing(op);
+                });
+            }
+
+            getHost().replicateRequest(this.context.options, latestState, getPeerNodeSelectorPath(),
+                    getSelfLink(),
+                    commitOp);
+            return;
+        } finally {
+            if (!indexState) {
+                return;
+            }
+            processCompletionStageIndexing(op);
+        }
     }
 
-    private void completeRequest(Operation op) {
+    /**
+     * Part of operation completion processing. Issues request to indexing service, through the host
+     * and kicks of pending request processing. On indexing completion, it continues with next stage
+     * of operation completion
+     */
+    private void processCompletionStageIndexing(Operation op) {
+        try {
+            op.nestCompletion((o, failure) -> {
+                if (failure != null) {
+                    if (op.isWithinTransaction()) {
+                        processPending(op);
+                    }
+                    failRequest(op, failure);
+                    return;
+                }
+                checkAndNestAuthupdateCompletionStage(op);
+            });
+
+            ServiceDocument mergedState = op.getLinkedState();
+            this.context.host.saveServiceState(this, op, mergedState);
+        } finally {
+            if (!op.isWithinTransaction()) {
+                processPending(op);
+            }
+        }
+    }
+
+    /**
+     * Update any authz cache artifacts. Service authors need to
+     * override this method to define custom authz cache clear behavior
+     */
+    protected void processCompletionStageUpdateAuthzArtifacts(Operation op) {
+        op.complete();
+    }
+
+    private void checkAndNestAuthupdateCompletionStage(Operation op) {
+        if (!this.getHost().isAuthorizationEnabled() || !this.getHost().isPrivilegedService(this)) {
+            processCompletionStageTransactionNotification(op, null);
+        } else {
+            op.nestCompletion((o, failure) -> {
+                if (failure != null) {
+                    if (op.isWithinTransaction()) {
+                        processPending(op);
+                    }
+                    failRequest(op, failure);
+                    return;
+                }
+                processCompletionStageTransactionNotification(op, null);
+            });
+            processCompletionStageUpdateAuthzArtifacts(op);
+        }
+    }
+
+    /**
+     * Process notification to transaction coordinator and complete request
+     */
+    private void processCompletionStageTransactionNotification(Operation op, Throwable e) {
+        // Notify transaction coordinator before completing the operation;
+        // unless this service is not visible inside the transaction
+        if (op.isWithinTransaction() && this.getHost().getTransactionServiceUri() != null
+                && hasOption(ServiceOption.PERSISTENCE)
+                && op.getStatusCode() != Operation.STATUS_CODE_NOT_FOUND
+                && !op.isFromReplication()) {
+            allocatePendingTransactions();
+            notifyTransactionCoordinatorOp(this, op, e)
+                    .setCompletion((txOp, txE) -> {
+                        processPending(op);
+
+                        if (txE != null) {
+                            failRequest(op, txE);
+                            return;
+                        }
+
+                        if (e == null) {
+                            processCompletionStagePublishAndComplete(op);
+                            return;
+                        }
+
+                        failRequest(op, e);
+                    }).sendWith(this);
+            return;
+        }
+
+        if (op.isWithinTransaction()) {
+            processPending(op);
+        }
+
+        if (e == null) {
+            processCompletionStagePublishAndComplete(op);
+            return;
+        }
+
+        failRequest(op, e);
+    }
+
+    /**
+     * Final stage of operation completion processing. Notifications will be published and client
+     * will receive operation response
+     */
+    private void processCompletionStagePublishAndComplete(Operation op) {
         if (hasOption(ServiceOption.INSTRUMENTATION)) {
             updatePerOperationStats(op);
         }
@@ -854,74 +1183,11 @@ public class StatefulService implements Service {
 
         publish(op);
 
-        if (op.isFromReplication() && !op.isSynchronize()) {
+        if (op.isFromReplication() && !op.isSynchronizeOwner()) {
             // avoid cost of sending the request body as a response
             op.setBodyNoCloning(null);
         }
         op.complete();
-    }
-
-    /**
-     * If the service is about to idle, advertise last request, as a commit, to all peers.
-     * Only applies to services with ServiceOption.ENFORCE_QUORUM
-     */
-    private void commitLastProposalIfIdle(Operation op) {
-        if (op.getStatusCode() >= Operation.STATUS_CODE_FAILURE_THRESHOLD) {
-            // we only commit updates that were accepted by the owner, so ignore this
-            // failed update
-            return;
-        }
-
-        if (op.isFromReplication() || op.getAction() == Action.GET) {
-            // only owners advertise commits, on updates
-            return;
-        }
-
-        if (!hasOption(ServiceOption.DOCUMENT_OWNER)) {
-            // Explicit commit messages are only sent from this instance on the owner node
-            return;
-        }
-
-        // The owner has the responsibility to advertise the most recent committed state
-        // to all the peers. If operations are flowing, operation at version N, informs services to
-        // commit proposal at N-1. However, if no new operations occur, the owner
-        // must still communicate the last commit in a timely fashion otherwise the replicas
-        // will be behind. Here we re-issue the current state (committed) when we notice the
-        // pending operation queue is empty
-        if (op.getAction() != Action.DELETE) {
-            synchronized (this.context) {
-                if (!this.context.operationQueue.isEmpty()) {
-                    return;
-                }
-            }
-        } else {
-            if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)) {
-                // Directive indicates this update should have no persistence side-effects. Do not
-                // forward to peers. This is often due to local stop from host shutting down.
-                return;
-            }
-        }
-
-        if (this.getHost().isStopping()) {
-            return;
-        }
-
-        ServiceDocument latestState = op.getLinkedState();
-        URI u = getUri();
-        Operation commitOp = Operation
-                .createPut(u)
-                .addRequestHeader(Operation.REPLICATION_PHASE_HEADER,
-                        Operation.REPLICATION_PHASE_COMMIT)
-                .setReferer(u)
-                .setExpiration(getHost().getOperationTimeoutMicros() + Utils.getNowMicrosUtc());
-
-        if (op.getAction() == Action.DELETE) {
-            commitOp.setAction(op.getAction());
-        }
-
-        getHost().replicateRequest(this.context.options, latestState, getPeerNodeSelectorPath(),
-                getSelfLink(),
-                commitOp);
     }
 
     private void publish(Operation op) {
@@ -944,30 +1210,60 @@ public class StatefulService implements Service {
             return;
         }
 
+        if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED)) {
+            return;
+        }
+
         if (!op.hasBody()) {
             return;
         }
         this.context.utilityService.notifySubscribers(op);
     }
 
+    private void failRequest(Operation op, Throwable e) {
+        failRequest(op, e, false);
+    }
+
+    private void failRequest(Operation op, Throwable e, boolean shouldRetry) {
+        if (shouldRetry) {
+            // Request client side retries on state or consensus conflict
+            ServiceErrorResponse rsp = ServiceErrorResponse.create(e, op.getStatusCode(),
+                    EnumSet.of(ErrorDetail.SHOULD_RETRY));
+            op.setBodyNoCloning(rsp);
+        }
+
+        processPending(op);
+        op.fail(e);
+    }
+
+    private void failRequestLimitExceeded(final Operation op, String queueDescription) {
+        if (hasOption(ServiceOption.INSTRUMENTATION)) {
+            adjustStat(Service.STAT_NAME_REQUEST_FAILURE_QUEUE_LIMIT_EXCEEDED_COUNT, 1);
+        }
+        Operation.failLimitExceeded(op,
+                ServiceErrorResponse.ERROR_CODE_SERVICE_QUEUE_LIMIT_EXCEEDED, queueDescription);
+    }
+
     private void updatePerOperationStats(Operation op) {
-        op.setCompletionTime(Utils.getNowMicrosUtc());
+        op.setCompletionTime(System.nanoTime() / 1000);
         InstrumentationContext ctx = op.getInstrumentationContext();
-        long queueLatency = ctx.handleInvokeTimeMicrosUtc - ctx.enqueueTimeMicrosUtc;
-        long handlerLatency = ctx.handlerCompletionTime - ctx.handleInvokeTimeMicrosUtc;
-        long endToEndDuration = ctx.operationCompletionTimeMicrosUtc - ctx.enqueueTimeMicrosUtc;
-        if (ctx.documentStoreCompletionTimeMicrosUtc > 0) {
+        long queueLatency = ctx.handleInvokeTimeMicros - ctx.enqueueTimeMicros;
+        long handlerLatency = ctx.handlerCompletionTimeMicros - ctx.handleInvokeTimeMicros;
+        long endToEndDuration = ctx.operationCompletionTimeMicros - ctx.enqueueTimeMicros;
+        if (ctx.documentStoreCompletionTimeMicros > 0) {
             ServiceStat s = getHistogramStat(Service.STAT_NAME_STATE_PERSIST_LATENCY);
             setStat(s,
-                    ctx.documentStoreCompletionTimeMicrosUtc - ctx.handlerCompletionTime);
+                    ctx.documentStoreCompletionTimeMicros - ctx.handlerCompletionTimeMicros);
         }
-        ServiceStat s = getHistogramStat(op.getAction()
-                + Service.STAT_NAME_OPERATION_QUEUEING_LATENCY);
+        ServiceStat s = getHistogramStat(ServiceStatUtils.getPerActionQueueLatencyName(op.getAction()));
         setStat(s, queueLatency);
-        s = getHistogramStat(op.getAction() + Service.STAT_NAME_SERVICE_HANDLER_LATENCY);
+
+        s = getHistogramStat(ServiceStatUtils.getPerActionServiceHandlerLatencyName(op.getAction()));
         setStat(s, handlerLatency);
-        s = getHistogramStat(op.getAction() + Service.STAT_NAME_OPERATION_DURATION);
-        setStat(op.getAction() + Service.STAT_NAME_OPERATION_DURATION, endToEndDuration);
+
+        String durationStatName = ServiceStatUtils.getPerActionDurationName(op.getAction());
+        s = getHistogramStat(durationStatName);
+        setStat(durationStatName, endToEndDuration);
     }
 
     private void loadAndLinkState(Operation op) {
@@ -1016,7 +1312,6 @@ public class StatefulService implements Service {
             synchronized (this.context) {
                 this.context.isUpdateActive = false;
             }
-            commitLastProposalIfIdle(op);
         }
 
         if (op.getAction() == Action.GET) {
@@ -1040,20 +1335,31 @@ public class StatefulService implements Service {
 
     @Override
     public Operation dequeueRequest() {
+        Operation op = null;
         synchronized (this.context) {
-            return this.context.operationQueue.poll();
+            if (this.context.synchQueue != null) {
+                // Synch requests are prioritized higher than
+                // other update requests.
+                op = this.context.synchQueue.poll();
+                if (this.context.synchQueue.isEmpty()) {
+                    this.context.synchQueue = null;
+                }
+            }
+            if (op == null) {
+                op = this.context.operationQueue.poll();
+            }
         }
+        return op;
     }
 
-    private void applyUpdate(Operation op) throws Throwable {
-        long time = Utils.getNowMicrosUtc();
-
+    private void applyUpdate(Operation op) throws Exception {
         ServiceDocument cachedState = op.getLinkedState();
         if (cachedState == null) {
             cachedState = this.context.stateType.newInstance();
         }
 
         if (!op.isFromReplication()) {
+            long time = Utils.getNowMicrosUtc();
             if (hasOption(ServiceOption.OWNER_SELECTION)) {
                 cachedState.documentEpoch = this.context.epoch;
             }
@@ -1073,9 +1379,6 @@ public class StatefulService implements Service {
         // a replica simply sets its version to the highest version it has seen. Agreement on
         // owner and epoch is done in validation methods upstream
         this.context.version = Math.max(cachedState.documentVersion, this.context.version);
-
-        cachedState.documentUpdateTimeMicros = Math.max(
-                cachedState.documentUpdateTimeMicros, time);
 
         if (hasOption(ServiceOption.OWNER_SELECTION)) {
             long prevEpoch = this.context.epoch;
@@ -1116,27 +1419,23 @@ public class StatefulService implements Service {
         });
 
         clonedRequest.setRetryCount(0);
-        clonedRequest.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH);
-        boolean isFactorySync = request
-                .hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_FORWARDING);
-        getHost().selectServiceOwnerAndSynchState(this, clonedRequest, isFactorySync);
+        clonedRequest.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER);
+
+        getHost().selectServiceOwnerAndSynchState(this, clonedRequest);
     }
 
     private void handleSynchronizeWithPeersCompletion(Operation request, Throwable failure,
-            boolean wasOwner, Operation o, Throwable e) {
+            boolean wasOwner, Operation synchRsp, Throwable e) {
         if (e != null) {
-            failRequest(request, e, true);
+            handleSynchFailure(request, synchRsp, e);
             return;
         }
 
         boolean isOwner = hasOption(ServiceOption.DOCUMENT_OWNER);
         boolean isStateUpdated = false;
 
-        logInfo("isOwner:%s e:%d v:%d, cause:%s",
-                isOwner, this.context.epoch, this.context.version, failure);
-
         // update and index using latest state from peers
-        ServiceDocument state = (ServiceDocument) o.getBodyRaw();
+        ServiceDocument state = (ServiceDocument) synchRsp.getBodyRaw();
         if (state != null) {
             if (hasOption(ServiceOption.DOCUMENT_OWNER)) {
                 state.documentOwner = getHost().getId();
@@ -1157,9 +1456,17 @@ public class StatefulService implements Service {
 
             // update synchronized linked state with the update operation, so it gets indexed
             request.linkState(state);
+
+            // update synch request body, so that caller can use the latest state if he's interested
+            request.setBodyNoCloning(state);
         }
 
         if (!wasOwner && isOwner) {
+            // we have just become the owner of this service - increment epoch -
+            // the new epoch will be linked and indexed downstream
+            synchronized (this.context) {
+                this.context.epoch++;
+            }
             isStateUpdated = true;
         }
 
@@ -1168,32 +1475,64 @@ public class StatefulService implements Service {
         }
 
         completeSynchronizationRequest(request, failure, isStateUpdated);
+    }
 
-        if (wasOwner) {
+    private void handleSynchFailure(Operation request, Operation synchRsp, Throwable e) {
+        boolean isMarkedDeleted = false;
+        if (synchRsp.getStatusCode() == Operation.STATUS_CODE_CONFLICT && synchRsp.hasBody()) {
+            ServiceErrorResponse rsp = synchRsp.getBody(ServiceErrorResponse.class);
+            isMarkedDeleted = rsp != null
+                    && rsp.getErrorCode() == ServiceErrorResponse.ERROR_CODE_STATE_MARKED_DELETED;
+        }
+
+        // If the synch failure was caused because this service is marked
+        // deleted on a peer node (with a newer version), then stop this
+        // service (on the owner node).
+        if (isMarkedDeleted) {
+            logWarning("On-demand synch failed because more recent version of service" +
+                    "is deleted on peer node. Stopping service on owner ...");
+            Operation stopOp = Operation
+                    .createDelete(null)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)
+                    .setCompletion((o, innerEx) -> {
+                        if (innerEx != null) {
+                            logSevere("Failed to stop service. Failure %s", innerEx.toString());
+                        }
+                        failRequest(request, e, false);
+                    });
+            handleStopCompletion(stopOp);
             return;
         }
 
-        getHost().scheduleServiceOptionToggleMaintenance(getSelfLink(),
-                EnumSet.of(ServiceOption.DOCUMENT_OWNER), null);
+        failRequest(request, e, true);
+        return;
     }
 
     private void completeSynchronizationRequest(Operation request, Throwable failure,
             boolean isStateUpdated) {
         if (failure != null) {
-            request.setStatusCode(Operation.STATUS_CODE_CONFLICT);
-            failRequest(request, new IllegalStateException(
-                    "Synchronization complete, original failure: " + failure.toString()), true);
-            return;
+            logWarning("isUpdated:%s, e:%d v:%d, cause:%s (%d",
+                    isStateUpdated, this.context.epoch, this.context.version, failure,
+                    request.getId());
+            // there could be a delay between becoming an owner and maintenance->synchronization
+            // detecting that and marking this service as the owner, so checking again before
+            // we fail
+            if (!hasOption(ServiceOption.DOCUMENT_OWNER)) {
+                request.setStatusCode(Operation.STATUS_CODE_CONFLICT);
+                failRequest(request, new IllegalStateException(
+                        "Synchronization complete, original failure: " + failure.toString()), true);
+                return;
+            }
         }
+
+        // avoid replicating this synchronization request, on completion
+        request.setFromReplication(true);
 
         if (!isStateUpdated) {
             processPending(request);
             request.complete();
             return;
         }
-
-        // avoid replicating this synchronization request, on completion
-        request.setFromReplication(true);
 
         // proceed with normal completion pipeline, including indexing
         request.nestCompletion(this::handleRequestCompletion);
@@ -1250,16 +1589,7 @@ public class StatefulService implements Service {
     }
 
     private ServiceStat getHistogramStat(String name) {
-        if (!hasOption(Service.ServiceOption.INSTRUMENTATION)) {
-            return null;
-        }
-        ServiceStat s = getStat(name);
-        synchronized (s) {
-            if (s.logHistogram == null) {
-                s.logHistogram = new ServiceStatLogHistogram();
-            }
-        }
-        return s;
+        return ServiceStatUtils.getOrCreateHistogramStat(this, name);
     }
 
     private boolean allocateUtilityService(boolean forceAllocate) {
@@ -1286,6 +1616,9 @@ public class StatefulService implements Service {
 
     @Override
     public URI getUri() {
+        if (this.context.host == null) {
+            return null;
+        }
         return UriUtils.buildUri(this.context.host, this.context.selfLink);
     }
 
@@ -1302,15 +1635,11 @@ public class StatefulService implements Service {
     @Override
     public void toggleOption(ServiceOption option, boolean enable) {
 
-        if (option == ServiceOption.IDEMPOTENT_POST) {
-            throw new IllegalArgumentException("Option not supported on singleton services."
-                    + " Set this service option on the factory service instead.");
-        }
-
         if (option != ServiceOption.HTML_USER_INTERFACE
                 && option != ServiceOption.DOCUMENT_OWNER
                 && option != ServiceOption.PERIODIC_MAINTENANCE
-                && option != ServiceOption.INSTRUMENTATION) {
+                && option != ServiceOption.INSTRUMENTATION
+                && option != ServiceOption.TRANSACTION_PENDING) {
 
             if (getProcessingStage() != Service.ProcessingStage.CREATED) {
                 throw new IllegalStateException("Service already started");
@@ -1321,12 +1650,41 @@ public class StatefulService implements Service {
             toggleOption(ServiceOption.CONCURRENT_GET_HANDLING, true);
         }
 
+        boolean optionsChanged = false;
         synchronized (this.context) {
             if (enable) {
-                this.context.options.add(option);
+                optionsChanged = this.context.options.add(option);
             } else {
-                this.context.options.remove(option);
+                optionsChanged = this.context.options.remove(option);
             }
+        }
+
+        if (this.context.host == null) {
+            return;
+        }
+
+        if (optionsChanged && option == ServiceOption.DOCUMENT_OWNER) {
+            EnumSet<ServiceOption> addedOptions = null;
+            EnumSet<ServiceOption> removedOptions = null;
+            EnumSet<ServiceOption> docOwner = EnumSet.of(ServiceOption.DOCUMENT_OWNER);
+            if (enable) {
+                addedOptions = docOwner;
+            } else {
+                removedOptions = docOwner;
+            }
+            getHost().scheduleServiceOptionToggleMaintenance(getSelfLink(),
+                    addedOptions, removedOptions);
+
+            if (enable && hasOption(ServiceOption.PERIODIC_MAINTENANCE)) {
+                // kick off maintenance cycle, service is on the new owner node
+                getHost().scheduleServiceMaintenance(this);
+            }
+        }
+
+        if (enable && optionsChanged
+                && option == ServiceOption.PERIODIC_MAINTENANCE
+                && this.context.processingStage == ProcessingStage.AVAILABLE) {
+            getHost().scheduleServiceMaintenance(this);
         }
     }
 
@@ -1347,7 +1705,8 @@ public class StatefulService implements Service {
 
     @Override
     public void setOperationProcessingChain(OperationProcessingChain opProcessingChain) {
-        this.context.opProcessingChain = opProcessingChain;
+        allocateExtraContext();
+        this.context.extras.opProcessingChain = opProcessingChain;
     }
 
     protected void setOperationQueueLimit(int limit) {
@@ -1355,49 +1714,37 @@ public class StatefulService implements Service {
     }
 
     @Override
-    public void setProcessingStage(Service.ProcessingStage stage) {
-        IllegalStateException failure = null;
-        String statName = null;
-        try {
-            synchronized (this.context) {
-                if (this.context.processingStage == stage) {
-                    return;
-                }
+    public void setProcessingStage(ProcessingStage stage) {
+        boolean logTransition = false;
+        synchronized (this.context) {
+            if (this.context.processingStage == stage) {
+                return;
+            }
 
-                if (stage == ProcessingStage.PAUSED) {
-                    if (this.context.processingStage != ProcessingStage.AVAILABLE) {
-                        failure = new IllegalStateException("Service can not be paused, in stage: "
-                                + this.context.processingStage);
-                        return;
-                    }
-                    if (this.context.isUpdateActive || !this.context.operationQueue.isEmpty()) {
-                        failure = new IllegalStateException("Service has active updates");
-                        return;
-                    }
-                    statName = STAT_NAME_PAUSE_COUNT;
-                } else if (this.context.processingStage == ProcessingStage.PAUSED
-                        && stage == ProcessingStage.AVAILABLE) {
-                    statName = STAT_NAME_RESUME_COUNT;
-                    this.context.isUpdateActive = false;
-                } else if (this.context.processingStage.ordinal() > stage.ordinal()) {
-                    throw new IllegalArgumentException(this.context.processingStage
-                            + " can not move to "
-                            + stage);
-                }
+            if (this.context.processingStage == ProcessingStage.STOPPED) {
+                // a service can be stopped while an attempt to start is being processed
+                logTransition = true;
+            } else if (this.context.processingStage.ordinal() > stage.ordinal()) {
+                throw new IllegalArgumentException(this.context.processingStage
+                        + " can not move to "
+                        + stage);
+            }
 
-                this.context.processingStage = stage;
+            if (logTransition) {
+                logInfo("Transition from %s to %s", this.context.processingStage, stage);
             }
-        } finally {
-            if (failure != null) {
-                throw failure;
-            }
-            if (statName != null) {
-                adjustStat(statName, 1);
-            }
+            this.context.processingStage = stage;
         }
 
         if (stage == ProcessingStage.AVAILABLE) {
-            getHost().processPendingServiceAvailableOperations(this, null);
+            getHost().processPendingServiceAvailableOperations(this, null, false);
+            getHost().getOperationTracker().processPendingServiceStartOperations(
+                    getSelfLink(), ProcessingStage.AVAILABLE, this);
+        }
+
+        if (stage == ProcessingStage.STOPPED) {
+            getHost().getOperationTracker().processPendingServiceStartOperations(
+                    getSelfLink(), ProcessingStage.STOPPED, this);
         }
     }
 
@@ -1414,12 +1761,17 @@ public class StatefulService implements Service {
     }
 
     private void prepareRequest(Operation op) {
-        if (this.hasOption(ServiceOption.REPLICATION)) {
-            // assume target is also replicated. If they are not, there is only a tiny performance
-            // hit due to the availability registration and instant completion
-            op.setTargetReplicated(true);
-        }
-        op.setReferer(UriUtils.buildUri(getHost().getPublicUri(), getSelfLink()));
+        // avoid URI allocation and parsing by using cached host URI string
+        StringBuilder sb = Utils.getBuilder();
+        sb.append(getHost().getPublicUriAsString()).append(getSelfLink());
+        op.setReferer(sb.toString());
+    }
+
+    /**
+     * Gets the cached ServiceDocumentDescription instance for the service state.
+     */
+    public ServiceDocumentDescription getStateDescription() {
+        return getHost().buildDocumentDescription(this);
     }
 
     /**
@@ -1435,7 +1787,7 @@ public class StatefulService implements Service {
         type = this.context.stateType;
         try {
             d = type.newInstance();
-        } catch (Throwable e) {
+        } catch (Exception e) {
             logSevere(e);
             throw (new RuntimeException(e));
         }
@@ -1450,10 +1802,10 @@ public class StatefulService implements Service {
                         "Cannot assign exampleValue: '%s' to field: %s of type: %s",
                         pd.exampleValue, pd.accessor.getName(), pd.accessor.getType());
                 logSevere(msg);
-                throw (new RuntimeException(msg, e));
-            } catch (Throwable e) {
+                throw new RuntimeException(msg, e);
+            } catch (Exception e) {
                 logSevere(e);
-                throw (new RuntimeException(e));
+                throw new RuntimeException(e);
             }
         }
         // build true Kind
@@ -1462,29 +1814,58 @@ public class StatefulService implements Service {
     }
 
     public void logSevere(Throwable e) {
-        log(Level.SEVERE, "%s", Utils.toString(e));
+        doLogging(Level.SEVERE, () -> Utils.toString(e));
     }
 
     public void logSevere(String fmt, Object... args) {
-        log(Level.SEVERE, fmt, args);
+        doLogging(Level.SEVERE, () -> String.format(fmt, args));
+    }
+
+    public void logSevere(Supplier<String> messageSupplier) {
+        doLogging(Level.SEVERE, messageSupplier);
     }
 
     public void logInfo(String fmt, Object... args) {
-        log(Level.INFO, fmt, args);
+        doLogging(Level.INFO, () -> String.format(fmt, args));
+    }
+
+    public void logInfo(Supplier<String> messageSupplier) {
+        doLogging(Level.INFO, messageSupplier);
     }
 
     public void logFine(String fmt, Object... args) {
-        log(Level.FINE, fmt, args);
+        doLogging(Level.FINE, () -> String.format(fmt, args));
+    }
+
+    public void logFine(Supplier<String> messageSupplier) {
+        doLogging(Level.FINE, messageSupplier);
     }
 
     public void logWarning(String fmt, Object... args) {
-        log(Level.WARNING, fmt, args);
+        doLogging(Level.WARNING, () -> String.format(fmt, args));
     }
 
-    protected void log(Level level, String fmt, Object... args) {
-        String uri = this.context.host != null && getUri() != null ? getUri().toString() : this.getClass().getSimpleName();
+    public void logWarning(Supplier<String> messageSupplier) {
+        doLogging(Level.WARNING, messageSupplier);
+    }
+
+    public void log(Level level, String fmt, Object... args) {
+        doLogging(level, () -> String.format(fmt, args));
+    }
+
+    public void log(Level level, Supplier<String> messageSupplier) {
+        doLogging(level, messageSupplier);
+    }
+
+    protected void doLogging(Level level, Supplier<String> messageSupplier) {
         Logger lg = Logger.getLogger(this.getClass().getName());
-        Utils.log(lg, 3, uri, level, fmt, args);
+        if (!lg.isLoggable(level)) {
+            return;
+        }
+        URI uri;
+        String classOrUri = this.context.host != null && this.context.selfLink != null
+                && (uri = getUri()) != null ? uri.toString() : this.getClass().getSimpleName();
+        Utils.log(lg, 3, classOrUri, level, messageSupplier);
     }
 
     /**
@@ -1506,9 +1887,11 @@ public class StatefulService implements Service {
     @Override
     public void handleMaintenance(Operation post) {
         ServiceMaintenanceRequest request = post.getBody(ServiceMaintenanceRequest.class);
-        if (request.reasons.contains(ServiceMaintenanceRequest.MaintenanceReason.PERIODIC_SCHEDULE)) {
+        if (request.reasons
+                .contains(ServiceMaintenanceRequest.MaintenanceReason.PERIODIC_SCHEDULE)) {
             this.handlePeriodicMaintenance(post);
-        } else if (request.reasons.contains(ServiceMaintenanceRequest.MaintenanceReason.NODE_GROUP_CHANGE)) {
+        } else if (request.reasons
+                .contains(ServiceMaintenanceRequest.MaintenanceReason.NODE_GROUP_CHANGE)) {
             this.handleNodeGroupMaintenance(post);
         } else {
             post.complete();
@@ -1544,8 +1927,9 @@ public class StatefulService implements Service {
     }
 
     @Override
-    public ServiceDocument setInitialState(String jsonState, Long version) {
-        ServiceDocument s = Utils.fromJson(jsonState, this.context.stateType);
+    public ServiceDocument setInitialState(Object state, Long version) {
+        ServiceDocument s = Utils.fromJson(state, this.context.stateType);
+
         if (version != null) {
             this.context.version = version;
             s.documentVersion = this.context.version;
@@ -1565,7 +1949,10 @@ public class StatefulService implements Service {
 
     @Override
     public String getPeerNodeSelectorPath() {
-        return this.context.nodeSelectorLink;
+        if (this.context.extras == null) {
+            return ServiceUriPaths.DEFAULT_NODE_SELECTOR;
+        }
+        return this.context.extras.nodeSelectorLink;
     }
 
     @Override
@@ -1578,7 +1965,30 @@ public class StatefulService implements Service {
             throw new IllegalArgumentException("link is required");
         }
 
-        this.context.nodeSelectorLink = link;
+        allocateExtraContext();
+        this.context.extras.nodeSelectorLink = link;
+    }
+
+    @Override
+    public String getDocumentIndexPath() {
+        if (this.context.extras == null) {
+            return ServiceUriPaths.CORE_DOCUMENT_INDEX;
+        }
+        return this.context.extras.documentIndexLink;
+    }
+
+    @Override
+    public void setDocumentIndexPath(String link) {
+        if (!hasOption(ServiceOption.PERSISTENCE)) {
+            throw new IllegalStateException("Service is not persisted / indexed");
+        }
+
+        if (link == null) {
+            throw new IllegalArgumentException("link is required");
+        }
+
+        allocateExtraContext();
+        this.context.extras.documentIndexLink = link;
     }
 
     @Override
@@ -1643,8 +2053,7 @@ public class StatefulService implements Service {
             return true;
         }
         // processing stage must also indicate service is started
-        if (getProcessingStage() != ProcessingStage.PAUSED
-                && getProcessingStage() != ProcessingStage.AVAILABLE) {
+        if (getProcessingStage() != ProcessingStage.AVAILABLE) {
             return false;
         }
         ServiceStat st = this.getStat(STAT_NAME_AVAILABLE);
@@ -1661,39 +2070,47 @@ public class StatefulService implements Service {
         }
 
         if (micros > 0 && micros < Service.MIN_MAINTENANCE_INTERVAL_MICROS) {
-            log(Level.WARNING, "Maintenance interval %d is less than the minimum interval %d"
-                    + ", reducing to min interval", micros, Service.MIN_MAINTENANCE_INTERVAL_MICROS);
+            logWarning("Maintenance interval %d is less than the minimum interval %d"
+                    + ", reducing to min interval", micros,
+                    Service.MIN_MAINTENANCE_INTERVAL_MICROS);
             micros = Service.MIN_MAINTENANCE_INTERVAL_MICROS;
         }
 
-        this.context.maintenanceInterval = micros;
+        allocateExtraContext();
+        this.context.extras.maintenanceInterval = micros;
+        if (getHost() != null
+                && getProcessingStage() == ProcessingStage.AVAILABLE
+                && micros < getHost().getMaintenanceCheckIntervalMicros()) {
+            getHost().scheduleServiceMaintenance(this);
+        }
+    }
+
+    @Override
+    public void setCacheClearDelayMicros(long micros) {
+        allocateExtraContext();
+        this.context.extras.cacheClearDelayMicros = micros;
     }
 
     @Override
     public long getMaintenanceIntervalMicros() {
-        return this.context.maintenanceInterval;
+        if (this.context.extras == null) {
+            return this.getHost().getMaintenanceIntervalMicros();
+        }
+        return this.context.extras.maintenanceInterval;
+    }
+
+    @Override
+    public long getCacheClearDelayMicros() {
+        if (this.context.extras != null && this.context.extras.cacheClearDelayMicros != null) {
+            return this.context.extras.cacheClearDelayMicros;
+        }
+
+        return getHost().getServiceCacheClearDelayMicros();
     }
 
     @Override
     public Class<? extends ServiceDocument> getStateType() {
         return this.context.stateType;
-    }
-
-    public boolean isConfigurationUpdate(Operation request) {
-        if (request.getAction() == Action.GET || request.getAction() == Action.DELETE) {
-            return false;
-        }
-
-        if (!request.hasBody()) {
-            return false;
-        }
-
-        ServiceConfigUpdateRequest body = request.getBody(ServiceConfigUpdateRequest.class);
-        if (!ServiceConfigUpdateRequest.KIND.equals(body.kind)) {
-            return false;
-        }
-
-        return true;
     }
 
     @Override
@@ -1716,26 +2133,26 @@ public class StatefulService implements Service {
             if (body.operationQueueLimit != null) {
                 setOperationQueueLimit(body.operationQueueLimit);
             }
+
             this.context.utilityService.handlePatchConfiguration(request, body);
             return;
         }
 
         if (request.getAction() == Action.GET) {
-            ServiceConfiguration cfg = new ServiceConfiguration();
-            cfg.options = getOptions();
-            cfg.maintenanceIntervalMicros = getMaintenanceIntervalMicros();
+            ServiceConfiguration cfg = Utils.buildServiceConfig(new ServiceConfiguration(), this);
             cfg.epoch = this.context.epoch;
             cfg.operationQueueLimit = this.context.operationQueue.getLimit();
-            request.setBody(cfg).complete();
+            request.setBodyNoCloning(cfg).complete();
             return;
         }
 
-        getHost().failRequestActionNotSupported(request);
+        Operation.failActionNotSupported(request);
     }
 
     /**
-    * Set authorization context on operation.
-    */
+     * Set authorization context on operation.
+     */
+    @Override
     public final void setAuthorizationContext(Operation op, AuthorizationContext ctx) {
         if (getHost().isPrivilegedService(this)) {
             op.setAuthorizationContext(ctx);
@@ -1758,6 +2175,7 @@ public class StatefulService implements Service {
     /**
      * Returns the system user's authorization context.
      */
+    @Override
     public final AuthorizationContext getSystemAuthorizationContext() {
         if (getHost().isPrivilegedService(this)) {
             return getHost().getSystemAuthorizationContext();
@@ -1767,12 +2185,95 @@ public class StatefulService implements Service {
     }
 
     /**
+     * Returns the authorization context associated with a given subject.
+     */
+    public final AuthorizationContext getAuthorizationContextForSubject(String subject) {
+        if (getHost().isPrivilegedService(this)) {
+            return getHost().getAuthorizationContextForSubject(subject);
+        } else {
+            throw new RuntimeException(
+                    "Service not allowed to get authorization context for a subject");
+        }
+    }
+
+    private void allocateExtraContext() {
+        synchronized (this.context) {
+            if (this.context.extras == null) {
+                this.context.extras = new AdditionalContext();
+            }
+        }
+    }
+
+    /**
+     * Adds the specified coordinator link to this service' pending transactions
+     */
+    void addPendingTransaction(String txCoordinatorLink) {
+        synchronized (this.context) {
+            allocateExtraContext();
+            if (this.context.extras.txCoordinatorLinks == null) {
+                this.context.extras.txCoordinatorLinks = new HashSet<>();
+            }
+            this.context.extras.txCoordinatorLinks.add(txCoordinatorLink);
+        }
+
+        toggleOption(ServiceOption.TRANSACTION_PENDING, true);
+    }
+
+    /**
+     * Removes the specified coordinator link from this service' pending transactions
+     */
+    void removePendingTransaction(String txCoordinatorLink) {
+        boolean toggleTransactionPending = false;
+
+        synchronized (this.context) {
+            allocateExtraContext();
+            if (this.context.extras.txCoordinatorLinks == null) {
+                return;
+            }
+            this.context.extras.txCoordinatorLinks.remove(txCoordinatorLink);
+            toggleTransactionPending = this.context.extras.txCoordinatorLinks.isEmpty();
+        }
+
+        if (toggleTransactionPending) {
+            toggleOption(ServiceOption.TRANSACTION_PENDING, false);
+        }
+    }
+
+    /**
+     * Adds this service pending transaction links to the specified log record
+     * and sets it as the body of the specified operation. The log record
+     * is cloned and thus can be modified safely later on.
+     */
+    Operation setPendingTransactionsAsBody(Operation op, Operation.TransactionContext opLogRecord) {
+        synchronized (this.context) {
+            if (this.context.extras != null) {
+                opLogRecord.coordinatorLinks = this.context.extras.txCoordinatorLinks;
+            }
+            return op.setBody(opLogRecord);
+        }
+    }
+
+    /**
      * Most of the transaction-related code becomes obsolete if we haven't seen transactions. A good
      * idea is to check whether the service has pending transactions
      */
     private boolean hasPendingTransactions() {
-        return this.context.txCoordinatorLinks != null
-                && !this.context.txCoordinatorLinks.isEmpty();
+        synchronized (this.context) {
+            return this.context.extras != null
+                    && this.context.extras.txCoordinatorLinks != null
+                    && !this.context.extras.txCoordinatorLinks.isEmpty();
+        }
     }
 
+    /**
+     * Allocates this service' pending transactions if not already allocated
+     */
+    private void allocatePendingTransactions() {
+        synchronized (this.context) {
+            allocateExtraContext();
+            if (this.context.extras.txCoordinatorLinks == null) {
+                this.context.extras.txCoordinatorLinks = new HashSet<>();
+            }
+        }
+    }
 }

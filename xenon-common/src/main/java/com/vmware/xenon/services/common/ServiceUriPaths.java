@@ -17,7 +17,7 @@ import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.WebSocketService;
 
-public class ServiceUriPaths {
+public final class ServiceUriPaths {
     public static final String SERVICE_URI_SUFFIX_SYNCHRONIZATION = "synch";
 
     public static final String SERVICE_URI_SUFFIX_FORWARDING = "forwarding";
@@ -32,10 +32,12 @@ public class ServiceUriPaths {
 
     public static final String MANAGEMENT = "/management";
     public static final String CORE_MANAGEMENT = CORE + MANAGEMENT;
+    public static final String CORE_SYNCHRONIZATION_MANAGEMENT = CORE_MANAGEMENT + "/synch";
     public static final String CORE_CALLBACKS = CORE + "/callbacks";
     public static final String PROCESS_LOG = CORE_MANAGEMENT + "/process-log";
     public static final String GO_PROCESS_LOG = CORE_MANAGEMENT + "/go-dcp-process-log";
     public static final String SYSTEM_LOG = CORE_MANAGEMENT + "/system-log";
+    public static final String MIGRATION_TASKS = MANAGEMENT + "/migration-tasks";
 
     public static final String CORE_PROCESSES = CORE + "/processes";
 
@@ -47,24 +49,40 @@ public class ServiceUriPaths {
 
     public static final String NODE_SELECTOR_PREFIX = CORE + "/node-selectors";
     public static final String DEFAULT_NODE_SELECTOR_NAME = "default";
-    public static final String SHA1_NODE_SELECTOR_NAME = "sha1-hash";
     public static final String DEFAULT_NODE_SELECTOR = NODE_SELECTOR_PREFIX + "/"
             + DEFAULT_NODE_SELECTOR_NAME;
-    public static final String SHA1_3X_NODE_SELECTOR = NODE_SELECTOR_PREFIX + "/"
-            + SHA1_NODE_SELECTOR_NAME + "-3x";
+    public static final String DEFAULT_1X_NODE_SELECTOR = NODE_SELECTOR_PREFIX + "/"
+            + DEFAULT_NODE_SELECTOR_NAME + "-1x";
+    public static final String DEFAULT_3X_NODE_SELECTOR = NODE_SELECTOR_PREFIX + "/"
+            + DEFAULT_NODE_SELECTOR_NAME + "-3x";
+    public static final String SYNCHRONIZATION_TASKS = CORE + "/synch-tasks";
 
     public static final String CORE_AUTH = CORE + "/auth";
     public static final String CORE_CREDENTIALS = CORE_AUTH + "/credentials";
 
     public static final String CORE_DOCUMENT_INDEX = ServiceUriPaths.CORE + "/document-index";
+    public static final String CORE_IN_MEMORY_DOCUMENT_INDEX = ServiceUriPaths.CORE
+            + "/in-memory-document-index";
+    public static final String CORE_DOCUMENT_INDEX_BACKUP = ServiceUriPaths.CORE + "/document-index-backup";
     public static final String CORE_OPERATION_INDEX = ServiceUriPaths.CORE + "/operation-index";
     public static final String CORE_SERVICE_CONTEXT_INDEX = ServiceUriPaths.CORE
             + "/service-context-index";
-    public static final String CORE_BLOB_INDEX = UriUtils.buildUriPath(ServiceUriPaths.CORE,
-            "blob-index");
 
     public static final String CORE_QUERY_TASKS = UriUtils.buildUriPath(ServiceUriPaths.CORE,
             "query-tasks");
+
+    public static final String CORE_QUERY_PAGE = UriUtils.buildUriPath(ServiceUriPaths.CORE,
+            "query-page");
+
+    public static final String CORE_QUERY_PAGE_FORWARDING = UriUtils.buildUriPath(
+            ServiceUriPaths.CORE, "query-page-forwarding");
+
+    public static final String CORE_QUERY_BROADCAST_PAGE = UriUtils.buildUriPath(ServiceUriPaths.CORE,
+            BroadcastQueryPageService.SELF_LINK_PREFIX);
+
+    public static final String CORE_GRAPH_QUERIES = UriUtils.buildUriPath(ServiceUriPaths.CORE,
+            "graph-queries");
+
     public static final String ODATA_QUERIES = UriUtils.buildUriPath(ServiceUriPaths.CORE,
             "odata-queries");
 
@@ -82,6 +100,8 @@ public class ServiceUriPaths {
             ServiceUriPaths.CORE_AUTHZ, "users");
     public static final String CORE_AUTHZ_VERIFICATION = UriUtils.buildUriPath(
             ServiceUriPaths.CORE_AUTHZ, "verification");
+    public static final String CORE_AUTHZ_TOKEN_CACHE = UriUtils.buildUriPath(
+            ServiceUriPaths.CORE_AUTHZ, "token-cache");
     public static final String CORE_AUTHZ_SYSTEM_USER = UriUtils.buildUriPath(
             ServiceUriPaths.CORE_AUTHZ, "system-user");
     public static final String CORE_AUTHZ_GUEST_USER = UriUtils.buildUriPath(
@@ -113,4 +133,8 @@ public class ServiceUriPaths {
      * @see com.vmware.xenon.swagger.SwaggerDescriptorService
      */
     public static final String SWAGGER = "/discovery/swagger";
+
+    private ServiceUriPaths() {
+
+    }
 }

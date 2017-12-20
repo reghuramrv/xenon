@@ -31,11 +31,9 @@ import com.vmware.xenon.services.common.QueryTask.QuerySpecification;
  * Test service used to validate document queries
  */
 public class ReplicationTestService extends StatefulService {
+    public static final String REFERER_TOKEN = UUID.randomUUID().toString();
     public static final String STRING_MARKER_FAIL_WITH_CONFLICT_CODE = "fail request withconflict error code, verify no retry";
     public static final String ERROR_MESSAGE_STRING_FIELD_IS_REQUIRED = "stringField is required";
-    public static final String STAT_NAME_MISSING_SERVICE_OPTION_TOGGLE_COUNT = "missingDocumentOwnerToggleCount";
-    public static final String STAT_NAME_SERVICE_OPTION_TOGGLE_COUNT = "documentOwnerToggleCount";
-    public static final String STAT_NAME_HANDLE_NODE_GROUP_MAINTENANCE_COUNT = "handleNodeGroupMaintenanceCount";
 
     public static class ReplicationTestServiceState extends ServiceDocument {
         public static final String CLIENT_PATCH_HINT = "client-";
@@ -70,13 +68,19 @@ public class ReplicationTestService extends StatefulService {
             return;
         }
 
+        if (!startPost.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED)) {
+            // this is a restart
+            startPost.complete();
+            return;
+        }
+
         ReplicationTestServiceState initState = startPost
                 .getBody(ReplicationTestServiceState.class);
 
         QueryTask t = new QueryTask();
         // make sure task does not auto-expire during test!
-        t.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                + TimeUnit.SECONDS.toMicros(getHost().getOperationTimeoutMicros());
+        t.documentExpirationTimeMicros = Utils.fromNowMicrosUtc(
+                TimeUnit.SECONDS.toMicros(getHost().getOperationTimeoutMicros()));
         t.querySpec = new QuerySpecification();
         t.querySpec.query.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
                 .setTermMatchValue(
@@ -84,7 +88,7 @@ public class ReplicationTestService extends StatefulService {
         t.documentSelfLink = UUID.randomUUID().toString();
         initState.queryTaskLink = UriUtils.buildUriPath(ServiceUriPaths.CORE_QUERY_TASKS,
                 t.documentSelfLink);
-        sendRequest(Operation.createPost(this, LuceneQueryTaskFactoryService.SELF_LINK).setBody(t));
+        sendRequest(Operation.createPost(this, QueryTaskFactoryService.SELF_LINK).setBody(t));
         startPost.complete();
 
         initState.stringField = UUID.randomUUID().toString();
@@ -126,6 +130,27 @@ public class ReplicationTestService extends StatefulService {
 
     private String retryRequestContextId;
     public AtomicInteger retryCount = new AtomicInteger();
+
+    @Override
+    public void handleGet(Operation get) {
+        if (get.getUri().getQuery() != null && !get.getRefererAsString().contains(REFERER_TOKEN)) {
+            get.fail(new IllegalArgumentException("invalid referer"));
+            return;
+        }
+
+        String acceptHeaderValue = get.getRequestHeaderAsIs(Operation.ACCEPT_HEADER);
+        if (Operation.MEDIA_TYPE_TEXT_HTML.equals(acceptHeaderValue)) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("<html>\n");
+            sb.append(Utils.toJsonHtml(getState(get)));
+            sb.append("/<html>");
+            get.setContentType(Operation.MEDIA_TYPE_TEXT_HTML)
+                    .setBodyNoCloning(sb.toString()).complete();
+            return;
+        }
+
+        get.setBody(getState(get)).complete();
+    }
 
     @Override
     public void handlePut(Operation put) {
@@ -213,33 +238,13 @@ public class ReplicationTestService extends StatefulService {
     }
 
     @Override
-    public void handleMaintenance(Operation maintOp) {
-        ServiceMaintenanceRequest body = maintOp.getBody(ServiceMaintenanceRequest.class);
-        // call super method to make sure handleNodeGroupMaintenance is called
-        super.handleMaintenance(maintOp);
-        if (!body.reasons.contains(MaintenanceReason.SERVICE_OPTION_TOGGLE)) {
-            return;
-        }
-
-        if (body.configUpdate == null
-                || !body.configUpdate.addOptions.contains(ServiceOption.DOCUMENT_OWNER)) {
-            adjustStat(STAT_NAME_MISSING_SERVICE_OPTION_TOGGLE_COUNT, 1);
-        } else {
-            adjustStat(STAT_NAME_SERVICE_OPTION_TOGGLE_COUNT, 1);
-        }
-
-    }
-
-    @Override
     public void handleNodeGroupMaintenance(Operation post) {
         ServiceMaintenanceRequest request = post.getBody(ServiceMaintenanceRequest.class);
         if (!request.reasons.contains(MaintenanceReason.NODE_GROUP_CHANGE)) {
             post.fail(new IllegalArgumentException("expected NODE_GROUP_CHANGE reason"));
             return;
         }
-
         post.complete();
-        adjustStat(STAT_NAME_HANDLE_NODE_GROUP_MAINTENANCE_COUNT, 1);
     }
 
 }

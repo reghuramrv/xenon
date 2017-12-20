@@ -15,12 +15,15 @@ package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
 import java.security.GeneralSecurityException;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -39,6 +42,7 @@ import com.vmware.xenon.services.common.ResourceGroupService.ResourceGroupState;
 import com.vmware.xenon.services.common.RoleService.Policy;
 import com.vmware.xenon.services.common.RoleService.RoleState;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.SystemUserService;
 import com.vmware.xenon.services.common.UserGroupService.UserGroupState;
 import com.vmware.xenon.services.common.UserService.UserState;
 import com.vmware.xenon.services.common.authn.AuthenticationConstants;
@@ -115,9 +119,10 @@ public class TestAuthorizationContext extends BasicTestCase {
         properties.put("hello", "world");
 
         Claims.Builder builder = new Claims.Builder();
-        builder.setIssuer(AuthenticationConstants.JWT_ISSUER);
+        builder.setIssuer(AuthenticationConstants.DEFAULT_ISSUER);
         builder.setSubject(UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, subject));
-        builder.setExpirationTime(Utils.getNowMicrosUtc() + TimeUnit.HOURS.toMicros(1));
+        long expirationTimeMicros = Utils.fromNowMicrosUtc(TimeUnit.HOURS.toMicros(1));
+        builder.setExpirationTime(TimeUnit.MICROSECONDS.toSeconds(expirationTimeMicros));
         builder.setProperties(properties);
 
         Claims claims = builder.getResult();
@@ -240,7 +245,8 @@ public class TestAuthorizationContext extends BasicTestCase {
 
         Claims.Builder builder = new Claims.Builder();
         builder.setSubject(UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, user));
-        builder.setExpirationTime(Utils.getNowMicrosUtc() + TimeUnit.HOURS.toMicros(1));
+        long expirationTimeMicros = Utils.fromNowMicrosUtc(TimeUnit.HOURS.toMicros(1));
+        builder.setExpirationTime(TimeUnit.MICROSECONDS.toSeconds(expirationTimeMicros));
         Claims expected = builder.getResult();
 
         // Post to get a cookie
@@ -408,31 +414,37 @@ public class TestAuthorizationContext extends BasicTestCase {
         UserState userState = new UserState();
         userState.email = user;
         userState.documentSelfLink = user;
-        UserGroupState userGroupState = new UserGroupState();
-        userGroupState.documentSelfLink = user + "-user-group";
-        userGroupState.query = new Query();
-        userGroupState.query.setTermPropertyName("email");
-        userGroupState.query.setTermMatchType(MatchType.TERM);
-        userGroupState.query.setTermMatchValue(userState.email);
-        ResourceGroupState resourceGroupState = new ResourceGroupState();
-        resourceGroupState.documentSelfLink = user + "-resource-group";
-        resourceGroupState.query = new Query();
+        Query userGroupQuery = new Query();
+        userGroupQuery.setTermPropertyName("email");
+        userGroupQuery.setTermMatchType(MatchType.TERM);
+        userGroupQuery.setTermMatchValue(userState.email);
+        UserGroupState userGroupState = UserGroupState.Builder.create()
+                .withSelfLink(user + "-user-group")
+                .withQuery(userGroupQuery)
+                .build();
 
+        Query resourceGroupQuery = new Query();
         Query kindClause = new Query();
         kindClause.setTermPropertyName(ServiceDocument.FIELD_NAME_SELF_LINK);
         kindClause.setTermMatchValue(serviceLink);
         kindClause.setTermMatchType(MatchType.TERM);
-        resourceGroupState.query.addBooleanClause(kindClause);
+        resourceGroupQuery.addBooleanClause(kindClause);
+        ResourceGroupState resourceGroupState = ResourceGroupState.Builder.create()
+                .withSelfLink( user + "-resource-group")
+                .withQuery(resourceGroupQuery)
+                .build();
 
-        RoleState roleState = new RoleState();
-        roleState.userGroupLink = UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USER_GROUPS,
-                userGroupState.documentSelfLink);
-        roleState.resourceGroupLink = UriUtils.buildUriPath(
-                ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS, resourceGroupState.documentSelfLink);
-        roleState.verbs = new HashSet<>();
-        roleState.verbs.add(Action.GET);
-        roleState.verbs.add(Action.POST);
-        roleState.policy = Policy.ALLOW;
+        Set<Action> verbs = new HashSet<>();
+        verbs.add(Action.GET);
+        verbs.add(Action.POST);
+        RoleState roleState = RoleState.Builder.create()
+                .withUserGroupLink(UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USER_GROUPS,
+                        userGroupState.documentSelfLink))
+                .withResourceGroupLink(UriUtils.buildUriPath(
+                        ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS, resourceGroupState.documentSelfLink))
+                .withVerbs(verbs)
+                .withPolicy(Policy.ALLOW)
+                .build();
 
         OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
         URI postUserUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_USERS);
@@ -569,5 +581,17 @@ public class TestAuthorizationContext extends BasicTestCase {
             }
         });
         this.host.testWait();
+    }
+
+    @Test
+    public void testAuthContextExpiry() {
+        AuthorizationContext authContext = this.host.getAuthorizationContextForSubject("foo");
+        assertTrue(authContext.getClaims().getExpirationTime() == Instant.MAX.getEpochSecond());
+        authContext = this.host.getAuthorizationContextForSubject("bar");
+        assertTrue(authContext.getClaims().getExpirationTime() == Instant.MAX.getEpochSecond());
+        authContext = this.host.getAuthorizationContextForSubject(GuestUserService.SELF_LINK);
+        assertTrue(authContext.getClaims().getExpirationTime() == Instant.MAX.getEpochSecond());
+        authContext = this.host.getAuthorizationContextForSubject(SystemUserService.SELF_LINK);
+        assertTrue(authContext.getClaims().getExpirationTime() == Instant.MAX.getEpochSecond());
     }
 }

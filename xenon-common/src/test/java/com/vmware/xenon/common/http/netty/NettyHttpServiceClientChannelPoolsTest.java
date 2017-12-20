@@ -15,20 +15,18 @@ package com.vmware.xenon.common.http.netty;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
 
 import java.util.concurrent.Executors;
-
 import javax.net.ssl.SSLContext;
 
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
-
 import org.junit.Before;
 import org.junit.Test;
 
 import com.vmware.xenon.common.ServiceClient;
 
 public class NettyHttpServiceClientChannelPoolsTest {
+
     private NettyHttpServiceClient client;
 
     @Before
@@ -45,51 +43,56 @@ public class NettyHttpServiceClientChannelPoolsTest {
 
     @Test
     public void testChannelPoolInitialization() {
-        // Instantiated before calling client.start()
-        assertNotNull(this.client.getChannelPool());
-    }
-
-    @Test
-    public void testSSLChannelPoolInitialization() {
-        assertNull(this.client.getSslChannelPool());
-
         this.client.start();
 
         assertNotNull(this.client.getSslChannelPool());
+        assertNotNull(this.client.getChannelPool());
+        assertNotNull(this.client.getHttp2ChannelPool());
     }
 
     @Test
     public void testDefaultConnectionLimit() {
         this.client.start();
 
-        assertEquals(NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST, this.client
-                .getChannelPool()
-                .getConnectionLimitPerHost());
-        assertEquals(NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST, this.client
-                .getSslChannelPool().getConnectionLimitPerHost());
+        assertEquals(NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST,
+                this.client.getConnectionLimitPerTag(
+                        NettyHttpServiceClient.CONNECTION_TAG_DEFAULT));
+        assertEquals(NettyHttpServiceClient.DEFAULT_CONNECTION_LIMIT_PER_TAG,
+                this.client.getConnectionLimitPerTag(
+                        NettyHttpServiceClient.CONNECTION_TAG_HTTP2_DEFAULT));
     }
 
     @Test
-    public void testSetConnectionLimitBeforeSslChanngelPoolInit() {
+    public void testSetConnectionLimitBeforeSslChannelPoolStart() {
         int connectionLimit = 11;
 
-        this.client.setConnectionLimitPerHost(connectionLimit);
+        this.client.setConnectionLimitPerTag(NettyHttpServiceClient.CONNECTION_TAG_DEFAULT,
+                connectionLimit);
+        this.client.setConnectionLimitPerTag(NettyHttpServiceClient.CONNECTION_TAG_HTTP2_DEFAULT,
+                connectionLimit);
 
         this.client.start();
 
-        assertEquals(connectionLimit, this.client.getChannelPool().getConnectionLimitPerHost());
-        assertEquals(connectionLimit, this.client.getSslChannelPool().getConnectionLimitPerHost());
+        assertEquals(connectionLimit, this.client.getChannelPool().getConnectionLimitPerTag(
+                NettyHttpServiceClient.CONNECTION_TAG_DEFAULT));
+        assertEquals(connectionLimit, this.client.getSslChannelPool().getConnectionLimitPerTag(
+                NettyHttpServiceClient.CONNECTION_TAG_HTTP2_DEFAULT));
     }
 
     @Test
-    public void testSetConnectionLimitAfterSslChanngelPoolInit() {
+    public void testSetConnectionLimitAfterSslChannelPoolStart() {
         int connectionLimit = 11;
 
         this.client.start();
 
-        this.client.setConnectionLimitPerHost(connectionLimit);
+        this.client.setConnectionLimitPerTag(NettyHttpServiceClient.CONNECTION_TAG_DEFAULT,
+                connectionLimit);
+        this.client.setConnectionLimitPerTag(NettyHttpServiceClient.CONNECTION_TAG_HTTP2_DEFAULT,
+                connectionLimit);
 
-        assertEquals(connectionLimit, this.client.getChannelPool().getConnectionLimitPerHost());
-        assertEquals(connectionLimit, this.client.getSslChannelPool().getConnectionLimitPerHost());
+        assertEquals(connectionLimit, this.client.getChannelPool().getConnectionLimitPerTag(
+                NettyHttpServiceClient.CONNECTION_TAG_DEFAULT));
+        assertEquals(connectionLimit, this.client.getSslChannelPool().getConnectionLimitPerTag(
+                NettyHttpServiceClient.CONNECTION_TAG_HTTP2_DEFAULT));
     }
 }

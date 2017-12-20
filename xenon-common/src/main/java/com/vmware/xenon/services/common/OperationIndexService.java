@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.SerializedOperation;
+import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.Utils;
 
 public class OperationIndexService extends LuceneDocumentIndexService {
@@ -33,7 +34,31 @@ public class OperationIndexService extends LuceneDocumentIndexService {
 
     @Override
     public void handleRequest(Operation op) {
-        if (!op.hasBody() || !op.getAction().equals(Action.POST)) {
+
+        Action action = op.getAction();
+
+        if (action == Action.DELETE) {
+            // by pass base class queuing and allow delete directly
+            try {
+                super.handleDeleteImpl(op);
+            } catch (Exception e) {
+                op.fail(e);
+            }
+            return;
+        }
+
+        if (!op.hasBody() || action != Action.POST) {
+
+            // do not accept backup and restore request
+            if (action == Action.PATCH) {
+                ServiceDocument sd = (ServiceDocument) op.getBodyRaw();
+                if (sd.documentKind != null &&
+                        (sd.documentKind.equals(BackupRequest.KIND) || sd.documentKind.equals(RestoreRequest.KIND))) {
+                    op.fail(new IllegalStateException("backup and restore request are not supported"));
+                    return;
+                }
+            }
+
             super.handleRequest(op);
             return;
         }
@@ -46,15 +71,15 @@ public class OperationIndexService extends LuceneDocumentIndexService {
             return;
         }
 
-        state.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
-                + DEFAULT_EXPIRATION_INTERVAL_MICROS;
+        state.documentExpirationTimeMicros = Utils.fromNowMicrosUtc(
+                DEFAULT_EXPIRATION_INTERVAL_MICROS);
 
         state.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
         if (state.documentSelfLink == null) {
             state.documentSelfLink = state.documentUpdateTimeMicros + "";
         }
 
-        state.documentUpdateAction = op.getAction().toString();
+        state.documentUpdateAction = action.toString();
 
         UpdateIndexRequest req = new UpdateIndexRequest();
         req.description = SerializedOperation.DESCRIPTION;

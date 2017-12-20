@@ -36,6 +36,7 @@ public class ReliableSubscriptionService extends StatelessService {
     private ServiceSubscriber subscribeRequest;
     private Consumer<Operation> consumer;
     private String peerNodeSelectorPath = ServiceUriPaths.DEFAULT_NODE_SELECTOR;
+    private URI nodeGroupCallbackUri;
 
     public static ReliableSubscriptionService create(Operation subscribe, ServiceSubscriber sr,
             Consumer<Operation> notificationConsumer) {
@@ -89,10 +90,29 @@ public class ReliableSubscriptionService extends StatelessService {
                     }
 
                     NodeSelectorState nss = o.getBody(NodeSelectorState.class);
-                    getHost().startSubscriptionService(
+                    URI callbackUri = getHost().startSubscriptionService(
                             Operation.createPost(this, nss.nodeGroupLink).setReferer(getUri()),
                             this::handleNodeGroupNotification);
+
+                    this.nodeGroupCallbackUri = callbackUri;
                     startPost.complete();
+                }));
+    }
+
+    @Override
+    public void handleStop(Operation op) {
+        // Delete the node group subscription which was created at handleStart.
+        sendRequest(Operation.createGet(this, getPeerNodeSelectorPath()).setCompletion(
+                (o, e) -> {
+                    if (e != null) {
+                        op.fail(e);
+                        return;
+                    }
+
+                    NodeSelectorState nss = o.getBody(NodeSelectorState.class);
+                    Operation delete = Operation.createDelete(this, nss.nodeGroupLink).setReferer(getUri());
+                    getHost().stopSubscriptionService(delete, this.nodeGroupCallbackUri);
+                    op.complete();
                 }));
     }
 
@@ -208,6 +228,7 @@ public class ReliableSubscriptionService extends StatelessService {
         // self DELETE. The client, if they implemented handleRequest on the service instance
         // will be able to tell something went wrong
         sendRequest(Operation.createDelete(getUri())
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NOTIFICATION)
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SKIPPED_NOTIFICATIONS));
     }
 }

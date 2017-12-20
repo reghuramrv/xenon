@@ -38,7 +38,6 @@ import io.netty.handler.codec.http.websocketx.WebSocketServerHandshaker;
 import io.netty.handler.codec.http.websocketx.WebSocketServerHandshakerFactory;
 
 import com.vmware.xenon.common.Operation;
-import com.vmware.xenon.common.OperationContext;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.ServiceSubscriptionState;
@@ -124,7 +123,6 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
                     dummyOp.addRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER, this.authToken);
                     dummyOp.setUri(
                             UriUtils.buildUri(this.host, ServiceUriPaths.CORE_WEB_SOCKET_ENDPOINT));
-                    OperationContext.setAuthorizationContext(this.host, dummyOp);
                 }
 
                 processWebSocketFrame(ctx, frameText);
@@ -169,7 +167,8 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
             if (token == null) {
                 String cookie = nettyRequest.headers().get(HttpHeaderNames.COOKIE);
                 if (cookie != null) {
-                    token = CookieJar.decodeCookies(cookie).get(AuthenticationConstants.XENON_JWT_COOKIE);
+                    token = CookieJar.decodeCookies(cookie)
+                            .get(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE);
                 }
 
             }
@@ -300,15 +299,12 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
                     this.host.sendRequest(Operation
                             .createDelete(service, path)
                             .setBody(body)
-                            .setReferer(
-                                    service.getUri())
+                            .setReferer(service.getUri())
                             .setCompletion(
                                     (completedOp, failure) -> {
                                         ctx.writeAndFlush(new TextWebSocketFrame(completedOp
                                                 .getStatusCode() + " " + requestId));
-                                        Utils.atomicGetOrCreate(this.serviceSubscriptions,
-                                                service.getUri(), ConcurrentSkipListSet::new)
-                                                .remove(path);
+                                        getSubscriptions(service).remove(path);
                                     }));
                     return;
                 }
@@ -356,17 +352,14 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
                     this.host.sendRequest(Operation
                             .createPost(service, path)
                             .setBody(body)
-                            .setReferer(
-                                    service.getUri())
+                            .setReferer(service.getUri())
                             .setCompletion(
                                     (completedOp, failure) -> {
                                         ctx.writeAndFlush(new TextWebSocketFrame(completedOp
                                                 .getStatusCode() + " " + requestId));
                                         if (completedOp.getStatusCode() >= 200
                                                 && completedOp.getStatusCode() < 300) {
-                                            Utils.atomicGetOrCreate(this.serviceSubscriptions,
-                                                    service.getUri(), ConcurrentSkipListSet::new)
-                                                    .add(path);
+                                            getSubscriptions(service).add(path);
                                         }
                                     }));
                     return;
@@ -391,6 +384,11 @@ public class NettyWebSocketRequestHandler extends SimpleChannelInboundHandler<Ob
         } catch (Exception e) {
             ctx.writeAndFlush("500 " + requestId);
         }
+    }
+
+    private Set<String> getSubscriptions(WebSocketService service) {
+        return this.serviceSubscriptions.computeIfAbsent(service.getUri(),
+                k -> new ConcurrentSkipListSet<>());
     }
 
     /**

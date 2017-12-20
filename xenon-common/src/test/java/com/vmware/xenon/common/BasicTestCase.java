@@ -20,7 +20,6 @@ import org.junit.rules.TestRule;
 import org.junit.rules.TestWatcher;
 import org.junit.runner.Description;
 
-import com.vmware.xenon.common.CommandLineArgumentParser;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.VerificationHost;
@@ -76,7 +75,7 @@ public class BasicTestCase {
         VerificationHost.initialize(host, args);
     }
 
-    public void beforeHostStart(VerificationHost host) throws Exception {
+    public void beforeHostStart(VerificationHost host) throws Throwable {
 
     }
 
@@ -96,6 +95,7 @@ public class BasicTestCase {
      * @param handler
      * @return
      */
+    @Deprecated
     public CompletionHandler getSafeHandler(CompletionHandler handler) {
         return this.host.getSafeHandler(handler);
     }

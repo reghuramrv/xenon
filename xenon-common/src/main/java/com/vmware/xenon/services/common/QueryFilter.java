@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.regex.Pattern;
 
 import com.vmware.xenon.common.ReflectionUtils;
@@ -61,7 +62,7 @@ public class QueryFilter {
         private static final String FORMAT = "Unsupported matchType: %s";
 
         UnsupportedMatchTypeException(Term term) {
-            super(String.format(FORMAT, term.term.matchType.toString()));
+            super(String.format(FORMAT, String.valueOf(term.term.matchType)));
         }
     }
 
@@ -120,10 +121,7 @@ public class QueryFilter {
             this.negate = negate;
 
             if (term.matchType == MatchType.WILDCARD) {
-                String normalize = term.matchValue
-                        .replace("*", ".*")
-                        .replace("+", ".+");
-                String regex = "^(" + normalize + ")$";
+                String regex = wildcardToRegex(term.matchValue);
                 this.pattern = Pattern.compile(regex);
             } else {
                 this.pattern = null;
@@ -134,6 +132,46 @@ public class QueryFilter {
             List<String> tmp = Arrays.asList(this.term.propertyName
                     .split(QueryTask.QuerySpecification.FIELD_NAME_REGEXP));
             this.propertyParts = Collections.unmodifiableList(tmp);
+        }
+
+        private static String wildcardToRegex(String wildcard) {
+            int len = wildcard.length();
+            StringBuilder sb = new StringBuilder(len + 10);
+            sb.append('^');
+            for (int i = 0; i < len; i++) {
+                char c = wildcard.charAt(i);
+                switch (c) {
+                case '*':
+                    sb.append(".*");
+                    break;
+                case '+':
+                    // TODO workaround for '+' in url query? if yes, need to properly decode url
+                    sb.append(".+");
+                    break;
+                case '?':
+                    sb.append('.');
+                    break;
+                case '(':
+                case ')':
+                case '[':
+                case ']':
+                case '$':
+                case '^':
+                case '.':
+                case '{':
+                case '}':
+                case '|':
+                case '\\':
+                    sb.append('\\');
+                    sb.append(c);
+                    break;
+                default:
+                    sb.append(c);
+                    break;
+                }
+            }
+            sb.append('$');
+            return sb.toString();
         }
     }
 
@@ -262,6 +300,7 @@ public class QueryFilter {
             }
         }
 
+        @Override
         public String toString() {
             class TermByPropertyNameComparator implements Comparator<Term> {
                 @Override
@@ -324,6 +363,8 @@ public class QueryFilter {
 
         // MUST and MUST_NOT makes a set of clauses into a conjunction.
         // Any SHOULD_OCCUR clauses in that set can then be discarded.
+        // Apply DeMorgan's laws in the negation case by converting MUST to SHOULD and vice versa.
+        int mustClauses = 0;
         int shouldClauses = 0;
         for (Query clause : q.booleanClauses) {
             Occurance o = clause.occurance;
@@ -333,12 +374,21 @@ public class QueryFilter {
 
             switch (o) {
             case MUST_OCCUR:
-                createDisjunctiveNormalForm(clause, prefixes, negate);
+                if (!negate) {
+                    createDisjunctiveNormalForm(clause, prefixes, false);
+                }
+                mustClauses++;
                 break;
             case MUST_NOT_OCCUR:
-                createDisjunctiveNormalForm(clause, prefixes, !negate);
+                if (!negate) {
+                    createDisjunctiveNormalForm(clause, prefixes, true);
+                }
+                mustClauses++;
                 break;
             case SHOULD_OCCUR:
+                if (negate) {
+                    createDisjunctiveNormalForm(clause, prefixes, false);
+                }
                 shouldClauses++;
                 break;
             default:
@@ -346,8 +396,10 @@ public class QueryFilter {
             }
         }
 
-        // The set of clauses only is a disjunction IFF ALL of the clauses have SHOULD_OCCUR.
-        if (shouldClauses == q.booleanClauses.size()) {
+        // The set of clauses is a disjunction if and only if all of the clauses are effectively
+        // SHOULD_OCCUR clauses.
+        if ((negate && mustClauses == q.booleanClauses.size())
+                || (!negate && shouldClauses == q.booleanClauses.size())) {
             ArrayList<Conjunction> originalPrefixes = new ArrayList<>(prefixes);
             prefixes.clear();
 
@@ -355,7 +407,8 @@ public class QueryFilter {
             // One for every clause in this disjunction.
             for (Query clause : q.booleanClauses) {
                 ArrayList<Conjunction> clausePrefixes = new ArrayList<>(originalPrefixes);
-                createDisjunctiveNormalForm(clause, clausePrefixes, negate);
+                boolean negateClause = (clause.occurance == Occurance.MUST_NOT_OCCUR) ? false : negate;
+                createDisjunctiveNormalForm(clause, clausePrefixes, negateClause);
                 prefixes.addAll(clausePrefixes);
             }
         }
@@ -423,29 +476,58 @@ public class QueryFilter {
 
         private boolean evaluateString(Term term, String o) {
             if (term.term.matchType == MatchType.WILDCARD) {
-                return term.pattern.matcher(o).matches();
+                return term.pattern.matcher(o == null ? "" : o).matches();
+            } else if (term.term.matchType == MatchType.PREFIX) {
+                return o != null && o.startsWith(term.term.matchValue);
+            }
+            return Objects.equals(o, term.term.matchValue);
+        }
+
+        private boolean evaluateNumber(Term term, Number o) {
+            if (term.term.range == null) {
+                return false;
             }
 
-            return o.equals(term.term.matchValue);
+            double max = term.term.range.max.doubleValue();
+            double min = term.term.range.min.doubleValue();
+            double val = o.doubleValue();
+
+            if (term.term.range.isMaxInclusive && val == max
+                    || term.term.range.isMinInclusive && val == min
+                    || (min < val && val < max)) {
+                return true;
+            } else {
+                return false;
+            }
         }
 
         @SuppressWarnings("unchecked")
         private boolean evaluateTerm(Term term, Object o, PropertyDescription pd, int depth) {
-            if (o == null) {
-                return term.negate;
-            }
-
             if (pd.typeName == TypeName.STRING) {
-                if (!(o instanceof String)) {
+                if (o != null && !(o instanceof String)) {
                     return term.negate;
                 }
 
                 if (term.negate) {
-                    if (evaluateString(term, (String)o)) {
+                    if (evaluateString(term, (String) o)) {
                         return false;
                     }
                 } else {
                     if (!evaluateString(term, (String) o)) {
+                        return false;
+                    }
+                }
+            } else if (pd.typeName == TypeName.LONG || pd.typeName == TypeName.DOUBLE) {
+                if (!(o instanceof Number)) {
+                    return term.negate;
+                }
+
+                if (term.negate) {
+                    if (evaluateNumber(term, (Number) o)) {
+                        return false;
+                    }
+                } else {
+                    if (!evaluateNumber(term, (Number) o)) {
                         return false;
                     }
                 }
@@ -468,11 +550,21 @@ public class QueryFilter {
                 if (pd.elementDescription.typeName == TypeName.STRING) {
                     Collection<String> cs = (Collection<String>) o;
                     if (term.negate) {
-                        if (cs.contains(term.term.matchValue)) {
-                            return false;
+                        for (String s : cs) {
+                            if (evaluateString(term, s)) {
+                                return false;
+                            }
                         }
                     } else {
-                        if (!cs.contains(term.term.matchValue)) {
+                        boolean found = false;
+                        for (String s : cs) {
+                            if (evaluateString(term, s)) {
+                                found = true;
+                                break;
+                            }
+                        }
+
+                        if (!found) {
                             return false;
                         }
                     }
@@ -518,8 +610,10 @@ public class QueryFilter {
         static Evaluator create(Conjunction conjunction) throws QueryFilterException {
             ArrayList<Term> terms = new ArrayList<>();
             for (Term term : conjunction) {
-                if (term.term.matchType != MatchType.TERM &&
-                        term.term.matchType != MatchType.WILDCARD) {
+                if (term.term.range == null &&
+                        term.term.matchType != MatchType.TERM &&
+                        term.term.matchType != MatchType.WILDCARD &&
+                        term.term.matchType != MatchType.PREFIX) {
                     throw new UnsupportedMatchTypeException(term);
                 }
 
@@ -715,6 +809,7 @@ public class QueryFilter {
         }
 
         class ElemComparator implements Comparator<Elem> {
+            @Override
             public int compare(Elem o1, Elem o2) {
                 return o1.count - o2.count;
             }

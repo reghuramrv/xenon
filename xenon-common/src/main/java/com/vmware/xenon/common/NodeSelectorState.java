@@ -13,7 +13,52 @@
 
 package com.vmware.xenon.common;
 
+
+import java.util.EnumSet;
+
+import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
+import com.vmware.xenon.services.common.NodeGroupUtils;
+
+
 public class NodeSelectorState extends ServiceDocument {
+
+    public enum Status {
+        UNAVAILABLE,
+        PAUSED,
+        AVAILABLE
+    }
+
+    public static final EnumSet<Status> UNAVAILABLE = EnumSet.of(Status.UNAVAILABLE);
+    public static final EnumSet<Status> PAUSED = EnumSet.of(Status.PAUSED, Status.AVAILABLE);
+    public static final EnumSet<Status> AVAILABLE = EnumSet.of(Status.AVAILABLE);
+    public static final EnumSet<Status> PAUSED_UNAVAILABLE = EnumSet.of(Status.PAUSED, Status.UNAVAILABLE);
+
+    /**
+     * Calculates the status of the Node Selector by inspecting the NodeGroup and local
+     * 'pause'/'resume' status.
+     */
+    public static Status calculateStatus(ServiceHost host, NodeGroupState groupState) {
+        boolean isAvailable = NodeGroupUtils.isNodeGroupAvailable(host, groupState);
+        return (isAvailable ? Status.AVAILABLE : Status.UNAVAILABLE);
+    }
+
+    public static void updateStatus(ServiceHost host,
+            NodeGroupState groupState, NodeSelectorState ns) {
+        ns.status = calculateStatus(host, groupState);
+    }
+
+    public static boolean isAvailable(NodeSelectorState ns) {
+        return AVAILABLE.contains(ns.status);
+    }
+
+    public static boolean isAvailable(ServiceHost host, NodeGroupState groupState) {
+        return AVAILABLE.contains(calculateStatus(host, groupState));
+    }
+
     public String nodeGroupLink;
     public Long replicationFactor;
+    public int replicationQuorum;
+    public int membershipQuorum;
+    public long membershipUpdateTimeMicros;
+    public Status status;
 }

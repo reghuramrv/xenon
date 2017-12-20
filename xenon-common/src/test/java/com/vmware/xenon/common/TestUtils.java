@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2015 VMware, Inc. All Rights Reserved.
+ * Copyright (c) 2014-2016 VMware, Inc. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy of
@@ -14,98 +14,241 @@
 package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
+import java.io.ByteArrayOutputStream;
+import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
-import java.math.RoundingMode;
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.ByteBuffer;
+import java.nio.charset.MalformedInputException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Comparator;
+import java.util.Date;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.TimeZone;
+import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
+import java.util.zip.GZIPOutputStream;
 
+import com.esotericsoftware.kryo.Kryo;
+import com.esotericsoftware.kryo.Kryo.DefaultInstantiatorStrategy;
+import com.esotericsoftware.kryo.io.Output;
+import com.esotericsoftware.kryo.serializers.VersionFieldSerializer;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
+import org.objenesis.strategy.StdInstantiatorStrategy;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
-import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
+import com.vmware.xenon.common.serialization.GsonSerializers;
+import com.vmware.xenon.common.serialization.JsonMapper;
+import com.vmware.xenon.common.serialization.KryoSerializers;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
-import com.vmware.xenon.services.common.QueryTask.NumericRange;
+import com.vmware.xenon.services.common.QueryValidationTestService.NestedType;
 import com.vmware.xenon.services.common.QueryValidationTestService.QueryValidationServiceState;
-import com.vmware.xenon.services.common.ServiceUriPaths;
-
 
 public class TestUtils {
 
     public int iterationCount = 1000;
+    /**
+     * enables hash collisions in the computeHash methods. Should be set to false when running
+     * large iteration count benchmarks
+     */
+    public boolean checkHashCollisions = true;
 
-    public static final Integer SOME_INT_VALUE = 100;
-    public static final Integer SOME_OTHER_INT_VALUE = 200;
-    public static final long SOME_EXPIRATION_VALUE = Utils.getNowMicrosUtc();
-    public static final String SOME_STRING_VALUE = "some value";
-    public static final String SOME_OTHER_STRING_VALUE = "some other value";
-    public static final String SOME_IGNORE_VALUE = "ignore me";
-    public static final String SOME_OTHER_IGNORE_VALUE = "ignore me please";
-    public static final long SOME_OTHER_EXPIRATION_VALUE =
-            Utils.getNowMicrosUtc() + TimeUnit.MINUTES.toMicros(5);
+    @Rule
+    public TestResults testResults = new TestResults();
 
-    private static class Range {
-        public final int from;
-        public final int to;
+    @Rule
+    public ExpectedException expectedEx = ExpectedException.none();
 
-        public Range(int from, int to) {
-            this.from = from;
-            this.to = to;
+    @Test
+    public void registerKind() {
+        String kindBefore = Utils.buildKind(ExampleServiceState.class);
+        String newKind = "e";
+        Utils.registerKind(ExampleServiceState.class, newKind);
+        String kindAfter = Utils.buildKind(ExampleServiceState.class);
+        assertEquals(newKind, kindAfter);
+        Utils.registerKind(ExampleServiceState.class, kindBefore);
+        kindAfter = Utils.buildKind(ExampleServiceState.class);
+        assertEquals(kindBefore, kindAfter);
+        Class<?> stateClass = Utils.getTypeFromKind(kindAfter);
+        assertEquals(stateClass.getCanonicalName(), ExampleServiceState.class.getCanonicalName());
+    }
+
+    @Test
+    public void buildUUID() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        Utils.setTimeDriftThreshold(TimeUnit.HOURS.toMicros(1));
+        try {
+            Logger log = Logger.getAnonymousLogger();
+            String baseId = Utils.computeHash("some id");
+            // verify uniqueness of each value returned, across N threads
+            Set<String> set = new ConcurrentSkipListSet<>();
+            int threadCount = Utils.DEFAULT_THREAD_COUNT;
+            int iterations = this.iterationCount;
+            log.info("Starting uniqueness check, thread count: " + threadCount);
+            TestContext ctx = new TestContext(threadCount, Duration.ofSeconds(30));
+            for (int t = 0; t < threadCount; t++) {
+                ForkJoinPool.commonPool().execute(() -> {
+                    for (int i = 0; i < iterations / threadCount; i++) {
+                        String value = Utils.buildUUID(baseId);
+                        if (!set.add(value)) {
+                            ctx.fail(new IllegalStateException("Duplicate: " + value));
+                        }
+                    }
+                    ctx.complete();
+                });
+            }
+            ctx.await();
+            set.clear();
+            System.gc();
+
+            // keep jvm from optimizing away calls
+            int sum = 0;
+            long start = System.nanoTime();
+            for (int i = 0; i < iterations; i++) {
+                sum += Utils.buildUUID(baseId).length();
+            }
+            long end = System.nanoTime();
+
+            log.info("iterations: " + iterations);
+            log.info("Total chars: " + sum);
+            double thpt = this.iterationCount / ((end - start) / 1000000000.0);
+            log.info("Throughput (calls / sec): " + thpt);
+            this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
+        } finally {
+            Utils.setTimeDriftThreshold(Utils.DEFAULT_TIME_DRIFT_THRESHOLD_MICROS);
         }
     }
 
     @Test
-    public void toHexString() {
-        byte[] bytes = new byte[4];
-        bytes[0] = 0x12;
-        bytes[1] = 0x34;
-        bytes[2] = (byte) 0xAB;
-        bytes[3] = (byte) 0xCD;
+    public void computeStringHash() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        Set<String> keys = new HashSet<>(this.iterationCount);
+        Set<Long> hashedKeys = new HashSet<>(this.iterationCount);
+        long collisionCount = 0;
 
-        String out = Utils.toHexString(bytes);
-        assertEquals("1234abcd", out);
+        for (int i = 0; i < this.iterationCount; i++) {
+            String k = "-string-" + i;
+            long hash = FNVHash.compute(k);
+            long hash2 = FNVHash.compute(k);
+            assertEquals(hash, hash2);
+            assertTrue(keys.add(k));
+        }
+        Logger.getAnonymousLogger().info("Generated keys: " + keys.size());
+        long s = System.nanoTime() / 1000;
+        for (String key : keys) {
+            long hash = FNVHash.compute(key);
+            assertTrue(hash != 0);
+            if (this.checkHashCollisions && !hashedKeys.add(hash)) {
+                collisionCount++;
+            }
+        }
+        long e = System.nanoTime() / 1000;
+        double thpt = this.iterationCount / ((e - s) / 1000000.0);
+
+        this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
+        Logger.getAnonymousLogger().info("Throughput: " + thpt);
+        Logger.getAnonymousLogger().info("Collisions: " + collisionCount);
+    }
+
+    private static String computeHash(byte[] content, int offset, int length) {
+        return Long.toHexString(FNVHash.compute(content, offset, length));
     }
 
     @Test
-    public void toHexStringZeroes() {
-        byte[] bytes = new byte[4];
-        bytes[0] = 0x00;
-        bytes[1] = 0x00;
-        bytes[2] = 0x00;
-        bytes[3] = 0x00;
+    public void computeByteHash() throws UnsupportedEncodingException {
+        CommandLineArgumentParser.parseFromProperties(this);
+        Set<String> keys = new HashSet<>(this.iterationCount);
+        Set<Long> hashedKeys = new HashSet<>(this.iterationCount);
+        long collisionCount = 0;
 
-        String out = Utils.toHexString(bytes);
-        assertEquals("00000000", out);
+        for (int i = 0; i < this.iterationCount; i++) {
+            String k = "-string-" + i;
+            byte[] bytes = k.getBytes(Utils.CHARSET);
+            String stringHash = computeHash(bytes, 0, bytes.length);
+            String stringHash2 = computeHash(bytes, 0, bytes.length);
+            assertEquals(stringHash, stringHash2);
+            assertTrue(keys.add(k));
+        }
+        Logger.getAnonymousLogger().info("Generated keys: " + keys.size());
+        long s = System.nanoTime() / 1000;
+        for (String key : keys) {
+            byte[] bytes = key.getBytes(Utils.CHARSET);
+            long hash = FNVHash.compute(bytes, 0, bytes.length);
+            assertTrue(hash != 0);
+            if (!hashedKeys.add(hash)) {
+                collisionCount++;
+            }
+        }
+        long e = System.nanoTime() / 1000;
+        double thpt = this.iterationCount / ((e - s) / 1000000.0);
+        Logger.getAnonymousLogger().info("Throughput: " + thpt);
+        Logger.getAnonymousLogger().info("Collisions: " + collisionCount);
+    }
+
+    @Test
+    public void buildKind() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        String kind = Utils.buildKind(ExampleServiceState.class);
+        long s = System.nanoTime() / 1000;
+        for (int i = 0; i < this.iterationCount; i++) {
+            String k = Utils.buildKind(ExampleServiceState.class);
+            assertTrue(kind.hashCode() == k.hashCode());
+        }
+        long e = System.nanoTime() / 1000;
+        double thpt = this.iterationCount / ((e - s) / 1000000.0);
+        Logger.getAnonymousLogger().info("Throughput: " + thpt);
+    }
+
+    @Test
+    public void getSystemNowMicrosUtc() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        long s = System.nanoTime() / 1000;
+        for (int i = 0; i < this.iterationCount; i++) {
+            Utils.getSystemNowMicrosUtc();
+        }
+        long e = System.nanoTime() / 1000;
+        double thpt = this.iterationCount / ((e - s) / 1000000.0);
+        Logger.getAnonymousLogger().info("Throughput: " + thpt);
     }
 
     @Test
@@ -115,15 +258,15 @@ public class TestUtils {
         ServiceDocument s = buildCloneOrSerializationObject();
 
         int byteCount = 0;
-        long start = Utils.getNowMicrosUtc();
-        byte[] content = new byte[1024];
+        long start = System.nanoTime() / 1000;
         for (int i = 0; i < count; i++) {
+            byte[] content = Utils.getBuffer(1024);
             byteCount = Utils.toBytes(s, content, 0);
             assertTrue(content != null);
             assertTrue(content.length >= expectedByteCount);
         }
 
-        long end = Utils.getNowMicrosUtc();
+        long end = System.nanoTime() / 1000;
         double thpt = end - start;
         thpt /= 1000000;
         thpt = count / thpt;
@@ -132,6 +275,178 @@ public class TestUtils {
                 String.format(
                         "Binary serializations per second: %f, iterations: %d, byte count: %d",
                         thpt, count, byteCount));
+        this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
+    }
+
+    @Test
+    public void setAndGetTimeComparisonEpsilon() {
+        long l = Utils.getTimeComparisonEpsilonMicros();
+        assertTrue(l > TimeUnit.SECONDS.toMicros(1));
+        l = 41;
+        // implicitly set epsilon through JVM property
+        System.setProperty(Utils.PROPERTY_NAME_PREFIX +
+                Utils.PROPERTY_NAME_TIME_COMPARISON, "" + l);
+        Utils.resetTimeComparisonEpsilonMicros();
+        long k = Utils.getTimeComparisonEpsilonMicros();
+        assertEquals(k, l);
+        // explicitly set epsilon
+        l = 45;
+        Utils.setTimeComparisonEpsilonMicros(l);
+        k = Utils.getTimeComparisonEpsilonMicros();
+        assertEquals(k, l);
+    }
+
+    @Test
+    public void isWithinTimeComparisonEpsilon() {
+        Utils.setTimeComparisonEpsilonMicros(TimeUnit.SECONDS.toMicros(10));
+        // check a value within about a millisecond from now
+        long l = Utils.getSystemNowMicrosUtc() + 1000;
+        assertTrue(Utils.isWithinTimeComparisonEpsilon(l));
+        // check a value days from now
+        l = Utils.getSystemNowMicrosUtc() + TimeUnit.DAYS.toMicros(2);
+        assertFalse(Utils.isWithinTimeComparisonEpsilon(l));
+    }
+
+    public static class CustomKryoForObjectThreadLocal extends ThreadLocal<Kryo> {
+        @Override
+        protected Kryo initialValue() {
+            return createKryo(true);
+        }
+    }
+
+    public static class CustomKryoForDocumentThreadLocal extends ThreadLocal<Kryo> {
+        @Override
+        protected Kryo initialValue() {
+            return createKryo(false);
+        }
+    }
+
+    private static final int EXAMPLE_SERVICE_CLASS_ID = 1234;
+
+    private static Kryo createKryo(boolean isObjectSerializer) {
+        Kryo k = new Kryo();
+        // handle classes with missing default constructors
+        k.setInstantiatorStrategy(new DefaultInstantiatorStrategy(new StdInstantiatorStrategy()));
+        // supports addition of fields if the @since annotation is used
+        k.setDefaultSerializer(VersionFieldSerializer.class);
+
+        if (!isObjectSerializer) {
+            // For performance reasons, and to avoid memory use, assume documents do not
+            // require object graph serialization with duplicate or recursive references
+            k.setReferences(false);
+        } else {
+            // To avoid monotonic increase of memory use, due to reference tracking, we must
+            // reset after each use.
+            k.setAutoReset(true);
+        }
+
+        k.register(ExampleServiceState.class, EXAMPLE_SERVICE_CLASS_ID);
+        HashMap<String, String> map = new HashMap<>();
+        k.register(map.getClass());
+        return k;
+    }
+
+    /**
+     * This test detects accidental changes to how the signature is calculated. Change it
+     * if signature calculation has changed, otherwise it is a regression.
+     */
+    @Test
+    public void testSignature() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        ServiceDocumentDescription desc = Builder.create()
+                .buildDescription(QueryValidationServiceState.class);
+
+        QueryValidationServiceState document = new QueryValidationServiceState();
+        document.nestedComplexValue = new NestedType();
+        document.nestedComplexValue.id = "document.nestedComplexValue.id";
+        document.nestedComplexValue.longValue = Long.MIN_VALUE;
+        document.documentKind = Utils.buildKind(document.getClass());
+        document.documentSelfLink = "documentSelfLink";
+        document.documentVersion = 0;
+        document.documentExpirationTimeMicros = 1111111111;
+        document.documentSourceLink = "documentSourceLink";
+        document.documentOwner = "owner";
+        document.documentUpdateTimeMicros = 222222222;
+        document.documentAuthPrincipalLink = "documentAuthPrincipalLink";
+        document.documentUpdateAction = "PUT";
+
+        document.referenceValue = URI.create("http://www.example.com");
+        document.mapOfStrings = new LinkedHashMap<>();
+        document.mapOfStrings.put("key1", "value1");
+        document.binaryContent = document.documentKind.getBytes(Utils.CHARSET_OBJECT);
+        document.booleanValue = false;
+        document.doublePrimitive = 3;
+        document.doubleValue = Double.valueOf(3);
+        document.id = document.documentSelfLink;
+        document.serviceLink = document.documentSelfLink;
+        document.dateValue = new Date(1422344512424L);
+        document.listOfStrings = Arrays.asList("1", "2", "3");
+
+        String wellKnownSignature = "6f06213cfdb5a51a";
+
+        Logger.getAnonymousLogger().info(
+                String.format(
+                        "Expected signature (%s) of document:\n%s",
+                        wellKnownSignature, Utils.toJsonHtml(document)));
+        String sig = Utils.computeSignature(document, desc);
+        assertEquals(wellKnownSignature, sig);
+    }
+
+    @Test
+    public void registerCustomKryoSerializer() {
+        try {
+
+            ExampleServiceState st = new ExampleServiceState();
+            st.id = UUID.randomUUID().toString();
+            st.counter = Utils.getNowMicrosUtc();
+            st.documentSelfLink = st.id;
+            st.keyValues = new HashMap<>();
+            st.keyValues.put(st.id, st.id);
+            // we need to prove that the default serializer, for both object and document is
+            // used and produces a different result, compared to the custom serializer. we first
+            // serialize with defaults, then with custom, and compare sizes
+
+            int byteCountToObjectDefault = Utils.toBytes(st, Utils.getBuffer(1024), 0);
+            Output outDocumentImplicitDefault = KryoSerializers.serializeAsDocument(st,
+                    1024);
+            int pDefaultImplicit = outDocumentImplicitDefault.position();
+            Output outDocumentDefault = KryoSerializers.serializeDocument(st, 1024);
+            int pDefault = outDocumentDefault.position();
+
+            Utils.registerCustomKryoSerializer(new CustomKryoForObjectThreadLocal(), false);
+            Utils.registerCustomKryoSerializer(new CustomKryoForDocumentThreadLocal(),
+                    true);
+
+            byte[] objectData = new byte[1024];
+            int byteCountToObjectCustom = Utils.toBytes(st, objectData, 0);
+            Output outDocumentImplicitCustom = KryoSerializers.serializeAsDocument(st,
+                    1024);
+            int p = outDocumentImplicitCustom.position();
+            Output outDocumentCustom = KryoSerializers.serializeDocument(st, 1024);
+
+            assertTrue(byteCountToObjectCustom != byteCountToObjectDefault);
+            assertTrue(p != pDefaultImplicit);
+            assertTrue(outDocumentCustom.position() != pDefault);
+
+            ExampleServiceState stDeserializedFromObject = (ExampleServiceState) Utils.fromBytes(
+                    objectData);
+            ExampleServiceState stDeserializedImplicit =
+                    (ExampleServiceState) KryoSerializers.deserializeDocument(
+                            outDocumentImplicitDefault.getBuffer(), 0,
+                            outDocumentImplicitDefault.position());
+            ExampleServiceState stDeserialized = (ExampleServiceState) KryoSerializers
+                    .deserializeDocument(
+                            outDocumentDefault.getBuffer(), 0, outDocumentDefault.position());
+            assertEquals(st.id, stDeserializedFromObject.id);
+            assertEquals(st.id, stDeserializedImplicit.id);
+            assertEquals(st.id, stDeserialized.id);
+            assertEquals(st.id, stDeserializedFromObject.keyValues.get(st.id));
+            assertEquals(st.id, stDeserializedImplicit.keyValues.get(st.id));
+            assertEquals(st.id, stDeserialized.keyValues.get(st.id));
+        } finally {
+            Utils.registerCustomKryoSerializer(null, false);
+            Utils.registerCustomKryoSerializer(null, true);
+        }
     }
 
     @Test
@@ -139,14 +454,14 @@ public class TestUtils {
         int count = 100000;
         Object s = buildCloneOrSerializationObject();
 
-        long start = Utils.getNowMicrosUtc();
+        long start = System.nanoTime() / 1000;
         for (int i = 0; i < count; i++) {
             s = Utils.cloneObject(s);
             Object foo = s;
             foo = Utils.cloneObject(foo);
         }
 
-        long end = Utils.getNowMicrosUtc();
+        long end = System.nanoTime() / 1000;
         double thpt = end - start;
         thpt /= 1000000;
         thpt = count / thpt;
@@ -175,37 +490,6 @@ public class TestUtils {
                 assertEquals(s.get(e.getKey()), e.getValue());
             }
         }
-    }
-
-    @Test
-    public void fromDocumentBytes() {
-        int count = 100000;
-        ExampleServiceState s = buildCloneOrSerializationObject();
-
-        byte[] content = new byte[1024];
-        int byteCount = Utils.toBytes(s, content, 0);
-
-        long start = Utils.getNowMicrosUtc();
-        for (int i = 0; i < count; i++) {
-            ExampleServiceState s1 = (ExampleServiceState) Utils.fromDocumentBytes(content, 0,
-                    content.length);
-            assertEquals(s.counter, s1.counter);
-            assertEquals(s.name, s1.name);
-            assertEquals(s.keyValues.size(), s1.keyValues.size());
-            assertEquals(s.keyValues.get("1"), s1.keyValues.get("1"));
-        }
-
-        long end = Utils.getNowMicrosUtc();
-
-        double thpt = end - start;
-        thpt /= 1000000;
-        thpt = count / thpt;
-
-        Logger.getAnonymousLogger().info(
-                String.format(
-                        "Binary deserializations per second: %f, iterations: %d, byte count: %d",
-                        thpt, count, byteCount));
-
     }
 
     private ExampleServiceState buildCloneOrSerializationObject() {
@@ -282,15 +566,15 @@ public class TestUtils {
         // now change derived fields and expect the signature to change
         QueryValidationServiceState changed = Utils.clone(original);
         changed.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
-        assertTrue(false == ServiceDocument.equals(desc, original, changed));
+        assertFalse(ServiceDocument.equals(desc, original, changed));
 
         changed = Utils.clone(original);
-        changed.stringValue = UUID.randomUUID().toString();
-        assertTrue(false == ServiceDocument.equals(desc, original, changed));
+        changed.textValue = UUID.randomUUID().toString();
+        assertFalse(ServiceDocument.equals(desc, original, changed));
 
         changed = Utils.clone(original);
         changed.mapOfStrings.put(UUID.randomUUID().toString(), UUID.randomUUID().toString());
-        assertTrue(false == ServiceDocument.equals(desc, original, changed));
+        assertFalse(ServiceDocument.equals(desc, original, changed));
 
         // finally do a simple throughput test
         logThroughput(this.iterationCount, useBinary, desc, original);
@@ -310,18 +594,17 @@ public class TestUtils {
 
     public void logThroughput(int count, boolean useBinary, ServiceDocumentDescription desc,
             ServiceDocument original)
-                    throws Throwable {
+            throws Throwable {
 
-        long s = Utils.getNowMicrosUtc();
+        long s = System.nanoTime() / 1000;
         long length = 0;
 
         for (int i = 0; i < count; i++) {
             if (useBinary) {
-                byte[] bytes = new byte[4096];
-                int pos = Utils.toBytes(original, bytes, 0);
-                assertTrue(bytes != null && pos > 10);
-                length = pos;
-                Utils.fromDocumentBytes(bytes, 0, pos);
+                Output o = KryoSerializers.serializeDocument(original, 4096);
+                assertTrue(o != null && o.position() > 10);
+                length = o.position();
+                KryoSerializers.deserializeDocument(o.getBuffer(), 0, o.position());
             } else {
                 String serializedDocument = Utils.toJson(original);
                 assertTrue(serializedDocument != null);
@@ -329,7 +612,7 @@ public class TestUtils {
                 Utils.fromJson(serializedDocument, original.getClass());
             }
         }
-        long e = Utils.getNowMicrosUtc();
+        long e = System.nanoTime() / 1000;
         double throughput = (e - s) / (double) TimeUnit.SECONDS.toMicros(1);
         throughput = count / throughput;
         Logger.getAnonymousLogger().info(
@@ -339,16 +622,60 @@ public class TestUtils {
                         throughput, length));
     }
 
+    @Test
+    public void signatureThroughput() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        ServiceDocumentDescription desc = Builder.create()
+                .buildDescription(QueryValidationServiceState.class);
+
+        QueryValidationServiceState document = VerificationHost.buildQueryValidationState();
+        document.documentKind = Utils.buildKind(document.getClass());
+        document.documentSelfLink = UUID.randomUUID().toString();
+        document.documentVersion = 0;
+        document.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
+        document.documentSourceLink = UUID.randomUUID().toString();
+        document.documentOwner = UUID.randomUUID().toString();
+        document.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+        document.documentAuthPrincipalLink = UUID.randomUUID().toString();
+        document.documentUpdateAction = UUID.randomUUID().toString();
+
+        document.mapOfStrings = new LinkedHashMap<>();
+        document.mapOfStrings.put("key1", "value1");
+        document.mapOfStrings.put("key2", "value2");
+        document.mapOfStrings.put("key3", "value3");
+        document.binaryContent = document.documentKind.getBytes();
+        document.booleanValue = false;
+        document.doublePrimitive = 3;
+        document.doubleValue = Double.valueOf(3);
+        document.id = document.documentSelfLink;
+        document.serviceLink = document.documentSelfLink;
+        document.dateValue = new Date();
+        document.listOfStrings = Arrays.asList("1", "2", "3", "4", "5");
+
+        long start = System.nanoTime();
+        for (int i = 0; i < this.iterationCount; i++) {
+            Utils.computeSignature(document, desc);
+        }
+
+        long duration = System.nanoTime() - start;
+
+        double thpt = this.iterationCount * 1000.0 * 1000.0 * 1000.0 / duration;
+        Logger.getAnonymousLogger().info(
+                String.format(
+                        "Signature calculation throughput: %.2f/sec", thpt));
+        this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
+    }
+
     public QueryValidationServiceState serializedAndCompareDocuments(
             boolean useBinary, QueryValidationServiceState original)
-                    throws Throwable {
+            throws Throwable {
         QueryValidationServiceState originalDeserializedWithSig = null;
         if (useBinary) {
-            byte[] serializedDocument = new byte[4096];
-            Utils.toBytes(original, serializedDocument, 0);
-            originalDeserializedWithSig = (QueryValidationServiceState) Utils.fromBytes(
-                    serializedDocument,
-                    0, serializedDocument.length);
+            Output o = KryoSerializers.serializeDocument(original, 4096);
+            originalDeserializedWithSig = (QueryValidationServiceState) KryoSerializers
+                    .deserializeDocument(
+                            o.getBuffer(),
+                            0, o.position());
         } else {
             String serializedDocument = Utils.toJson(original);
             originalDeserializedWithSig = Utils.fromJson(
@@ -450,6 +777,37 @@ public class TestUtils {
                 TimeUnit.NANOSECONDS.toMillis(stop - start)));
     }
 
+    private static class TestKeyObjectValueHolder {
+        private final Map<String, Object> keyValues = new HashMap<>();
+    }
+
+    private void checkOptions(EnumSet<Service.ServiceOption> options) {
+        checkOptions(options, false);
+    }
+
+    private void checkOptions(EnumSet<Service.ServiceOption> options, boolean isFailureExpected) {
+        String error;
+        for (Service.ServiceOption o : options) {
+            error = Utils.validateServiceOption(options, o);
+            if (error != null && !isFailureExpected) {
+                throw new IllegalArgumentException(error);
+            }
+        }
+    }
+
+    @Test
+    public void toJsonHtml() {
+        ServiceDocument doc = new ServiceDocument();
+        String json = Utils.toJsonHtml(doc);
+        assertTrue(json.contains("  "));
+    }
+
+    @Test
+    public void toJsonHtmlNull() {
+        String json = Utils.toJsonHtml(null);
+        assertEquals(json, "null");
+    }
+
     @Test
     public void validateServiceOption() {
         // positive tests
@@ -512,6 +870,23 @@ public class TestUtils {
     }
 
     @Test
+    public void testGsonParserErrorSuppressed() throws JsonSyntaxException {
+        this.expectedEx.expect(JsonSyntaxException.class);
+        this.expectedEx.expectMessage("JSON body could not be parsed");
+        JsonMapper jsonMapper = new JsonMapper();
+        jsonMapper.setJsonSuppressGsonSerializationErrors(true);
+        jsonMapper.fromJson("TEST", ExampleServiceState.class);
+    }
+
+    @Test
+    public void testGsonParserError() throws JsonSyntaxException {
+        this.expectedEx.expect(JsonSyntaxException.class);
+        this.expectedEx.expectMessage("Expected BEGIN_OBJECT but was STRING");
+        JsonMapper jsonMapper = new JsonMapper();
+        jsonMapper.fromJson("TEST", ExampleServiceState.class);
+    }
+
+    @Test
     public void testParseZonedDateTime() throws Exception {
         Calendar cal = Calendar.getInstance();
         cal.setTimeZone(TimeZone.getTimeZone("Australia/Sydney"));
@@ -534,40 +909,40 @@ public class TestUtils {
         SystemHostInfo systemHostInfo = new SystemHostInfo();
         systemHostInfo.properties.put(SystemHostInfo.PROPERTY_NAME_OS_NAME, expected);
 
-        assertEquals(expected, Utils.getOsName(systemHostInfo));
+        assertEquals(expected, systemHostInfo.getOsName());
     }
 
     @Test
     public void testDetermineOsFamilyForWindows() throws Exception {
         final String osName = "Windows NT";
 
-        assertEquals(OsFamily.WINDOWS, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.WINDOWS, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForLinux() throws Exception {
         final String osName = "Linux";
 
-        assertEquals(OsFamily.LINUX, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.LINUX, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForMac() throws Exception {
         final String osName = "Mac OS X";
 
-        assertEquals(OsFamily.MACOS, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.MACOS, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForOther() throws Exception {
         final String osName = "TI 99/4A";
 
-        assertEquals(OsFamily.OTHER, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.OTHER, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForNull() throws Exception {
-        assertEquals(OsFamily.OTHER, Utils.determineOsFamily(null));
+        assertEquals(OsFamily.OTHER, SystemHostInfo.determineOsFamily(null));
     }
 
     @Test
@@ -618,6 +993,46 @@ public class TestUtils {
     }
 
     @Test
+    public void testGetFromPrimitives() {
+        Map<String, Object> map = new HashMap<>();
+        map.put("bt", true);
+        map.put("bf", false);
+        map.put("int", 123);
+        map.put("double", 3.14);
+        map.put("string", "hello");
+        ExampleServiceState doc = new ExampleServiceState();
+        doc.documentSelfLink = "selfLink";
+        doc.tags = new HashSet<>(Arrays.asList("t1", "t2"));
+        map.put("doc", doc);
+
+        validateExtract(Utils.toJson(map));
+        validateExtract(Utils.fromJson(Utils.toJson(map), JsonElement.class));
+    }
+
+    private void validateExtract(Object jsonRepr) {
+        assertEquals(true, Utils.getJsonMapValue(jsonRepr, "bt", Boolean.class));
+        assertEquals(false, Utils.getJsonMapValue(jsonRepr, "bf", Boolean.class));
+        assertEquals(Integer.valueOf(123), Utils.getJsonMapValue(jsonRepr, "int", Integer.class));
+        assertEquals(Double.valueOf(3.14), Utils.getJsonMapValue(jsonRepr, "double", Double.class));
+        assertEquals("hello", Utils.getJsonMapValue(jsonRepr, "string", String.class));
+        assertEquals("selfLink", Utils.getJsonMapValue(jsonRepr, "doc", ExampleServiceState.class).documentSelfLink);
+        assertTrue(Utils.getJsonMapValue(jsonRepr, "doc", ExampleServiceState.class).tags.contains("t1"));
+
+        assertNull(Utils.getJsonMapValue(jsonRepr, "badKey", ExampleServiceState.class));
+
+        // coercion to string always possible
+        assertEquals("true", Utils.getJsonMapValue(jsonRepr, "bt", String.class));
+
+        try {
+            // must fail if object is expected
+            Utils.getJsonMapValue(jsonRepr, "bt", ServiceDocument.class);
+            fail("Impossible conversion");
+        } catch (JsonSyntaxException ignore) {
+
+        }
+    }
+
+    @Test
     public void testGetFromJsonMap() {
         String sampleJson = "{"
                 + "\"key1\":\"val1\","
@@ -640,380 +1055,6 @@ public class TestUtils {
         assertTrue(val3.containsKey("key32"));
     }
 
-    /**
-     * Test merging where patch updates all mergeable fields.
-     */
-    @Test
-    public void testFullMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        source.documentExpirationTimeMicros = SOME_EXPIRATION_VALUE;
-        MergeTest patch = new MergeTest();
-        patch.s = SOME_OTHER_STRING_VALUE;
-        patch.x = SOME_OTHER_INT_VALUE;
-        patch.ignore = SOME_OTHER_IGNORE_VALUE;
-        patch.documentExpirationTimeMicros = SOME_OTHER_EXPIRATION_VALUE;
-
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertTrue("There should be changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_OTHER_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-        Assert.assertEquals("Auto-annotated expiration field", source.documentExpirationTimeMicros,
-                SOME_OTHER_EXPIRATION_VALUE);
-    }
-
-    /**
-     * Test merging where patch updates all mergeable fields into an object which have all the fields unset.
-     */
-    @Test
-    public void testFullMerge2() {
-        MergeTest source = new MergeTest();
-        MergeTest patch = new MergeTest();
-        patch.s = SOME_OTHER_STRING_VALUE;
-        patch.x = SOME_OTHER_INT_VALUE;
-        patch.ignore = SOME_OTHER_IGNORE_VALUE;
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertTrue("There should be changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_OTHER_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
-        Assert.assertNull("Non-annotated ignore field", source.ignore);
-    }
-
-    @Test
-    public void testSerializeClassesWithoutDefaultConstructor() {
-        Range range = new Range(0, 100);
-        // clone uses kryo serialization
-        Range clone = Utils.clone(range);
-        assertEquals(range.from, clone.from);
-        assertEquals(range.to, clone.to);
-    }
-
-    /**
-     * Test merging partially defined patch object.
-     */
-    @Test
-    public void testPartialMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        MergeTest patch = new MergeTest();
-        patch.x = SOME_OTHER_INT_VALUE;
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertTrue("There should be changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_OTHER_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-    }
-
-    /**
-     * Test merging in an empty patch.
-     */
-    @Test
-    public void testEmptyMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        MergeTest patch = new MergeTest();
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertFalse("There should be no changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-    }
-
-    /**
-     * Test merging patch with same values as existing value.
-     */
-    @Test
-    public void testEqualsMerge() {
-        MergeTest source = new MergeTest();
-        source.s = SOME_STRING_VALUE;
-        source.x = SOME_INT_VALUE;
-        source.ignore = SOME_IGNORE_VALUE;
-        MergeTest patch = new MergeTest();
-        patch.s = source.s;
-        patch.x = source.x;
-        patch.ignore = SOME_OTHER_IGNORE_VALUE;
-        ServiceDocumentDescription d = ServiceDocumentDescription.Builder.create()
-                .buildDescription(MergeTest.class);
-        Assert.assertFalse("There should be no changes", Utils.mergeWithState(d, source, patch));
-        Assert.assertEquals("Annotated s field", source.s, SOME_STRING_VALUE);
-        Assert.assertEquals("Annotated x field", source.x, SOME_INT_VALUE);
-        Assert.assertEquals("Non-annotated ignore field", source.ignore, SOME_IGNORE_VALUE);
-    }
-
-    @Test
-    public void testComputeSignatureChanged() {
-        ServiceDocumentDescription description = ServiceDocumentDescription.Builder.create()
-                .buildDescription(QueryValidationServiceState.class);
-
-        QueryValidationServiceState document = new QueryValidationServiceState();
-        document.documentSelfLink = "testComputeSignatureChange";
-        document.stringValue = "valueA";
-        document.documentExpirationTimeMicros = 1;
-        String initialSignature = Utils.computeSignature(document, description);
-
-        document.stringValue = "valueB";
-        String valueChangedSignature = Utils.computeSignature(document, description);
-
-        assertNotEquals(initialSignature, valueChangedSignature);
-
-        document.documentExpirationTimeMicros = 2;
-        String expirationChangedSignature = Utils.computeSignature(document, description);
-
-        assertNotEquals(initialSignature, expirationChangedSignature);
-        assertNotEquals(valueChangedSignature, expirationChangedSignature);
-    }
-
-    @Test
-    public void testComputeSignatureUnchanged() {
-        ServiceDocumentDescription description = ServiceDocumentDescription.Builder.create()
-                .buildDescription(QueryValidationServiceState.class);
-
-        QueryValidationServiceState document = new QueryValidationServiceState();
-        document.documentSelfLink = "testComputeSignatureChange";
-        document.stringValue = "valueA";
-        document.documentUpdateTimeMicros = 1;
-        String initialSignature = Utils.computeSignature(document, description);
-
-        document.documentUpdateTimeMicros = 2;
-        String updateChangedSignature = Utils.computeSignature(document, description);
-
-        assertEquals(initialSignature, updateChangedSignature);
-    }
-
-    /**
-     * Test service document.
-     */
-    private static class MergeTest extends ServiceDocument {
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        public Integer x;
-        @UsageOption(option = PropertyUsageOption.INFRASTRUCTURE)
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        public String s;
-        public String ignore;
-    }
-
-
-    @ServiceDocument.IndexingParameters(serializedStateSize = 8, versionRetention = 44)
-    private static class AnnotatedDoc extends ServiceDocument {
-        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
-        @PropertyOptions(indexing = PropertyIndexingOption.STORE_ONLY)
-        @Documentation(description = "desc", exampleString = "example")
-        public String opt;
-
-        @UsageOption(option = PropertyUsageOption.ID)
-        @PropertyOptions(
-                indexing = {
-                    PropertyIndexingOption.SORT,
-                    PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE},
-                usage = {
-                    PropertyUsageOption.OPTIONAL})
-        public String opts;
-
-        @PropertyOptions(indexing = PropertyIndexingOption.EXPAND)
-        public Range nestedPodo;
-
-        @UsageOption(option = PropertyUsageOption.OPTIONAL)
-        public RoundingMode someEnum;
-
-        @UsageOption(option = PropertyUsageOption.OPTIONAL)
-        public Enum<?> justEnum;
-    }
-
-    private static class TestKeyObjectValueHolder {
-        private final Map<String, Object> keyValues = new HashMap<>();
-    }
-
-    private void checkOptions(EnumSet<ServiceOption> options) {
-        checkOptions(options, false);
-    }
-
-    private void checkOptions(EnumSet<ServiceOption> options, boolean isFailureExpected) {
-        String error;
-        for (ServiceOption o : options) {
-            error = Utils.validateServiceOption(options, o);
-            if (error != null && !isFailureExpected) {
-                throw new IllegalArgumentException(error);
-            }
-        }
-    }
-
-    @Test
-    public void testMergeQueryResultsWithSameData() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testAnnotationOnFields() {
-        Builder builder = ServiceDocumentDescription.Builder.create();
-        ServiceDocumentDescription desc = builder.buildDescription(AnnotatedDoc.class);
-        assertEquals(8, desc.serializedStateSizeLimit);
-        assertEquals(44, desc.versionRetentionLimit);
-
-        PropertyDescription optDesc = desc.propertyDescriptions.get("opt");
-        assertEquals(optDesc.usageOptions, EnumSet.of(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL));
-        assertEquals(optDesc.indexingOptions, EnumSet.of(PropertyIndexingOption.STORE_ONLY));
-        assertEquals(optDesc.exampleValue, "example");
-        assertEquals(optDesc.propertyDocumentation, "desc");
-
-        PropertyDescription optsDesc = desc.propertyDescriptions.get("opts");
-        assertEquals(optsDesc.usageOptions, EnumSet.of(PropertyUsageOption.ID, PropertyUsageOption.OPTIONAL));
-        assertEquals(optsDesc.indexingOptions, EnumSet.of(PropertyIndexingOption.SORT, PropertyIndexingOption.EXCLUDE_FROM_SIGNATURE));
-    }
-
-    @Test
-    public void testNestedPodosAreAssignedKinds() {
-        ServiceDocumentDescription desc = ServiceDocumentDescription.Builder.create()
-                .buildDescription(AnnotatedDoc.class);
-        PropertyDescription nestedPodo = desc.propertyDescriptions.get("nestedPodo");
-        assertEquals(Utils.buildKind(Range.class), nestedPodo.kind);
-
-        // primitives don't have a kind
-        PropertyDescription opt = desc.propertyDescriptions.get("opt");
-        assertNull(opt.kind);
-    }
-
-    @Test
-    public void testEnumValuesArePopulated() {
-        ServiceDocumentDescription desc = ServiceDocumentDescription.Builder.create()
-                .buildDescription(AnnotatedDoc.class);
-        PropertyDescription someEnum = desc.propertyDescriptions.get("someEnum");
-        PropertyDescription nestedPodo = desc.propertyDescriptions.get("nestedPodo");
-        PropertyDescription justEnum = desc.propertyDescriptions.get("justEnum");
-
-        assertEquals(RoundingMode.values().length, someEnum.enumValues.length);
-        assertNull(nestedPodo.enumValues);
-
-        // handle generic classes where the type parameter is Enum
-        assertNull(justEnum.enumValues);
-    }
-
-    @Test
-    public void testNumberFieldsCoercedToDouble() {
-        PropertyDescription desc = ServiceDocumentDescription.Builder
-                .create()
-                .buildPodoPropertyDescription(NumericRange.class);
-        assertEquals(TypeName.DOUBLE, desc.fieldDescriptions.get("min").typeName);
-        assertEquals(TypeName.DOUBLE, desc.fieldDescriptions.get("max").typeName);
-    }
-
-    @Test
-    public void testMergeQueryResultsWithDifferentData() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 3, 4, 5, 7, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 10, 2, 3, 4, 5, 6, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 8 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithEmptySet() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 3, 4, 5, 7, 8, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 10, 2, 3, 4, 5, 6, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {});
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithAllEmpty() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(new int[] {});
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(new int[] {});
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {});
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] {}));
-    }
-
-    @Test
-    public void testMergeQueryResultsInDescOrder() {
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 9, 7, 5, 4, 3, 1 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 9, 6, 5, 4, 3, 2, 10 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 8, 4, 3, 2, 10, 1 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, false);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 9, 8, 7, 6, 5, 4, 3, 2, 10, 1 }));
-    }
-
-    private ServiceDocumentQueryResult createServiceDocumentQueryResult(int[] documentIndices) {
-
-        ServiceDocumentQueryResult result = new ServiceDocumentQueryResult();
-        result.documentCount = (long) documentIndices.length;
-        result.documents = new HashMap<>();
-
-        for (int index : documentIndices) {
-            String documentLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document" + index;
-            result.documentLinks.add(documentLink);
-            result.documents.put(documentLink, new Object());
-        }
-
-        return result;
-    }
-
-    private boolean verifyMergeResult(ServiceDocumentQueryResult mergeResult,
-            int[] expectedSequence) {
-        if (mergeResult.documentCount != expectedSequence.length) {
-            return false;
-        }
-
-        for (int i = 0; i < expectedSequence.length; i++) {
-            String expectedLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document"
-                    + expectedSequence[i];
-            if (!expectedLink.equals(mergeResult.documentLinks.get(i))) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
     @Test
     public void testDecodeUrlEncodedText() throws Throwable {
 
@@ -1024,5 +1065,187 @@ public class TestUtils {
                 Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED);
 
         Assert.assertEquals(textPlain, textDecoded);
+    }
+
+    @Test
+    public void testValidateStateForUniqueIdentifier() {
+        ExampleServiceState state = new ExampleServiceState();
+        state.id = null;
+        state.required = "testRequiredField";
+        ServiceDocumentDescription desc = buildStateDescription(ExampleServiceState.class, null);
+        Utils.validateState(desc, state);
+        Assert.assertNotNull("Unique Identifier was not provided a default UUID", state.id);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testValidateStateForRequiredField() {
+        ExampleServiceState state = new ExampleServiceState();
+        state.id = null;
+        state.required = null;
+        ServiceDocumentDescription desc = buildStateDescription(ExampleServiceState.class, null);
+        Utils.validateState(desc, state);
+    }
+
+    @Test
+    public void testDecodeGzipedResponseBody() throws Exception {
+        String body = "This is the original body content, but gzipped";
+        byte[] gzippedBody = compress(body);
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addResponseHeader(Operation.CONTENT_ENCODING_HEADER,
+                        Operation.CONTENT_ENCODING_GZIP)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody), false);
+
+        assertEquals(body, op.getBody(String.class));
+
+        // Content encoding header is removed as the body is already decoded
+        assertNull(op.getResponseHeader(Operation.CONTENT_ENCODING_HEADER));
+    }
+
+    @Test
+    public void testDecodeGzipedRequestBody() throws Exception {
+        String body = "This is the original body content, but gzipped";
+        byte[] gzippedBody = compress(body);
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addRequestHeader(Operation.CONTENT_ENCODING_HEADER,
+                        Operation.CONTENT_ENCODING_GZIP)
+                .addRequestHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody), true);
+
+        assertEquals(body, op.getBody(String.class));
+
+        // Content encoding header is removed as the body is already decoded
+        assertNull(op.getRequestHeader(Operation.CONTENT_ENCODING_HEADER));
+    }
+
+    @Test
+    public void testFailsDecodeGzipedBodyWithoutContentEncoding() throws Exception {
+        byte[] gzippedBody = compress("test");
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+        try {
+            Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody), false);
+            throw new IllegalStateException("should have failed");
+        } catch (MalformedInputException e) {
+
+        }
+    }
+
+    @Test
+    public void testEncodeGzipResponseBody() throws Throwable {
+        String body = "This is the original body content, but gzipped";
+        byte[] gzippedBody = compress(body);
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(body.length())
+                .setBody(body)
+                .addRequestHeader(Operation.ACCEPT_ENCODING_HEADER,
+                        Operation.CONTENT_ENCODING_GZIP)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        byte[] encodedBody = Utils.encodeBody(op, body, Operation.MEDIA_TYPE_TEXT_PLAIN, false);
+
+        assertTrue(Arrays.equals(gzippedBody, encodedBody));
+
+        // Content encoding header is present
+        assertEquals(op.getResponseHeader(Operation.CONTENT_ENCODING_HEADER),
+                Operation.CONTENT_ENCODING_GZIP);
+    }
+
+    private static byte[] compress(String str) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        GZIPOutputStream gzip = new GZIPOutputStream(out);
+        gzip.write(str.getBytes(Utils.CHARSET));
+        gzip.close();
+        return out.toByteArray();
+    }
+
+    public static class TestInvalidComputerSignatureState extends ServiceDocument {
+        public String key1;
+        public String key2;
+    }
+
+    @Test
+    public void testComputeSignature() throws Exception {
+        ServiceDocumentDescription sdd = TestUtils.buildStateDescription(
+                TestInvalidComputerSignatureState.class, null);
+
+        TestInvalidComputerSignatureState state1 = new TestInvalidComputerSignatureState();
+        state1.key1 = "1";
+        state1.key2 = null;
+
+        TestInvalidComputerSignatureState state2 = new TestInvalidComputerSignatureState();
+        state2.key1 = null;
+        state2.key2 = "1";
+
+        TestInvalidComputerSignatureState state3 = new TestInvalidComputerSignatureState();
+        state3.key1 = "1";
+        state3.key2 = "";
+
+        String sign1 = Utils.computeSignature(state1, sdd);
+        String sign2 = Utils.computeSignature(state2, sdd);
+        String sign3 = Utils.computeSignature(state3, sdd);
+
+        assertNotEquals(sign1, sign2);
+        assertNotEquals(sign2, sign3);
+        assertNotEquals(sign1, sign3);
+    }
+
+    @Test
+    public void testBuildServiceConfig() {
+        Service exampleService = new ExampleService();
+        exampleService.setHost(VerificationHost.create());
+
+        ServiceConfiguration config = new ServiceConfiguration();
+        Utils.buildServiceConfig(config, exampleService);
+
+        assertEquals(exampleService.getOptions(), config.options);
+        assertEquals(exampleService.getMaintenanceIntervalMicros(), config.maintenanceIntervalMicros);
+        assertEquals(ExampleServiceState.VERSION_RETENTION_LIMIT, config.versionRetentionLimit);
+        assertEquals(ExampleServiceState.VERSION_RETENTION_FLOOR, config.versionRetentionFloor);
+        assertEquals(exampleService.getPeerNodeSelectorPath(), config.peerNodeSelectorPath);
+        assertEquals(exampleService.getDocumentIndexPath(), config.documentIndexPath);
+    }
+
+    @Test
+    public void hashJsonMaps() {
+        Map<String, String> asc = new TreeMap<>();
+        for (int i = 0; i < 50; i++) {
+            asc.put(UUID.randomUUID().toString(), UUID.randomUUID().toString());
+        }
+
+        Map<String, String> desc = new TreeMap<>(Comparator.reverseOrder());
+        desc.putAll(asc);
+
+        Map<String, String> juh = new HashMap<>();
+        juh.putAll(asc);
+
+        Map<String, String> chm = new ConcurrentHashMap<>();
+        chm.putAll(juh);
+
+        assertNotEquals(asc.toString(), desc.toString());
+        assertNotEquals(asc.toString(), juh.toString());
+        assertNotEquals(asc.toString(), chm.toString());
+
+        long ascH = GsonSerializers.hashJson(asc, 0);
+        long descH = GsonSerializers.hashJson(desc, 0);
+        long juhH = GsonSerializers.hashJson(juh, 0);
+        long chmH = GsonSerializers.hashJson(chm, 0);
+
+        assertEquals(ascH, descH);
+        assertEquals(ascH, juhH);
+        assertEquals(ascH, chmH);
     }
 }

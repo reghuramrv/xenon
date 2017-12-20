@@ -15,19 +15,14 @@ package com.vmware.xenon.samples;
 
 import java.util.logging.Level;
 
-
-import io.swagger.models.Contact;
-import io.swagger.models.Info;
-import io.swagger.models.License;
-
 import com.vmware.xenon.common.ServiceHost;
+import com.vmware.xenon.services.common.ExampleService;
+import com.vmware.xenon.services.common.ExampleTaskService;
 import com.vmware.xenon.services.common.RootNamespaceService;
-import com.vmware.xenon.services.common.ServiceUriPaths;
 import com.vmware.xenon.services.samples.SampleFactoryServiceWithCustomUi;
-import com.vmware.xenon.services.samples.SamplePreviousEchoFactoryService;
+import com.vmware.xenon.services.samples.SamplePreviousEchoService;
 import com.vmware.xenon.services.samples.SampleServiceWithSharedCustomUi;
-import com.vmware.xenon.services.samples.SampleSimpleEchoFactoryService;
-import com.vmware.xenon.swagger.SwaggerDescriptorService;
+import com.vmware.xenon.services.samples.SampleSimpleEchoService;
 import com.vmware.xenon.ui.UiService;
 
 /**
@@ -53,7 +48,7 @@ public class SampleHost extends ServiceHost {
     public ServiceHost start() throws Throwable {
         super.start();
 
-        // Start core services (logging, gossiping)-- must be done once
+        // Start core services, must be done once
         startDefaultCoreServicesSynchronously();
 
         // Start the root namespace service: this will list all available factory services for
@@ -67,33 +62,17 @@ public class SampleHost extends ServiceHost {
         super.startService(new SampleFactoryServiceWithCustomUi());
 
         // Start a factory for echo sample service
-        super.startService(new SampleSimpleEchoFactoryService());
+        super.startFactory(new SampleSimpleEchoService());
 
         // Start a factory for the service that returns the previous results
-        super.startService(new SamplePreviousEchoFactoryService());
+        super.startFactory(new SamplePreviousEchoService());
+
+        // Start example tutorial services
+        super.startFactory(new ExampleService());
+        super.startFactory(new ExampleTaskService());
 
         // Start UI service
         super.startService(new UiService());
-
-        // Serve Swagger 2.0 compatible API description
-        SwaggerDescriptorService swagger = new SwaggerDescriptorService();
-
-        // exclude some core services
-        swagger.setExcludedPrefixes(
-                "/core/transactions",
-                "/core/node-groups");
-
-        // Provide API metainfo
-        Info apiInfo = new Info();
-        apiInfo.setVersion("1.0.0");
-        apiInfo.setTitle("Xenon SampleHost");
-        apiInfo.setLicense(new License().name("Apache 2.0").url("https://github.com/vmware/xenon/blob/master/LICENSE"));
-        apiInfo.setContact(new Contact().url("https://github.com/vmware/xenon"));
-        swagger.setInfo(apiInfo);
-
-        // Serve swagger on default uri
-        super.startService(swagger);
-        System.out.println("Checkout swaggerUI: " + this.getPublicUri() + ServiceUriPaths.SWAGGER + "/ui");
 
         return this;
     }

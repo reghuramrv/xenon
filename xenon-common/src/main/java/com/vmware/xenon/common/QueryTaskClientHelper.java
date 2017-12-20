@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.QueryTask.NumericRange;
 import com.vmware.xenon.services.common.QueryTask.Query;
@@ -42,7 +43,7 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
  * The result is kind of iterator completion that can process the results in an unified way without
  * need to know if paginated, direct or expanded.
  *
-  * Example usage:
+ * Example usage:
  *
  *<pre>
  *
@@ -72,19 +73,36 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
  * </pre>
  */
 public class QueryTaskClientHelper<T extends ServiceDocument> {
-    public static final long QUERY_RETRIEVAL_RETRY_INTERVAL_MILLIS = Long.getLong(
-            "xenon.querytaskclienthelper.query.retry.interval.millis", 300);
-    public static final long DEFAULT_EXPIRATION_TIME_IN_MICROS = Long.getLong(
-            "xenon.querytaskclienthelper.query.documents.default.expiration.millis",
-            TimeUnit.SECONDS.toMicros(120));
-    public static final Integer DEFAULT_QUERY_RESULT_LIMIT = Integer.getInteger(
-            "xenon.querytaskclienthelper.query.documents.default.resultLimit", 50);
+    public static final long QUERY_RETRIEVAL_RETRY_INTERVAL_MICROS = XenonConfiguration.duration(
+            QueryTaskClientHelper.class,
+            "retryInterval",
+            TimeUnit.MILLISECONDS,
+            Long.getLong("xenon.querytaskclienthelper.query.retry.interval.millis", 300)
+    );
+
+    public static final long DEFAULT_EXPIRATION_TIME_IN_MICROS = XenonConfiguration.duration(
+            QueryTaskClientHelper.class,
+            "taskExpiration",
+            TimeUnit.MICROSECONDS,
+            // the property names below says millis but value is interpreted as micros, so to retain FULL
+            // backward compatibility the bug is still preserved, assuming users have always passed micros anyway
+            Long.getLong("xenon.querytaskclienthelper.query.documents.default.expiration.millis",
+                    TimeUnit.SECONDS.toMicros(120))
+    );
+
+    public static final Integer DEFAULT_QUERY_RESULT_LIMIT = XenonConfiguration.integer(
+            QueryTaskClientHelper.class,
+            "resultLimit",
+            Integer.getInteger("xenon.querytaskclienthelper.query.documents.default.resultLimit", 50)
+    );
 
     private final Class<T> type;
     private ServiceHost host;
+    private ServiceRequestSender serviceRequestSender;
     private QueryTask queryTask;
     private ResultHandler<T> resultHandler;
     private URI baseUri;
+    private String factoryPath;
 
     private QueryTaskClientHelper(Class<T> type) {
         this.type = type;
@@ -111,9 +129,9 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
     /**
      * Query an expanded document extending {@link ServiceDocument}s that is updated or deleted
      * since given time in the past. The result will return if there is any update or delete
-     * operation from provided documentSinceUpdateTimeMicros. The deleted documents will be marked
-     * as with {@link ServiceDocument#documentSignature} =
-     * {@link ServiceDocument#isDeletedTemplate(ServiceDocument)}. This query could be used to find
+     * operation from provided documentSinceUpdateTimeMicros.
+     *
+     * This query could be used to find
      * out if there were any updates since the time it is provided as parameter.
      *
      * @param documentSinceUpdateTimeMicros
@@ -142,11 +160,9 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
     }
 
     /**
-     * Query for a list of expanded documents extending {@link ServiceDocument}s that are updated or
-     * deleted since given time in the past. The result will include both updated and deleted
-     * documents. The deleted documents will be marked as with
-     * {@link ServiceDocument#documentSignature} =
-     * {@link ServiceDocument#isDeletedTemplate(ServiceDocument)}.
+     * Query for a list of expanded documents extending {@link ServiceDocument}s that
+     * are updated or deleted since given time in the past. The result will include
+     * both updated and deleted documents.
      *
      * @param documentSinceUpdateTimeMicros
      *            Indicating a time since the document was last updated matching the property
@@ -180,10 +196,23 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
      */
     public QueryTaskClientHelper<T> sendWith(ServiceHost serviceHost) {
         assertNotNull(serviceHost, "'serviceHost' must not be null.");
-        this.host = serviceHost;
-        if (this.baseUri == null) {
-            this.baseUri = serviceHost.getUri();
-        }
+        this.serviceRequestSender = this.host = serviceHost;
+        sendQueryRequest();
+        return this;
+    }
+
+    /**
+     * Set the Service, which will be used to send the request to the Query task
+     * service.
+     *
+     * @param service
+     *
+     * @return QueryTaskClientHelper
+     */
+    public QueryTaskClientHelper<T> sendWith(Service service) {
+        assertNotNull(service, "'service' must not be null.");
+        this.host = service.getHost();
+        this.serviceRequestSender = service;
         sendQueryRequest();
         return this;
     }
@@ -218,6 +247,19 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
     }
 
     /**
+     * Set the factory path to be used when generating the initial query {@link Operation}.
+     *
+     * @param factoryPath
+     *
+     * @return QueryTaskClientHelper
+     */
+    public QueryTaskClientHelper<T> setFactoryPath(String factoryPath) {
+        assertNotNull(factoryPath, "'factoryPath' must not be null.");
+        this.factoryPath = factoryPath;
+        return this;
+    }
+
+    /**
      * Set ResultHandler to be used during completion handling of every element. Either the list of
      * ServiceDocuments will be passed as parameter or exception in case of errors.
      *
@@ -234,15 +276,23 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
     }
 
     public static long getDefaultQueryExpiration() {
-        return Utils.getNowMicrosUtc() + DEFAULT_EXPIRATION_TIME_IN_MICROS;
+        return Utils.fromNowMicrosUtc(DEFAULT_EXPIRATION_TIME_IN_MICROS);
     }
 
     private void sendQueryRequest() {
         assertNotNull(this.queryTask, "'queryTask' must be set first.");
         assertNotNull(this.resultHandler, "'resultHandler' must be set first.");
 
-        this.host.sendRequest(Operation
-                .createPost(UriUtils.extendUri(this.baseUri, ServiceUriPaths.CORE_QUERY_TASKS))
+        if (this.baseUri == null) {
+            this.baseUri = this.host.getUri();
+        }
+
+        if (this.factoryPath == null) {
+            this.factoryPath = ServiceUriPaths.CORE_QUERY_TASKS;
+        }
+
+        this.serviceRequestSender.sendRequest(Operation
+                .createPost(UriUtils.extendUri(this.baseUri, this.factoryPath))
                 .setBody(this.queryTask)
                 .setReferer(this.host.getUri())
                 .setCompletion((o, e) -> {
@@ -266,7 +316,7 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
             return;
         }
 
-        this.host.sendRequest(Operation
+        this.serviceRequestSender.sendRequest(Operation
                 .createGet(UriUtils.extendUri(this.baseUri, q.documentSelfLink))
                 .setReferer(this.host.getUri())
                 .setCompletion((o, e) -> {
@@ -279,8 +329,8 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
 
                     if (!TaskState.isFinished(rsp.taskInfo)) {
                         this.host.log(Level.FINE, "Resource query not complete yet, retrying...");
-                        this.host.schedule(() -> processQuery(rsp, handler),
-                                QUERY_RETRIEVAL_RETRY_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+                        this.host.scheduleCore(() -> processQuery(rsp, handler),
+                                QUERY_RETRIEVAL_RETRY_INTERVAL_MICROS, TimeUnit.MICROSECONDS);
                         return;
                     }
 
@@ -335,7 +385,7 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
                 return;
             }
 
-            this.host.sendRequest(Operation
+            this.serviceRequestSender.sendRequest(Operation
                     .createGet(UriUtils.extendUri(this.baseUri, nextPageLink))
                     .setReferer(this.host.getUri())
                     .setCompletion((o, e) -> {
@@ -360,11 +410,11 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
                                 }
                             }
                             getNextPageLinks(page.results.nextPageLink, resultLimit, handler);
-                        } catch (Throwable ex) {
+                        } catch (Exception ex) {
                             handler.handle(noResult(), ex);
                         }
                     }));
-        } catch (Throwable ex) {
+        } catch (Exception ex) {
             handler.handle(noResult(), ex);
         }
     }
@@ -448,7 +498,7 @@ public class QueryTaskClientHelper<T extends ServiceDocument> {
     }
 
     @FunctionalInterface
-    public static interface ResultHandler<T extends ServiceDocument> {
-        public void handle(QueryElementResult<T> queryElementResult, Throwable failure);
+    public interface ResultHandler<T extends ServiceDocument> {
+        void handle(QueryElementResult<T> queryElementResult, Throwable failure);
     }
 }

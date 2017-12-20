@@ -46,7 +46,7 @@ public class MinimalFactoryTestService extends FactoryService {
     @Override
     public void handleStop(Operation op) {
         this.gotStopped = true;
-        op.complete();
+        super.handleStop(op);
     }
 
     @Override
@@ -57,7 +57,7 @@ public class MinimalFactoryTestService extends FactoryService {
             return;
         }
         this.gotDeleted = true;
-        op.complete();
+        super.handleDelete(op);
     }
 
     @Override
@@ -69,5 +69,12 @@ public class MinimalFactoryTestService extends FactoryService {
             }
         }
         return s;
+    }
+
+    @Override
+    public void handlePost(Operation op) {
+        setOperationHandlerInvokeTimeStat(op);
+        super.handlePost(op);
+        setOperationDurationStat(op);
     }
 }

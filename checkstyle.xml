@@ -11,6 +11,7 @@
     <module name="TreeWalker">
         <module name="AvoidStarImport"/>
         <module name="UnusedImports"/>
+        <module name="RedundantImport"/>
         <module name="ImportOrder">
             <property name="groups" value="/^javax?\./,/^(?!com\.vmware\.)[a-z]/"/>
             <property name="ordered" value="true"/>
@@ -34,6 +35,8 @@
         <module name="MultipleVariableDeclarations"/>
         <module name="ArrayTypeStyle"/>
         <module name="MissingSwitchDefault"/>
+        <module name="MissingOverride"/>
+        <module name="HideUtilityClassConstructor"/>
         <module name="FallThrough"/>
         <module name="UpperEll"/>
         <module name="ModifierOrder"/>
@@ -68,7 +71,7 @@
     </module>
 
     <module name="RegexpHeader">
-        <property name="headerFile" value="contrib/header.regexp"/>
+        <property name="headerFile" value="${checkstyle.header.file}"/>
         <property name="fileExtensions" value="java"/>
     </module>
 

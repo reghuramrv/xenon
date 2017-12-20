@@ -17,6 +17,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import static com.vmware.xenon.common.Service.STAT_NAME_OPERATION_DURATION;
+
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Date;
@@ -24,7 +26,8 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 
 import org.junit.Test;
 
@@ -34,11 +37,14 @@ import com.vmware.xenon.common.Service.ProcessingStage;
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
+import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestProperty;
+import com.vmware.xenon.common.test.TestRequestSender;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.MinimalFactoryTestService;
 import com.vmware.xenon.services.common.MinimalTestService;
+import com.vmware.xenon.services.common.ServiceHostManagementService;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 
 /**
@@ -117,6 +123,54 @@ public class TestServiceModel extends BasicReusableHostTestCase {
     }
 
     @Test
+    public void onDemandStartNonExistingService() throws Throwable {
+        // This test verifies that on-demand start, triggered by an operation targeting
+        // a non-existent Stateful persistent no-replicated service, does not inadvertently
+        // create the service or a memory footprint of it.
+
+        String factorySelfLink = "/some-factory";
+        String servicePath = UriUtils.buildUriPath(factorySelfLink, "does-not-exist");
+
+        // First verification: explicit service start:
+        // Simulate an on-demand start of a non-existing service (typically being
+        // triggered by an operation targeting a service that is not attached)
+        TestContext ctx = this.host.testCreate(1);
+        Operation onDemandPost = Operation.createPost(host, servicePath)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERSION_CHECK)
+                .setReplicationDisabled(true)
+                .setAuthorizationContext(host.getSystemAuthorizationContext())
+                .setCompletion((o, e) -> {
+                    if (e == null) {
+                        ctx.failIteration(new IllegalStateException("expected start to fail"));
+                    } else {
+                        ctx.completeIteration();
+                    }
+                });
+        Service childService = new MinimalTestService();
+        childService.toggleOption(ServiceOption.FACTORY_ITEM, true);
+        childService.toggleOption(ServiceOption.PERSISTENCE, true);
+        this.host.startService(onDemandPost, childService);
+        ctx.await();
+
+        // Second verification: on-demand GET:
+        // We send a GET to a Stateful, persistent, non-replicated service.
+        // On-demand load should kick-in, but fail to find the service.
+        // We verify that on-demand load does not create the service that does not exist.
+        MinimalFactoryTestService factoryService = new MinimalFactoryTestService();
+        EnumSet<ServiceOption> caps = EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.FACTORY_ITEM);
+        factoryService.setChildServiceCaps(caps);
+
+        this.host.startServiceAndWait(factoryService, factorySelfLink, null);
+        URI uri = UriUtils.buildUri(this.host, servicePath);
+        this.host.getTestRequestSender().sendAndWaitFailure(Operation.createGet(uri));
+
+        // Third verification:
+        // Verify that the service was not created during the previous GET attempt
+        this.host.getTestRequestSender().sendAndWaitFailure(Operation.createGet(uri));
+    }
+
+    @Test
     public void serviceStop() throws Throwable {
         MinimalTestService serviceToBeDeleted = new MinimalTestService();
         MinimalTestService serviceToBeStopped = new MinimalTestService();
@@ -131,15 +185,17 @@ public class TestServiceModel extends BasicReusableHostTestCase {
         // first issue a delete with a body (used as a hint to fail delete), and it should be aborted.
         // Verify service is still running if it fails delete
         Operation delete = Operation.createDelete(serviceToBeDeleted.getUri())
-                .setBody(body)
-                .setCompletion(this.host.getExpectedFailureCompletion());
-        this.host.sendAndWait(delete);
+                .setBody(body);
+        Operation response = this.host.waitForResponse(delete);
+        assertNotNull(response);
+        assertEquals(Operation.STATUS_CODE_INTERNAL_ERROR, response.getStatusCode());
 
         // try a delete that should be aborted with the factory service
         delete = Operation.createDelete(factoryService.getUri())
-                .setBody(body)
-                .setCompletion(this.host.getExpectedFailureCompletion());
-        this.host.sendAndWait(delete);
+                .setBody(body);
+        response = this.host.waitForResponse(delete);
+        assertNotNull(response);
+        assertEquals(Operation.STATUS_CODE_INTERNAL_ERROR, response.getStatusCode());
 
         // verify services are still running
         assertEquals(ProcessingStage.AVAILABLE,
@@ -147,22 +203,105 @@ public class TestServiceModel extends BasicReusableHostTestCase {
         assertEquals(ProcessingStage.AVAILABLE,
                 this.host.getServiceStage(serviceToBeDeleted.getSelfLink()));
 
-        delete = Operation.createDelete(serviceToBeDeleted.getUri())
-                .setCompletion(this.host.getCompletion());
-        this.host.sendAndWait(delete);
+        delete = Operation.createDelete(serviceToBeDeleted.getUri());
+        response = this.host.waitForResponse(delete);
+        assertNotNull(response);
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
+
         assertTrue(serviceToBeDeleted.gotDeleted);
         assertTrue(serviceToBeDeleted.gotStopped);
 
         try {
             // stop the host, observe stop only on remaining service
-            this.host.stop();
+            this.host.tearDown();
             assertTrue(!serviceToBeStopped.gotDeleted);
             assertTrue(serviceToBeStopped.gotStopped);
             assertTrue(factoryService.gotStopped);
+            this.host = null;
         } finally {
-            this.host.setPort(0);
-            this.host.start();
+            setUpOnce();
         }
+    }
+
+    @Test
+    public void stopServiceWithSynch() throws Throwable {
+        // Wait for synchronization to happen.
+        this.host.waitForReplicatedFactoryServiceAvailable(
+                UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK),
+                ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+
+        long count = Math.max(this.serviceCount, 10);
+
+        // Determine the current count of pending service deletions.
+        Map<String, ServiceStat> stats = this.host.getServiceStats(this.host.getManagementServiceUri());
+        ServiceStat stat = stats.get(
+                ServiceHostManagementService.STAT_NAME_PENDING_SERVICE_DELETION_COUNT);
+        double oldCount = (stat != null) ? stat.latestValue : 0;
+
+        // create example services.
+        List<URI> exampleUris = this.host.createExampleServices(this.host, count, null);
+
+        // do GETs on the example services to make sure all have started successfully.
+        this.host.getServiceState(null, ExampleService.ExampleServiceState.class, exampleUris);
+
+        // Create DELETE and SYNCH_OWNER requests for each service
+        TestContext ctx = this.host.testCreate(exampleUris.size() * 2);
+        List<Operation> operations = new ArrayList<>(exampleUris.size() * 2);
+        for (URI exampleUri : exampleUris) {
+
+            // It's ok if the synch request fails
+            ServiceDocument doc = new ServiceDocument();
+            doc.documentSelfLink = exampleUri.getPath();
+            Operation synchPost = Operation
+                    .createPost(this.host, ExampleService.FACTORY_LINK)
+                    .setBody(doc)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER)
+                    .setReferer(this.host.getUri())
+                    .setCompletion((o, e) -> {
+                        this.host.log(Level.INFO, "Sync completed for %s. Failure: %s",
+                                exampleUri, e != null ? e.getMessage() : "none");
+                        ctx.completeIteration();
+                    });
+            operations.add(synchPost);
+
+            // Deletes should not fail.
+            Operation delete = Operation
+                    .createDelete(exampleUri)
+                    .setReferer(this.host.getUri())
+                    .setCompletion((o, e) -> {
+                        this.host.log(Level.INFO, "Delete completed for %s. Failure: %s",
+                                exampleUri, e != null ? e.getMessage() : "none");
+                        if (e != null) {
+                            ctx.failIteration(e);
+                            return;
+                        }
+                        ctx.completeIteration();
+                    });
+            operations.add(delete);
+        }
+
+        // Send all DELETE and SYNCH_OWNER requests together to maximize their
+        // chance of getting intervleaved.
+        for (Operation op : operations) {
+            this.host.send(op);
+        }
+        ctx.await();
+
+        // Do gets on each service and make sure each one returns a 404 error.
+        for (URI exampleUri : exampleUris) {
+            Operation op = Operation.createGet(exampleUri);
+            TestRequestSender.FailureResponse response = this.host
+                    .getTestRequestSender().sendAndWaitFailure(op);
+            assertEquals(Operation.STATUS_CODE_NOT_FOUND, response.op.getStatusCode());
+        }
+
+        // Because we are using a shared host, the new pending deletion count should be anywhere
+        // from zero to the count we recorded at the start of this test.
+        this.host.waitFor("pendingServiceCount did not reach expected value", () -> {
+            Map<String, ServiceStat> newStats = this.host.getServiceStats(this.host.getManagementServiceUri());
+            ServiceStat newStat = newStats.get(ServiceHostManagementService.STAT_NAME_PENDING_SERVICE_DELETION_COUNT);
+            return newStat.latestValue >= 0 && newStat.latestValue <= oldCount;
+        });
     }
 
     /**
@@ -374,28 +513,28 @@ public class TestServiceModel extends BasicReusableHostTestCase {
         // test get
         this.host.testStart(serviceCount * 4);
         doOperationWithContextId(servicesWithContextId, Action.GET,
-                stateWithContextId.getContextId, false);
+                stateWithContextId.getContextId);
         doOperationWithContextId(servicesWithContextId, Action.GET,
-                stateWithContextId.getContextId, true);
-        doOperationWithContextId(servicesWithOutContextId, Action.GET, null, false);
-        doOperationWithContextId(servicesWithOutContextId, Action.GET, null, true);
+                stateWithContextId.getContextId);
+        doOperationWithContextId(servicesWithOutContextId, Action.GET, null);
+        doOperationWithContextId(servicesWithOutContextId, Action.GET, null);
         this.host.testWait();
 
         // test put
         this.host.testStart(serviceCount * 4);
         doOperationWithContextId(servicesWithContextId, Action.PUT,
-                stateWithContextId.putContextId, false);
+                stateWithContextId.putContextId);
         doOperationWithContextId(servicesWithContextId, Action.PUT,
-                stateWithContextId.putContextId, true);
-        doOperationWithContextId(servicesWithOutContextId, Action.PUT, null, false);
-        doOperationWithContextId(servicesWithOutContextId, Action.PUT, null, true);
+                stateWithContextId.putContextId);
+        doOperationWithContextId(servicesWithOutContextId, Action.PUT, null);
+        doOperationWithContextId(servicesWithOutContextId, Action.PUT, null);
         this.host.testWait();
 
         // test patch
         this.host.testStart(serviceCount * 2);
         doOperationWithContextId(servicesWithContextId, Action.PATCH,
-                stateWithContextId.patchContextId, false);
-        doOperationWithContextId(servicesWithOutContextId, Action.PATCH, null, false);
+                stateWithContextId.patchContextId);
+        doOperationWithContextId(servicesWithOutContextId, Action.PATCH, null);
         this.host.testWait();
 
         // check end state
@@ -426,7 +565,7 @@ public class TestServiceModel extends BasicReusableHostTestCase {
     }
 
     public void doOperationWithContextId(List<Service> services, Service.Action action,
-            String contextId, boolean useCallback) {
+            String contextId) {
         for (Service service : services) {
             Operation op;
             switch (action) {
@@ -443,8 +582,7 @@ public class TestServiceModel extends BasicReusableHostTestCase {
                 throw new RuntimeException("Unsupported action");
             }
 
-            op
-                    .forceRemote()
+            op.forceRemote()
                     .setBody(new ContextIdTestService.State())
                     .setContextId(contextId)
                     .setCompletion((o, e) -> {
@@ -455,12 +593,7 @@ public class TestServiceModel extends BasicReusableHostTestCase {
 
                         this.host.completeIteration();
                     });
-
-            if (useCallback) {
-                this.host.sendRequestWithCallback(op.setReferer(this.host.getReferer()));
-            } else {
-                this.host.send(op);
-            }
+            this.host.send(op);
         }
         // reset context id, since its set in the main thread
         OperationContext.setContextId(null);
@@ -535,7 +668,7 @@ public class TestServiceModel extends BasicReusableHostTestCase {
         Operation post = Operation.createPost(uri);
         this.host.startService(post, new GetIllegalDocumentService());
         assertEquals(500, post.getStatusCode());
-        assertTrue(post.getBody(ServiceErrorResponse.class).message.contains("myLink"));
+        assertTrue(post.getErrorResponseBody().message.contains("myLink"));
     }
 
     public static class PrefixDispatchService extends StatelessService {
@@ -657,9 +790,27 @@ public class TestServiceModel extends BasicReusableHostTestCase {
             uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/2/3"));
             uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/2/3/?k=v&k1=v1"));
             uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/2/3/?k=v&k1=v1"));
+            // namespace service owns paths with utility service prefix
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/2/3/ui"));
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/2/3/ui/"));
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/2/3/ui/test"));
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/2/stats"));
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/config"));
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/replication"));
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/1/subscriptions"));
 
+            // try all actions and expect no failure.
+            // DELETE should be the last action tested, because it deletes the documents
             EnumSet<Action> actions = EnumSet.allOf(Action.class);
+            actions.remove(Action.DELETE);
             verifyAllActions(uris, actions, false);
+
+            // these should all fail, utility service suffix
+            uris.clear();
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/ui"));
+            uris.add(UriUtils.extendUri(nsOwner.getUri(), "/stats"));
+            actions = EnumSet.of(Action.POST);
+            verifyAllActions(uris, actions, true);
 
             // these should all fail, do not start with prefix
             uris.clear();
@@ -669,7 +820,13 @@ public class TestServiceModel extends BasicReusableHostTestCase {
             uris.add(UriUtils.extendUri(this.host.getUri(), "/1/2/3"));
             uris.add(UriUtils.extendUri(this.host.getUri(), "/1/2/3/?k=v&k1=v1"));
             uris.add(UriUtils.extendUri(this.host.getUri(), "/1/2/3/?k=v&k1=v1"));
+            actions = EnumSet.allOf(Action.class);
+            actions.remove(Action.DELETE);
             verifyAllActions(uris, actions, true);
+
+            // now test DELETE, which should pass for both existing and non-existing services
+            actions = EnumSet.of(Action.DELETE);
+            verifyAllActions(uris, actions, false);
         }
 
         verifyDeleteOnNamespaceOwner(s);
@@ -752,7 +909,9 @@ public class TestServiceModel extends BasicReusableHostTestCase {
 
     public static class PeriodicMaintenanceTestStatelessService extends StatelessService {
         public PeriodicMaintenanceTestStatelessService() {
-            this.setMaintenanceIntervalMicros(1);
+            this.setMaintenanceIntervalMicros(
+                    TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS * 3)
+            );
             this.toggleOption(ServiceOption.INSTRUMENTATION, true);
             this.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
         }
@@ -766,7 +925,9 @@ public class TestServiceModel extends BasicReusableHostTestCase {
     public static class PeriodicMaintenanceTestStatefulService extends StatefulService {
         public PeriodicMaintenanceTestStatefulService() {
             super(ServiceDocument.class);
-            this.setMaintenanceIntervalMicros(1);
+            this.setMaintenanceIntervalMicros(
+                    TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS * 3)
+            );
             this.toggleOption(ServiceOption.INSTRUMENTATION, true);
             this.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
         }
@@ -795,29 +956,82 @@ public class TestServiceModel extends BasicReusableHostTestCase {
     }
 
     @Test
-    public void handlePeriodicMaintenance() throws Throwable {
-        // Check StatelessService
-        doCheckPeriodicMaintenance(new PeriodicMaintenanceTestStatelessService());
+    public void periodicMaintenance() throws Throwable {
+        try {
+            this.host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(50));
+            // Check StatelessService
+            doCheckPeriodicMaintenance(new PeriodicMaintenanceTestStatelessService());
 
-        // Check StatefulService
-        doCheckPeriodicMaintenance(new PeriodicMaintenanceTestStatefulService());
+            // Check StatefulService
+            doCheckPeriodicMaintenance(new PeriodicMaintenanceTestStatefulService());
+
+            // Check StatelessService with dynamic toggle
+            Service s = new PeriodicMaintenanceTestStatelessService();
+            s.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, false);
+            doCheckPeriodicMaintenance(s);
+
+            // Check StatefulService with dynamic toggle
+            s = new PeriodicMaintenanceTestStatefulService();
+            s.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, false);
+            doCheckPeriodicMaintenance(s);
+        } finally {
+            this.host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(
+                    VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
+        }
     }
 
     private void doCheckPeriodicMaintenance(Service s) throws Throwable {
         // Start service
-        this.host.startServiceAndWait(s, UUID.randomUUID().toString(), null);
+        Service service = this.host.startServiceAndWait(s, UUID.randomUUID().toString(), null);
 
-        ServiceStat stat = s.getStat(STAT_NAME_HANDLE_PERIODIC_MAINTENANCE);
-
-        Date exp = this.host.getTestExpiration();
-        while (stat.latestValue < PERIODIC_MAINTENANCE_MAX) {
-            Thread.sleep(100);
-            this.host.log("Handled %d periodic maintenance events, expecting %d",
-                    (int)stat.latestValue, PERIODIC_MAINTENANCE_MAX);
-            if (new Date().after(exp)) {
-                throw new TimeoutException();
-            }
+        int expectedMaintCount = PERIODIC_MAINTENANCE_MAX;
+        if (!s.hasOption(ServiceOption.PERIODIC_MAINTENANCE)) {
+            this.host.log("Toggling %s on", ServiceOption.PERIODIC_MAINTENANCE);
+            this.host.toggleServiceOptions(s.getUri(),
+                    EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE), null);
+            expectedMaintCount = 1;
         }
+
+        this.host.log("waiting for maintenance stat increment, expecting %d repeats",
+                expectedMaintCount);
+        final int limit = expectedMaintCount;
+        this.host.waitFor("maint. count incorrect", () -> {
+            ServiceStat stat = service.getStat(STAT_NAME_HANDLE_PERIODIC_MAINTENANCE);
+            if (stat.latestValue < limit) {
+                return false;
+            }
+            return true;
+        });
+    }
+
+    @Test
+    public void getStatelessServiceOperationStats() throws Throwable {
+        MinimalFactoryTestService factoryService = new MinimalFactoryTestService();
+        MinimalTestServiceState body = new MinimalTestServiceState();
+        body.id = UUID.randomUUID().toString();
+        this.host.startServiceAndWait(factoryService, UUID.randomUUID().toString(), body);
+        // try a post on the factory service and assert that the stats are collected for the post operation.
+        this.host.waitFor("stats not found", () -> {
+            Operation post = Operation.createPost(factoryService.getUri())
+                    .setBody(body);
+            Operation response = this.host.waitForResponse(post);
+            assertNotNull(response);
+            // the stat is updated after the operation is completed, so we might miss the initial
+            // stat
+            ServiceStats testStats = host.getServiceState(null, ServiceStats.class, UriUtils
+                    .buildStatsUri(factoryService.getUri()));
+            if (testStats == null) {
+                return false;
+            }
+
+            ServiceStat serviceStat = testStats.entries
+                    .get(Action.POST + STAT_NAME_OPERATION_DURATION);
+            if (serviceStat == null || serviceStat.latestValue == 0) {
+                return false;
+            }
+            host.log(Utils.toJsonHtml(testStats));
+            return true;
+        });
     }
 
 }

@@ -13,6 +13,9 @@
 
 package com.vmware.xenon.common;
 
+import static com.vmware.xenon.common.Service.Action.DELETE;
+import static com.vmware.xenon.common.Service.Action.POST;
+
 import java.io.NotActiveException;
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
@@ -23,16 +26,28 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.logging.Level;
 
+import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.Operation.OperationOption;
+import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats;
 import com.vmware.xenon.common.ServiceSubscriptionState.ServiceSubscriber;
+import com.vmware.xenon.services.common.QueryTask;
+import com.vmware.xenon.services.common.QueryTask.NumericRange;
+import com.vmware.xenon.services.common.QueryTask.Query;
+import com.vmware.xenon.services.common.QueryTask.Query.Occurance;
+import com.vmware.xenon.services.common.QueryTask.QueryTerm;
+import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.SynchronizationRequest;
 import com.vmware.xenon.services.common.UiContentService;
-
 
 /**
  * Utility service managing the various URI control REST APIs for each service instance. A single
@@ -44,6 +59,77 @@ public class UtilityService implements Service {
     private ServiceStats stats;
     private ServiceSubscriptionState subscriptions;
     private UiContentService uiService;
+
+    /**
+     * Dedupes most well-known strings used as stat names.
+     */
+    private static class StatsKeyDeduper {
+        private final Map<String, String> map = new HashMap<>();
+
+        StatsKeyDeduper() {
+            register(Service.STAT_NAME_REQUEST_COUNT);
+            register(Service.STAT_NAME_PRE_AVAILABLE_OP_COUNT);
+            register(Service.STAT_NAME_AVAILABLE);
+            register(Service.STAT_NAME_FAILURE_COUNT);
+            register(Service.STAT_NAME_REQUEST_OUT_OF_ORDER_COUNT);
+            register(Service.STAT_NAME_REQUEST_FAILURE_QUEUE_LIMIT_EXCEEDED_COUNT);
+            register(Service.STAT_NAME_STATE_PERSIST_LATENCY);
+            register(Service.STAT_NAME_OPERATION_QUEUEING_LATENCY);
+            register(Service.STAT_NAME_SERVICE_HANDLER_LATENCY);
+            register(Service.STAT_NAME_CREATE_COUNT);
+            register(Service.STAT_NAME_OPERATION_DURATION);
+            register(Service.STAT_NAME_SERVICE_HOST_MAINTENANCE_COUNT);
+            register(Service.STAT_NAME_MAINTENANCE_COUNT);
+            register(Service.STAT_NAME_NODE_GROUP_CHANGE_MAINTENANCE_COUNT);
+            register(Service.STAT_NAME_NODE_GROUP_SYNCH_DELAYED_COUNT);
+            register(Service.STAT_NAME_MAINTENANCE_COMPLETION_DELAYED_COUNT);
+            register(Service.STAT_NAME_DOCUMENT_OWNER_TOGGLE_ON_MAINT_COUNT);
+            register(Service.STAT_NAME_DOCUMENT_OWNER_TOGGLE_OFF_MAINT_COUNT);
+            register(Service.STAT_NAME_VERSION_CONFLICT_COUNT);
+            register(Service.STAT_NAME_VERSION_IN_CONFLICT);
+            register(Service.STAT_NAME_MAINTENANCE_DURATION);
+            register(Service.STAT_NAME_SYNCH_TASK_RETRY_COUNT);
+            register(Service.STAT_NAME_CHILD_SYNCH_FAILURE_COUNT);
+
+            register(ServiceStatUtils.GET_DURATION);
+            register(ServiceStatUtils.POST_DURATION);
+            register(ServiceStatUtils.PATCH_DURATION);
+            register(ServiceStatUtils.PUT_DURATION);
+            register(ServiceStatUtils.DELETE_DURATION);
+            register(ServiceStatUtils.OPTIONS_DURATION);
+
+            register(ServiceStatUtils.GET_REQUEST_COUNT);
+            register(ServiceStatUtils.POST_REQUEST_COUNT);
+            register(ServiceStatUtils.PATCH_REQUEST_COUNT);
+            register(ServiceStatUtils.PUT_REQUEST_COUNT);
+            register(ServiceStatUtils.DELETE_REQUEST_COUNT);
+            register(ServiceStatUtils.OPTIONS_REQUEST_COUNT);
+
+            register(ServiceStatUtils.GET_QLATENCY);
+            register(ServiceStatUtils.POST_QLATENCY);
+            register(ServiceStatUtils.PATCH_QLATENCY);
+            register(ServiceStatUtils.PUT_QLATENCY);
+            register(ServiceStatUtils.DELETE_QLATENCY);
+            register(ServiceStatUtils.OPTIONS_QLATENCY);
+
+            register(ServiceStatUtils.GET_HANDLER_LATENCY);
+            register(ServiceStatUtils.POST_HANDLER_LATENCY);
+            register(ServiceStatUtils.PATCH_HANDLER_LATENCY);
+            register(ServiceStatUtils.PUT_HANDLER_LATENCY);
+            register(ServiceStatUtils.DELETE_HANDLER_LATENCY);
+            register(ServiceStatUtils.OPTIONS_HANDLER_LATENCY);
+        }
+
+        private void register(String s) {
+            this.map.put(s, s);
+        }
+
+        public String getStatKey(String s) {
+            return this.map.getOrDefault(s, s);
+        }
+    }
+
+    private static final StatsKeyDeduper STATS_KEY_DICT = new StatsKeyDeduper();
 
     public UtilityService() {
     }
@@ -73,6 +159,8 @@ public class UtilityService implements Service {
             handleDocumentTemplateRequest(op);
         } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_CONFIG)) {
             this.parent.handleConfigurationRequest(op);
+        } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_SYNCHRONIZATION)) {
+            handleSynchRequest(op);
         } else if (op.getUri().getPath().endsWith(ServiceHost.SERVICE_URI_SUFFIX_AVAILABLE)) {
             handleAvailableRequest(op);
         } else {
@@ -100,10 +188,87 @@ public class UtilityService implements Service {
         handleRequest(op);
     }
 
+    private void handleSynchRequest(Operation op) {
+        if (op.getAction() != Action.PATCH && op.getAction() != Action.PUT) {
+            Operation.failActionNotSupported(op);
+            return;
+        }
+
+        if (this.parent.getProcessingStage() != ProcessingStage.AVAILABLE) {
+            // processing stage takes precedence over isAvailable statistic
+            op.fail(Operation.STATUS_CODE_UNAVAILABLE);
+            return;
+        }
+
+        if (!op.hasBody()) {
+            op.fail(new IllegalArgumentException("body is required"));
+            return;
+        }
+
+        SynchronizationRequest synchRequest = op.getBody(SynchronizationRequest.class);
+        if (synchRequest.kind == null || !synchRequest.kind.equals(Utils.buildKind(SynchronizationRequest.class))) {
+            op.fail(new IllegalArgumentException(String.format(
+                    "Invalid 'kind' in the request body")));
+            return;
+        }
+
+        if (!synchRequest.documentSelfLink.equals(this.parent.getSelfLink())) {
+            op.fail(new IllegalArgumentException("Invalid param in the body: " + synchRequest.documentSelfLink));
+            return;
+        }
+
+        // Synchronize the FactoryService
+        if (this.parent instanceof FactoryService) {
+            ((FactoryService)this.parent).synchronizeChildServicesIfOwner(new Operation());
+            op.complete();
+            return;
+        }
+
+        if (this.parent instanceof StatelessService) {
+            op.fail(new IllegalArgumentException("Nothing to synchronize for stateless service: " +
+                    synchRequest.documentSelfLink));
+            return;
+        }
+
+        // Synchronize the single child service.
+        synchronizeChildService(this.parent.getSelfLink(), op);
+    }
+
+    private void synchronizeChildService(String link, Operation op) {
+        // To trigger synchronization of the child-service, we make
+        // a SYNCH-OWNER request. The request body is an empty document
+        // with just the documentSelfLink property set to the link
+        // of the child-service. This is done so that the FactoryService
+        // routes the request to the DOCUMENT_OWNER.
+        ServiceDocument d = new ServiceDocument();
+        d.documentSelfLink = UriUtils.getLastPathSegment(link);
+        String factoryLink = UriUtils.getParentPath(link);
+
+        Operation.CompletionHandler c = (o, e) -> {
+            if (e != null) {
+                String msg = String.format("Synchronization failed for service %s with status code %d, message %s",
+                        o.getUri().getPath(), o.getStatusCode(), e.getMessage());
+                this.parent.getHost().log(Level.WARNING, msg);
+                op.fail(new IllegalStateException(msg));
+                return;
+            }
+
+            op.complete();
+        };
+
+        Operation.createPost(this, factoryLink)
+                .setBody(d)
+                .setCompletion(c)
+                .setReferer(getUri())
+                .setConnectionSharing(true)
+                .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER)
+                .sendWith(this.parent);
+    }
+
     private void handleAvailableRequest(Operation op) {
         if (op.getAction() == Action.GET) {
-            if (this.parent.getProcessingStage() != ProcessingStage.PAUSED
-                    && this.parent.getProcessingStage() != ProcessingStage.AVAILABLE) {
+            if (this.parent.getProcessingStage() != ProcessingStage.AVAILABLE) {
                 // processing stage takes precedence over isAvailable statistic
                 op.fail(Operation.STATUS_CODE_UNAVAILABLE);
                 return;
@@ -118,7 +283,7 @@ public class UtilityService implements Service {
                 return;
             }
             op.fail(Operation.STATUS_CODE_UNAVAILABLE);
-        } else if (op.getAction() == Action.PATCH || op.getAction() == Action.PUT) {
+        } else if (op.getAction() == Action.PATCH || op.getAction() == Action.PUT || op.getAction() == Action.POST) {
             if (!op.hasBody()) {
                 op.fail(new IllegalArgumentException("body is required"));
                 return;
@@ -132,7 +297,7 @@ public class UtilityService implements Service {
             }
             handleStatsRequest(op);
         } else {
-            getHost().failRequestActionNotSupported(op);
+            Operation.failActionNotSupported(op);
         }
     }
 
@@ -145,7 +310,14 @@ public class UtilityService implements Service {
         }
 
         ServiceSubscriber body = null;
-        if (op.hasBody()) {
+
+        // validate and populate body for POST & DELETE
+        Action action = op.getAction();
+        if (action == POST || action == DELETE) {
+            if (!op.hasBody()) {
+                op.fail(new IllegalStateException("body is required"));
+                return;
+            }
             body = op.getBody(ServiceSubscriber.class);
             if (body.reference == null) {
                 op.fail(new IllegalArgumentException("reference is required"));
@@ -153,7 +325,7 @@ public class UtilityService implements Service {
             }
         }
 
-        switch (op.getAction()) {
+        switch (action) {
         case POST:
             // synchronize to avoid concurrent modification during serialization for GET
             synchronized (this.subscriptions) {
@@ -204,19 +376,32 @@ public class UtilityService implements Service {
         op.complete();
     }
 
+    public boolean hasSubscribers() {
+        ServiceSubscriptionState subscriptions = this.subscriptions;
+        return subscriptions != null
+                && subscriptions.subscribers != null
+                && !subscriptions.subscribers.isEmpty();
+    }
+
+    public boolean hasStats() {
+        ServiceStats stats = this.stats;
+        return stats != null && stats.entries != null && !stats.entries.isEmpty();
+    }
+
     public void notifySubscribers(Operation op) {
         try {
-            if (this.subscriptions == null || this.subscriptions.subscribers == null) {
+            if (op.getAction() == Action.GET) {
                 return;
             }
 
-            if (op.getAction() == Action.GET) {
+            if (!this.hasSubscribers()) {
                 return;
             }
 
             long now = Utils.getNowMicrosUtc();
 
             Operation clone = op.clone();
+            clone.toggleOption(OperationOption.REMOTE, false);
             clone.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NOTIFICATION);
             for (Entry<URI, ServiceSubscriber> e : this.subscriptions.subscribers.entrySet()) {
                 ServiceSubscriber s = e.getValue();
@@ -226,7 +411,7 @@ public class UtilityService implements Service {
             if (!performSubscriptionsMaintenance(now)) {
                 return;
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             this.parent.getHost().log(Level.WARNING,
                     "Uncaught exception notifying subscribers for %s: %s",
                     this.parent.getSelfLink(), Utils.toString(e));
@@ -291,6 +476,9 @@ public class UtilityService implements Service {
                             && s.failedNotificationCount > ServiceSubscriber.NOTIFICATION_FAILURE_LIMIT) {
                         if (now - s.initialFailedNotificationTimeMicros > getHost()
                                 .getMaintenanceIntervalMicros()) {
+                            getHost().log(Level.INFO,
+                                    "removing subscriber, failed notifications: %d",
+                                    s.failedNotificationCount);
                             remove = true;
                         }
                     }
@@ -400,7 +588,7 @@ public class UtilityService implements Service {
                 op.fail(new IllegalArgumentException("stat does not exist"));
                 return;
             }
-            setStat(existingStat, newStat.latestValue);
+            initializeOrSetStat(existingStat, newStat);
             op.complete();
             break;
         case DELETE:
@@ -428,11 +616,16 @@ public class UtilityService implements Service {
                 populateDocumentProperties(s);
                 op.setBody(s).complete();
             } else {
-                ServiceDocument rsp;
+                ServiceStats rsp;
                 synchronized (this.stats) {
                     rsp = populateDocumentProperties(this.stats);
                     rsp = Utils.clone(rsp);
                 }
+
+                if (handleStatsGetWithODataRequest(op, rsp)) {
+                    return;
+                }
+
                 op.setBodyNoCloning(rsp);
                 op.complete();
             }
@@ -444,9 +637,131 @@ public class UtilityService implements Service {
         }
     }
 
+    /**
+     * Selects statistics entries that satisfy a simple sub set of ODATA filter expressions
+     */
+    private boolean handleStatsGetWithODataRequest(Operation op, ServiceStats rsp) {
+        if (UriUtils.getODataCountParamValue(op.getUri())) {
+            op.fail(new IllegalArgumentException(
+                    UriUtils.URI_PARAM_ODATA_COUNT + " is not supported"));
+            return true;
+        }
+
+        if (UriUtils.getODataOrderByParamValue(op.getUri()) != null) {
+            op.fail(new IllegalArgumentException(
+                    UriUtils.URI_PARAM_ODATA_ORDER_BY + " is not supported"));
+            return true;
+        }
+
+        if (UriUtils.getODataSkipToParamValue(op.getUri()) != null) {
+            op.fail(new IllegalArgumentException(
+                    UriUtils.URI_PARAM_ODATA_SKIP_TO + " is not supported"));
+            return true;
+        }
+
+        if (UriUtils.getODataTopParamValue(op.getUri()) != null) {
+            op.fail(new IllegalArgumentException(
+                    UriUtils.URI_PARAM_ODATA_TOP + " is not supported"));
+            return true;
+        }
+
+        if (UriUtils.getODataFilterParamValue(op.getUri()) == null) {
+            return false;
+        }
+
+        QueryTask task = ODataUtils.toQuery(op, false, null);
+        if (task == null || task.querySpec.query == null) {
+            return false;
+        }
+
+        List<Query> clauses = task.querySpec.query.booleanClauses;
+        if (clauses == null || clauses.size() == 0) {
+            clauses = new ArrayList<Query>();
+            if (task.querySpec.query.term == null) {
+                return false;
+            }
+            clauses.add(task.querySpec.query);
+        }
+
+        return processStatsODataQueryClauses(op, rsp, clauses);
+    }
+
+    private boolean processStatsODataQueryClauses(Operation op, ServiceStats rsp,
+            List<Query> clauses) {
+        for (Query q : clauses) {
+            if (!Occurance.MUST_OCCUR.equals(q.occurance)) {
+                op.fail(new IllegalArgumentException("only AND expressions are supported"));
+                return true;
+            }
+
+            QueryTerm term = q.term;
+
+            if (term == null) {
+                return processStatsODataQueryClauses(op, rsp, q.booleanClauses);
+            }
+
+            // prune entries using the filter match value and property
+            Iterator<Entry<String, ServiceStat>> statIt = rsp.entries.entrySet().iterator();
+            while (statIt.hasNext()) {
+                Entry<String, ServiceStat> e = statIt.next();
+                if (ServiceStat.FIELD_NAME_NAME.equals(term.propertyName)) {
+                    // match against the name property which is the also the key for the
+                    // entry table
+                    if (term.matchType.equals(MatchType.TERM)
+                            && e.getKey().equals(term.matchValue)) {
+                        continue;
+                    }
+                    if (term.matchType.equals(MatchType.PREFIX)
+                            && e.getKey().startsWith(term.matchValue)) {
+                        continue;
+                    }
+                    if (term.matchType.equals(MatchType.WILDCARD)) {
+                        // we only support two types of wild card queries:
+                        // *something or something*
+                        if (term.matchValue.endsWith(UriUtils.URI_WILDCARD_CHAR)) {
+                            // prefix match
+                            String mv = term.matchValue.replace(UriUtils.URI_WILDCARD_CHAR, "");
+                            if (e.getKey().startsWith(mv)) {
+                                continue;
+                            }
+                        } else if (term.matchValue.startsWith(UriUtils.URI_WILDCARD_CHAR)) {
+                            // suffix match
+                            String mv = term.matchValue.replace(UriUtils.URI_WILDCARD_CHAR, "");
+
+                            if (e.getKey().endsWith(mv)) {
+                                continue;
+                            }
+                        }
+                    }
+                } else if (ServiceStat.FIELD_NAME_LATEST_VALUE.equals(term.propertyName)) {
+                    // support numeric range queries on latest value
+                    if (term.range == null || term.range.type != TypeName.DOUBLE) {
+                        op.fail(new IllegalArgumentException(
+                                ServiceStat.FIELD_NAME_LATEST_VALUE
+                                        + "requires double numeric range"));
+                        return true;
+                    }
+                    @SuppressWarnings("unchecked")
+                    NumericRange<Double> nr = (NumericRange<Double>) term.range;
+                    ServiceStat st = e.getValue();
+                    boolean withinMax = nr.isMaxInclusive && st.latestValue <= nr.max ||
+                            st.latestValue < nr.max;
+                    boolean withinMin = nr.isMinInclusive && st.latestValue >= nr.min ||
+                            st.latestValue > nr.min;
+                    if (withinMin && withinMax) {
+                        continue;
+                    }
+                }
+                statIt.remove();
+            }
+        }
+        return false;
+    }
+
     private ServiceStats populateDocumentProperties(ServiceStats stats) {
         ServiceStats clone = new ServiceStats();
-        clone.entries = stats.entries;
+        // sort entries by key (natural ordering)
+        clone.entries = new TreeMap<>(stats.entries);
         clone.documentUpdateTimeMicros = stats.documentUpdateTimeMicros;
         clone.documentSelfLink = UriUtils.buildUriPath(this.parent.getSelfLink(),
                 ServiceHost.SERVICE_URI_SUFFIX_STATS);
@@ -481,14 +796,36 @@ public class UtilityService implements Service {
         }
 
         if (updateBody.maintenanceIntervalMicros == null
+                && updateBody.peerNodeSelectorPath == null
                 && updateBody.operationQueueLimit == null
                 && updateBody.epoch == null
                 && (updateBody.addOptions == null || updateBody.addOptions.isEmpty())
                 && (updateBody.removeOptions == null || updateBody.removeOptions
-                        .isEmpty())) {
+                .isEmpty())
+                && updateBody.versionRetentionLimit == null) {
             op.fail(new IllegalArgumentException(
                     "At least one configuraton field must be specified"));
             return;
+        }
+
+        if (updateBody.versionRetentionLimit != null) {
+            // Fail the request for immutable service as it is not allowed to change the version
+            // retention.
+            if (this.parent.getOptions().contains(ServiceOption.IMMUTABLE)) {
+                op.fail(new IllegalArgumentException(String.format(
+                        "Service %s has option %s, retention limit cannot be modified",
+                        this.parent.getSelfLink(), ServiceOption.IMMUTABLE)));
+                return;
+            }
+            ServiceDocumentDescription serviceDocumentDescription = this.parent
+                    .getDocumentTemplate().documentDescription;
+            serviceDocumentDescription.versionRetentionLimit = updateBody.versionRetentionLimit;
+            if (updateBody.versionRetentionFloor != null) {
+                serviceDocumentDescription.versionRetentionFloor = updateBody.versionRetentionFloor;
+            } else {
+                serviceDocumentDescription.versionRetentionFloor =
+                        updateBody.versionRetentionLimit / 2;
+            }
         }
 
         // service might fail a capability toggle if the capability can not be changed after start
@@ -508,27 +845,55 @@ public class UtilityService implements Service {
             this.parent.setMaintenanceIntervalMicros(updateBody.maintenanceIntervalMicros);
         }
 
+        if (updateBody.peerNodeSelectorPath != null) {
+            this.parent.setPeerNodeSelectorPath(updateBody.peerNodeSelectorPath);
+        }
+
         op.complete();
+    }
+
+    private void initializeOrSetStat(ServiceStat stat, ServiceStat newValue) {
+        synchronized (stat) {
+            if (stat.timeSeriesStats == null && newValue.timeSeriesStats != null) {
+                stat.timeSeriesStats = new TimeSeriesStats(newValue.timeSeriesStats.numBins,
+                        newValue.timeSeriesStats.binDurationMillis, newValue.timeSeriesStats.aggregationType);
+            }
+            stat.unit = newValue.unit;
+            stat.sourceTimeMicrosUtc = newValue.sourceTimeMicrosUtc;
+            setStat(stat, newValue.latestValue);
+        }
     }
 
     @Override
     public void setStat(ServiceStat stat, double newValue) {
         allocateStats();
+        findStat(stat.name, true, stat);
         synchronized (stat) {
             stat.version++;
             stat.accumulatedValue += newValue;
             stat.latestValue = newValue;
-            if (stat.logHistogram != null) {
-                int binIndex = 0;
-                if (newValue > 0.0) {
-                    binIndex = (int) Math.log10(newValue);
-                }
-                if (binIndex >= 0 && binIndex < stat.logHistogram.bins.length) {
-                    stat.logHistogram.bins[binIndex]++;
+            addHistogram(stat, newValue);
+            stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
+            if (stat.timeSeriesStats != null) {
+                if (stat.sourceTimeMicrosUtc != null) {
+                    stat.timeSeriesStats.add(stat.sourceTimeMicrosUtc, newValue, newValue);
+                } else {
+                    stat.timeSeriesStats.add(stat.lastUpdateMicrosUtc, newValue, newValue);
                 }
             }
         }
-        stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
+    }
+
+    private void addHistogram(ServiceStat stat, double newValue) {
+        if (stat.logHistogram != null) {
+            int binIndex = 0;
+            if (newValue > 0.0) {
+                binIndex = (int) Math.log10(newValue);
+            }
+            if (binIndex >= 0 && binIndex < stat.logHistogram.bins.length) {
+                stat.logHistogram.bins[binIndex]++;
+            }
+        }
     }
 
     @Override
@@ -537,18 +902,16 @@ public class UtilityService implements Service {
         synchronized (stat) {
             stat.latestValue += delta;
             stat.version++;
-            if (stat.logHistogram != null) {
-
-                int binIndex = 0;
-                if (delta > 0.0) {
-                    binIndex = (int) Math.log10(delta);
-                }
-                if (binIndex >= 0 && binIndex < stat.logHistogram.bins.length) {
-                    stat.logHistogram.bins[binIndex]++;
+            addHistogram(stat, stat.latestValue);
+            stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
+            if (stat.timeSeriesStats != null) {
+                if (stat.sourceTimeMicrosUtc != null) {
+                    stat.timeSeriesStats.add(stat.sourceTimeMicrosUtc, stat.latestValue, delta);
+                } else {
+                    stat.timeSeriesStats.add(stat.lastUpdateMicrosUtc, stat.latestValue, delta);
                 }
             }
         }
-        stat.lastUpdateMicrosUtc = Utils.getNowMicrosUtc();
     }
 
     @Override
@@ -560,7 +923,7 @@ public class UtilityService implements Service {
         if (!allocateStats(true)) {
             return null;
         }
-        return findStat(name, create);
+        return findStat(name, create, null);
     }
 
     private void replaceSingleStat(ServiceStat stat) {
@@ -571,7 +934,7 @@ public class UtilityService implements Service {
             // create a new stat with the default values
             ServiceStat newStat = new ServiceStat();
             newStat.name = stat.name;
-            setStat(newStat, stat.latestValue);
+            initializeOrSetStat(newStat, stat);
             if (this.stats.entries == null) {
                 this.stats.entries = new HashMap<>();
             }
@@ -594,16 +957,28 @@ public class UtilityService implements Service {
         }
     }
 
-    private ServiceStat findStat(String name, boolean create) {
+    private ServiceStat findStat(String name, boolean create, ServiceStat initialStat) {
         synchronized (this.stats) {
             if (this.stats.entries == null) {
                 this.stats.entries = new HashMap<>();
             }
             ServiceStat st = this.stats.entries.get(name);
             if (st == null && create) {
-                st = new ServiceStat();
+                st = initialStat != null ? initialStat : new ServiceStat();
+                name = STATS_KEY_DICT.getStatKey(name);
                 st.name = name;
                 this.stats.entries.put(name, st);
+            }
+
+            if (create && st != null && initialStat != null) {
+                // if the statistic already exists make sure it has the same features
+                // as the statistic we are trying to create
+                if (st.timeSeriesStats == null && initialStat.timeSeriesStats != null) {
+                    st.timeSeriesStats = initialStat.timeSeriesStats;
+                }
+                if (st.logHistogram == null && initialStat.logHistogram != null) {
+                    st.logHistogram = initialStat.logHistogram;
+                }
             }
             return st;
         }
@@ -666,12 +1041,10 @@ public class UtilityService implements Service {
 
     @Override
     public void adjustStat(String name, double delta) {
-        return;
     }
 
     @Override
     public void setStat(String name, double newValue) {
-        return;
     }
 
     @Override
@@ -700,7 +1073,7 @@ public class UtilityService implements Service {
     }
 
     @Override
-    public ServiceDocument setInitialState(String jsonState, Long initialVersion) {
+    public ServiceDocument setInitialState(Object state, Long initialVersion) {
         return null;
     }
 
@@ -735,6 +1108,16 @@ public class UtilityService implements Service {
     }
 
     @Override
+    public void setDocumentIndexPath(String uriPath) {
+
+    }
+
+    @Override
+    public String getDocumentIndexPath() {
+        return null;
+    }
+
+    @Override
     public void setState(Operation op, ServiceDocument newState) {
         op.linkState(newState);
     }
@@ -751,7 +1134,16 @@ public class UtilityService implements Service {
     }
 
     @Override
+    public void setCacheClearDelayMicros(long micros) {
+    }
+
+    @Override
     public long getMaintenanceIntervalMicros() {
+        return 0;
+    }
+
+    @Override
+    public long getCacheClearDelayMicros() {
         return 0;
     }
 
@@ -763,5 +1155,15 @@ public class UtilityService implements Service {
     @Override
     public Class<? extends ServiceDocument> getStateType() {
         return null;
+    }
+
+    @Override
+    public final void setAuthorizationContext(Operation op, AuthorizationContext ctx) {
+        throw new RuntimeException("Service not allowed to set authorization context");
+    }
+
+    @Override
+    public final AuthorizationContext getSystemAuthorizationContext() {
+        throw new RuntimeException("Service not allowed to get system authorization context");
     }
 }

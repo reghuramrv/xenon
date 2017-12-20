@@ -15,21 +15,26 @@ package com.vmware.xenon.common;
 
 import java.net.URI;
 import java.util.EnumSet;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
+import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.services.common.QueryTask;
+import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.Query.Occurance;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
 import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
 import com.vmware.xenon.services.common.ServiceUriPaths;
-import com.vmware.xenon.services.common.TransactionService.ResolutionKind;
-import com.vmware.xenon.services.common.TransactionService.ResolutionRequest;
 
 /**
  * Stateless helpers for transactions
  */
-public class TransactionServiceHelper {
+public final class TransactionServiceHelper {
+
+    private TransactionServiceHelper() {
+
+    }
+
     interface Handler {
         void handler(Operation op);
     }
@@ -39,119 +44,143 @@ public class TransactionServiceHelper {
     }
 
     /**
-     * Transaction-enabled path
+     * Handles a GET request on a service that has pending transactions.
+     *
+     * If the request is transactional, we search for the latest version of the
+     * service tagged with the transaction and return it if exists; if it
+     * doesn't - we search for the latest non-shadowed version and return
+     * it if exists (otherwise we fail the request).
+     *
+     * If the request is non-transactional we search for the latest
+     * non-shadowed version and return it if exists, otherwise we fail the
+     * request.
      */
     static void handleGetWithinTransaction(StatefulService s, Operation get,
-                                           Handler h, FailRequest fr) {
-
-        QueryTask.Query selfLinkClause = new QueryTask.Query()
-                .setTermPropertyName(ServiceDocument.FIELD_NAME_SELF_LINK)
-                .setTermMatchValue(s.getSelfLink());
-
-        QueryTask.Query txClause = new QueryTask.Query();
-
+            Handler h, FailRequest fr, AuthorizationContext authContext) {
         if (get.isWithinTransaction()) {
-            // latest that has txid -- TODO: incorporate caching (DCP-1160)
-            txClause.setTermPropertyName(ServiceDocument.FIELD_NAME_TRANSACTION_ID);
-            txClause.setTermMatchValue(get.getTransactionId());
-        } else {
-            // latest that does not have txid -- TODO: incorporate caching (DCP-1160)
-            txClause.setTermPropertyName(ServiceDocument.FIELD_NAME_TRANSACTION_ID);
-            txClause.setTermMatchValue("*");
-            txClause.setTermMatchType(MatchType.WILDCARD);
-            txClause.occurance = Occurance.MUST_NOT_OCCUR;
-        }
-        QueryTask.QuerySpecification q = new QueryTask.QuerySpecification();
-        q.options = EnumSet.of(QueryTask.QuerySpecification.QueryOption.EXPAND_CONTENT,
-                QueryTask.QuerySpecification.QueryOption.INCLUDE_ALL_VERSIONS);
-        q.query.addBooleanClause(selfLinkClause);
-        q.query.addBooleanClause(txClause);
+            Operation inTransactionQueryOp = buildLatestInTransactionQueryTaskOp(s,
+                    get.getTransactionId(), authContext).setCompletion((o, e) -> {
+                        if (e != null) {
+                            get.fail(e);
+                            return;
+                        }
 
-        QueryTask task = QueryTask.create(q).setDirect(true);
-        URI uri = UriUtils.buildUri(s.getHost(), ServiceUriPaths.CORE_QUERY_TASKS);
-        Operation startPost = Operation
-                .createPost(uri)
-                .setBody(task)
-                .setCompletion((o, f) -> handleTransactionQueryCompletion(s, o, f, get, h, fr));
-        s.sendRequest(startPost);
+                        QueryTask response = o.getBody(QueryTask.class);
+                        if (response.results.documentLinks.isEmpty()) {
+                            Operation nonTransactionQueryOp = buildLatestNonTransactionQueryTaskOp(
+                                    s, authContext).setCompletion((o2, e2) -> {
+                                        if (e2 != null) {
+                                            get.fail(e);
+                                            return;
+                                        }
+                                        QueryTask nonTransactionResponse = o2
+                                                .getBody(QueryTask.class);
+                                        returnLatestOrFail(nonTransactionResponse, get, fr);
+                                    });
+                            s.sendRequest(nonTransactionQueryOp);
+                        } else {
+                            returnLatestOrFail(response, get, fr);
+                        }
+                    });
+            s.sendRequest(inTransactionQueryOp);
+        } else {
+            Operation nonTransactionQueryOp = buildLatestNonTransactionQueryTaskOp(s, authContext)
+                    .setCompletion((o, e) -> {
+                        if (e != null) {
+                            get.fail(e);
+                            return;
+                        }
+
+                        QueryTask response = o.getBody(QueryTask.class);
+                        returnLatestOrFail(response, get, fr);
+                    });
+            s.sendRequest(nonTransactionQueryOp);
+        }
     }
 
-    /**
-     * Process the latest version recovered
-     */
-    static void handleTransactionQueryCompletion(StatefulService s, Operation o, Throwable f,
-                                                 Operation original, Handler h, FailRequest fr) {
-        if (f != null) {
-            s.logInfo(f.toString());
-            original.fail(f);
-            return;
-        }
-
-        QueryTask response = o.getBody(QueryTask.class);
-
-        // If we are within a transaction, empty state means there are no shadowed versions, so
-        // return previous visible. If we are not, however, this means a 404 -- there is no prior
-        // visible state!
+    private static void returnLatestOrFail(QueryTask response, Operation get, FailRequest fr) {
         if (response.results.documentLinks.isEmpty()) {
-            if (original.isWithinTransaction()) {
-                // TODO: This has the possibility of returning a version that has a different
-                // transaction, if there are more than one pending -- depends on DCP 1160.
-                h.handler(original);
-            } else {
-                original.setStatusCode(Operation.STATUS_CODE_NOT_FOUND);
-                fr.failRequest(original, new IllegalStateException("Latest state not found"), false);
-            }
+            get.setStatusCode(Operation.STATUS_CODE_NOT_FOUND);
+            fr.failRequest(get, new IllegalStateException("Latest state not found"), false);
             return;
         }
 
-        List<String> dl = response.results.documentLinks;
-        String latest = dl.get(0);
+        String latest = response.results.documentLinks.get(0);
         Object obj = response.results.documents.get(latest);
-        original.setBodyNoCloning(obj).complete();
-        original.complete();
+        get.setBodyNoCloning(obj).complete();
+    }
+
+    private static Operation buildLatestInTransactionQueryTaskOp(StatefulService s, String txid,
+            AuthorizationContext authContext) {
+        Query.Builder queryBuilder = Query.Builder.create();
+        queryBuilder.addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK, s.getSelfLink());
+        queryBuilder.addFieldClause(ServiceDocument.FIELD_NAME_TRANSACTION_ID, txid);
+
+        QueryTask.Builder queryTaskBuilder = QueryTask.Builder.createDirectTask()
+                .setQuery(queryBuilder.build());
+        queryTaskBuilder.addOption(QueryOption.EXPAND_CONTENT);
+        queryTaskBuilder.addOption(QueryOption.INCLUDE_ALL_VERSIONS);
+        queryTaskBuilder.orderDescending(ServiceDocument.FIELD_NAME_VERSION, TypeName.LONG);
+        QueryTask task = queryTaskBuilder.build();
+
+        Operation returnOp = Operation
+                .createPost(s.getHost(), ServiceUriPaths.CORE_QUERY_TASKS)
+                .setBody(task);
+        returnOp.setAuthorizationContext(authContext);
+        return returnOp;
+    }
+
+    private static Operation buildLatestNonTransactionQueryTaskOp(StatefulService s,
+            AuthorizationContext authContext) {
+        Query.Builder queryBuilder = Query.Builder.create();
+        queryBuilder.addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK, s.getSelfLink());
+        queryBuilder.addFieldClause(ServiceDocument.FIELD_NAME_TRANSACTION_ID, "*",
+                MatchType.WILDCARD, Occurance.MUST_NOT_OCCUR);
+
+        QueryTask.Builder queryTaskBuilder = QueryTask.Builder.createDirectTask()
+                .setQuery(queryBuilder.build());
+        queryTaskBuilder.addOption(QueryOption.EXPAND_CONTENT);
+        queryTaskBuilder.addOption(QueryOption.INCLUDE_ALL_VERSIONS);
+        queryTaskBuilder.orderDescending(ServiceDocument.FIELD_NAME_VERSION, TypeName.LONG);
+        QueryTask task = queryTaskBuilder.build();
+
+        Operation returnOp = Operation
+                .createPost(s.getHost(), ServiceUriPaths.CORE_QUERY_TASKS)
+                .setBody(task);
+        returnOp.setAuthorizationContext(authContext);
+        return returnOp;
     }
 
     /**
      * Notify the transaction coordinator
      */
-    static void notifyTransactionCoordinator(Service s, Set<String> txCoordinatorLinks,
-                                             Operation op, Throwable e) {
+    static Operation notifyTransactionCoordinatorOp(StatefulService s, Operation op, Throwable e) {
+        URI txCoordinator = UriUtils.buildTransactionUri(s.getHost(), op.getTransactionId());
+        s.addPendingTransaction(txCoordinator.getPath());
+
         Operation.TransactionContext operationsLogRecord = new Operation.TransactionContext();
         operationsLogRecord.action = op.getAction();
-        operationsLogRecord.coordinatorLinks = txCoordinatorLinks;
         operationsLogRecord.isSuccessful = e == null;
 
-        URI txCoordinator = UriUtils.buildTransactionUri(s.getHost(), op.getTransactionId());
-
-        txCoordinatorLinks.add(txCoordinator.toString());
-
-        s.sendRequest(Operation.createPut(txCoordinator).setBody(operationsLogRecord));
+        Operation notifyCoordinatorOp = Operation.createPut(txCoordinator).setTransactionId(null);
+        notifyCoordinatorOp.addRequestHeader(Operation.TRANSACTION_REFLINK_HEADER, s.getSelfLink());
+        return s.setPendingTransactionsAsBody(notifyCoordinatorOp, operationsLogRecord);
     }
 
     /**
      * Notify the transaction coordinator of a new service
      */
-    static void notifyTransactionCoordinatorOfNewService(FactoryService factoryService, Service childService, Operation op) {
+    static Operation notifyTransactionCoordinatorOfNewServiceOp(FactoryService factoryService,
+            Service childService, Operation op) {
         // some of the basic properties of the child service being created are not
         // yet set at the point we're intercepting the POST, so we need to set them here
         childService.setHost(factoryService.getHost());
         URI childServiceUri = op.getUri().normalize();
-        String childServicePath = UriUtils.normalizeUriPath(childServiceUri.getPath()).intern();
+        String childServicePath = UriUtils.normalizeUriPath(childServiceUri.getPath());
         childService.setSelfLink(childServicePath);
 
-        notifyTransactionCoordinator(childService, new HashSet<>(), op, null);
-    }
-
-    static void abortTransactions(StatefulService service, Set<String> coordinators) {
-        if (coordinators == null || coordinators.isEmpty()) {
-            return;
-        }
-        ResolutionRequest resolution = new ResolutionRequest();
-        resolution.kind = ResolutionKind.ABORT;
-        for (String coordinator : coordinators) {
-            service.sendRequest(Operation.createPatch(UriUtils.buildUri(coordinator))
-                    .setBodyNoCloning(resolution));
-        }
+        // TODO: remove cast by changing childService type at the origin (FactoryService)
+        return notifyTransactionCoordinatorOp((StatefulService) childService, op, null);
     }
 
     /**
@@ -159,23 +188,38 @@ public class TransactionServiceHelper {
      * etc.), and take appropriate action
      */
     static boolean handleOperationInTransaction(StatefulService s,
-                                                Class<? extends ServiceDocument> st,
-                                                Set<String> txCoordinatorLinks, Operation request) {
-        if (request.getRequestHeader(Operation.VMWARE_DCP_TRANSACTION_HEADER) == null) {
+            Class<? extends ServiceDocument> st,
+            Operation request, AuthorizationContext authContext) {
+        if (request.getRequestHeaderAsIs(Operation.TRANSACTION_HEADER) == null) {
             return false;
         }
 
-        if (request.getRequestHeader(Operation.VMWARE_DCP_TRANSACTION_HEADER).equals(
+        if (request.getRequestHeaderAsIs(Operation.TRANSACTION_HEADER)
+                .equals(Operation.TX_ENSURE_COMMIT)) {
+            // this request is targeting a transaction service - let it 'fall through'
+            return false;
+        }
+
+        if (request.getRequestHeaderAsIs(Operation.TRANSACTION_HEADER).equals(
                 Operation.TX_COMMIT)) {
             // commit should expose latest state, i.e., remove shadow and bump the version
             // and remove transaction from pending
-            if (txCoordinatorLinks != null) {
-                txCoordinatorLinks.remove(request.getReferer().toString());
-            }
+            String txRefLink = request.getRequestHeader(Operation.TRANSACTION_REFLINK_HEADER);
+            s.removePendingTransaction(txRefLink);
+            s.getHost().clearTransactionalCachedServiceState(s,
+                    UriUtils.getLastPathSegment(txRefLink));
 
             QueryTask.QuerySpecification q = new QueryTask.QuerySpecification();
-            q.query.setTermPropertyName(ServiceDocument.FIELD_NAME_TRANSACTION_ID);
-            q.query.setTermMatchValue(UriUtils.getLastPathSegment(request.getReferer()));
+            QueryTask.Query txnIdClause = new QueryTask.Query().setTermPropertyName(
+                    ServiceDocument.FIELD_NAME_TRANSACTION_ID)
+                    .setTermMatchValue(UriUtils.getLastPathSegment(txRefLink));
+            txnIdClause.occurance = QueryTask.Query.Occurance.MUST_OCCUR;
+            q.query.addBooleanClause(txnIdClause);
+            QueryTask.Query selfLinkClause = new QueryTask.Query().setTermPropertyName(
+                    ServiceDocument.FIELD_NAME_SELF_LINK)
+                    .setTermMatchValue(s.getSelfLink());
+            selfLinkClause.occurance = QueryTask.Query.Occurance.MUST_OCCUR;
+            q.query.addBooleanClause(selfLinkClause);
             q.options = EnumSet.of(QueryTask.QuerySpecification.QueryOption.EXPAND_CONTENT,
                     QueryTask.QuerySpecification.QueryOption.INCLUDE_ALL_VERSIONS);
             QueryTask task = QueryTask.create(q).setDirect(true);
@@ -184,14 +228,16 @@ public class TransactionServiceHelper {
                     .createPost(uri)
                     .setBody(task)
                     .setCompletion((o, f) -> unshadowQueryCompletion(s, st, o, f, request));
+            startPost.setAuthorizationContext(authContext);
             s.sendRequest(startPost);
 
-        } else if (request.getRequestHeader(Operation.VMWARE_DCP_TRANSACTION_HEADER).equals(
+        } else if (request.getRequestHeaderAsIs(Operation.TRANSACTION_HEADER).equals(
                 Operation.TX_ABORT)) {
             // abort should just remove transaction from pending
-            if (txCoordinatorLinks != null) {
-                txCoordinatorLinks.remove(request.getReferer().toString());
-            }
+            String txRefLink = request.getRequestHeader(Operation.TRANSACTION_REFLINK_HEADER);
+            s.removePendingTransaction(txRefLink);
+            s.getHost().clearTransactionalCachedServiceState(s,
+                    UriUtils.getLastPathSegment(txRefLink));
             request.complete();
         } else {
             request.fail(new IllegalArgumentException(
@@ -201,9 +247,9 @@ public class TransactionServiceHelper {
     }
 
     static void unshadowQueryCompletion(StatefulService s,
-                                        Class<? extends ServiceDocument> st,
-                                        Operation o, Throwable f,
-                                        Operation original) {
+            Class<? extends ServiceDocument> st,
+            Operation o, Throwable f,
+            Operation original) {
         if (f != null) {
             s.logInfo(f.toString());
             original.fail(f);
@@ -223,7 +269,7 @@ public class TransactionServiceHelper {
         String latest = dl.get(0);
         Object obj = response.results.documents.get(latest);
         // ..unshadow..
-        ServiceDocument sd = Utils.fromJson((String) obj, st);
+        ServiceDocument sd = Utils.fromJson(obj, st);
         sd.documentTransactionId = null;
         // ..and stick back in.
         s.setState(original, sd);

@@ -13,24 +13,30 @@
 
 package com.vmware.xenon.common;
 
+import static java.lang.String.format;
+
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.security.Principal;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Consumer;
-
 import javax.security.cert.X509Certificate;
 
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
+import com.vmware.xenon.common.ServiceErrorResponse.ErrorDetail;
+import com.vmware.xenon.common.ServiceHost.ServiceNotFoundException;
+import com.vmware.xenon.common.serialization.KryoSerializers;
+import com.vmware.xenon.services.common.GuestUserService;
 import com.vmware.xenon.services.common.QueryFilter;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.SystemUserService;
@@ -41,16 +47,17 @@ import com.vmware.xenon.services.common.SystemUserService;
  */
 public class Operation implements Cloneable {
 
+    /**
+     * Portion of serialized JSON body string to include in {@code toString}
+     */
+    private static final int TO_STRING_SERIALIZED_BODY_LIMIT = 256;
+
     @FunctionalInterface
     public interface CompletionHandler {
         void handle(Operation completedOp, Throwable failure);
     }
 
     public static class SocketContext {
-
-        public SocketContext() {
-        }
-
         private long lastUseTimeMicros;
 
         public long getLastUseTimeMicros() {
@@ -58,7 +65,7 @@ public class Operation implements Cloneable {
         }
 
         public void updateLastUseTime() {
-            this.lastUseTimeMicros = Utils.getNowMicrosUtc();
+            this.lastUseTimeMicros = Utils.getSystemNowMicrosUtc();
         }
 
         public void writeHttpRequest(Object request) {
@@ -68,35 +75,14 @@ public class Operation implements Cloneable {
         public void close() {
             throw new IllegalStateException();
         }
-
-        private static int maxRequestSize = 1024 * 1024 * 16;
-
-        private static final int MAX_CLIENT_REQUEST_SIZE = 1024 * 1024 * 128;
-
-        /**
-         * Set maximum request/response size for socket I/O.
-         * Note that this has to be called very early before client / listener initialize.
-         * @param max size in bytes
-         */
-        public static void setMaxRequestSize(int max) {
-            maxRequestSize = max;
-        }
-
-        public static int getMaxRequestSize() {
-            return maxRequestSize;
-        }
-
-        public static int getMaxClientRequestSize() {
-            return MAX_CLIENT_REQUEST_SIZE;
-        }
     }
 
     static class InstrumentationContext {
-        public long handleInvokeTimeMicrosUtc;
-        public long enqueueTimeMicrosUtc;
-        public long documentStoreCompletionTimeMicrosUtc;
-        public long handlerCompletionTime;
-        public long operationCompletionTimeMicrosUtc;
+        long handleInvokeTimeMicros;
+        long enqueueTimeMicros;
+        long documentStoreCompletionTimeMicros;
+        long handlerCompletionTimeMicros;
+        long operationCompletionTimeMicros;
     }
 
     /**
@@ -121,12 +107,13 @@ public class Operation implements Cloneable {
     }
 
     static class RemoteContext {
-        public SocketContext socketCtx;
-        public Map<String, String> requestHeaders = new HashMap<>();
-        public Map<String, String> responseHeaders = new HashMap<>();
-        public Principal peerPrincipal;
-        public X509Certificate[] peerCertificateChain;
-        public boolean isKeepAlive;
+        SocketContext socketCtx;
+        Map<String, String> requestHeaders;
+        Map<String, String> responseHeaders;
+        Principal peerPrincipal;
+        X509Certificate[] peerCertificateChain;
+        String connectionTag;
+        Map<String, String> cookies;
     }
 
     /**
@@ -201,18 +188,25 @@ public class Operation implements Cloneable {
         }
 
         public boolean isSystemUser() {
+            return isUserSubject(SystemUserService.SELF_LINK);
+        }
+
+        public boolean isGuestUser() {
+            return isUserSubject(GuestUserService.SELF_LINK);
+        }
+
+        private boolean isUserSubject(String userLink) {
             Claims claims = getClaims();
             if (claims == null) {
                 return false;
             }
-
             String subject = claims.getSubject();
             if (subject == null) {
                 return false;
             }
-
-            return subject.equals(SystemUserService.SELF_LINK);
+            return subject.equals(userLink);
         }
+
 
         public static class Builder {
             private AuthorizationContext authorizationContext;
@@ -255,15 +249,77 @@ public class Operation implements Cloneable {
                 return this;
             }
 
-            public Builder setResourceQueryFilterMap(Map<Action, QueryFilter> resourceQueryFiltersMap) {
+            public Builder setResourceQueryFilterMap(
+                    Map<Action, QueryFilter> resourceQueryFiltersMap) {
                 this.authorizationContext.resourceQueryFiltersMap = resourceQueryFiltersMap;
                 return this;
             }
         }
     }
 
-    public static enum OperationOption {
-        REPLICATED, REPLICATION_DISABLED, CLONING_DISABLED, NOTIFICATION_DISABLED, REPLICATED_TARGET
+    public enum OperationOption {
+        /**
+         * Set to request underlying support for overlapping operations on the same connection.
+         * For example, if set, and the service client is HTTP/2 aware, the operation will use the
+         * same connection as many others, pending, operations
+         */
+        CONNECTION_SHARING,
+
+        /**
+         * Set by the client to both request a long lived connection on out-bound requests,
+         * or indicate the operation was received on a long lived connection, for in-bound requests
+         */
+        KEEP_ALIVE,
+        /**
+         * Set on both out-bound and in-bound replicated updates
+         */
+        REPLICATED,
+
+        /**
+         * Set on both out-bound and in-bound forwarded requests
+         */
+        FORWARDED,
+
+        /**
+         * Set to prevent replication
+         */
+        REPLICATION_DISABLED,
+        /**
+         * Set by request listener to prevent cloning of the body during
+         * {@link Operation#setBody(Object)}
+         */
+        CLONING_DISABLED,
+        /**
+         * Set to prevent notifications being sent after the service handler completes the
+         * operation
+         */
+        NOTIFICATION_DISABLED,
+        /**
+         * Set if the target service is replicated
+         */
+        REPLICATED_TARGET,
+        /**
+         * Set by client to disable default logging of operation failures
+         */
+        FAILURE_LOGGING_DISABLED,
+        /**
+         * Set by a local {@code ServiceRequestListener} instance indicating the operation
+         * originated outside the process / host
+         */
+        REMOTE,
+        /**
+         * The operation exceeded the rate limit associated with it logical context
+         * (authorization subject by default)
+         */
+        RATE_LIMITED,
+
+        /**
+         * Infrastructure use only
+         *
+         * Set by transport/client to indicate the operation has an active socket
+         * channel associated with it.
+         */
+        SOCKET_ACTIVE
     }
 
     public static class SerializedOperation extends ServiceDocument {
@@ -279,6 +335,7 @@ public class Operation implements Cloneable {
         public EnumSet<OperationOption> options;
         public String contextId;
         public String transactionId;
+        public String userInfo;
 
         public static final ServiceDocumentDescription DESCRIPTION = Operation.SerializedOperation
                 .buildDescription();
@@ -289,8 +346,9 @@ public class Operation implements Cloneable {
             SerializedOperation ctx = new SerializedOperation();
             ctx.contextId = op.getContextId();
             ctx.action = op.action;
-            ctx.referer = op.referer;
+            ctx.referer = op.getReferer();
             ctx.id = op.id;
+            ctx.statusCode = op.statusCode;
             ctx.options = op.options.clone();
             ctx.transactionId = op.getTransactionId();
             if (op.uri != null) {
@@ -298,6 +356,7 @@ public class Operation implements Cloneable {
                 ctx.port = op.uri.getPort();
                 ctx.path = op.uri.getPath();
                 ctx.query = op.uri.getQuery();
+                ctx.userInfo = op.uri.getUserInfo();
             }
 
             Object body = op.getBodyRaw();
@@ -326,32 +385,122 @@ public class Operation implements Cloneable {
         }
     }
 
+    public static void fail(Operation request, int statusCode, int errorCode, Throwable e) {
+        request.setStatusCode(statusCode);
+        ServiceErrorResponse r = Utils.toServiceErrorResponse(e);
+        r.statusCode = statusCode;
+        r.errorCode = errorCode;
+
+        if (e instanceof ServiceNotFoundException) {
+            r.stackTrace = null;
+        }
+        request.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON).fail(e, r);
+    }
+
+    static void failOwnerMismatch(Operation op, String id, ServiceDocument body) {
+        String owner = body != null ? body.documentOwner : "";
+        op.setStatusCode(Operation.STATUS_CODE_CONFLICT);
+        Throwable e = new IllegalStateException(format(
+                "Owner in body: %s, computed locally: %s",
+                owner, id));
+        ServiceErrorResponse rsp = ServiceErrorResponse.create(e, op.getStatusCode(),
+                EnumSet.of(ErrorDetail.SHOULD_RETRY));
+        rsp.setInternalErrorCode(ServiceErrorResponse.ERROR_CODE_OWNER_MISMATCH);
+        op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
+        op.fail(e, rsp);
+    }
+
+    public static void failActionNotSupported(Operation request) {
+
+        request.setStatusCode(Operation.STATUS_CODE_BAD_METHOD)
+                .setContentType(MEDIA_TYPE_APPLICATION_JSON)
+                .fail(new IllegalStateException("Action not supported: " + request.getAction()));
+    }
+
+    public static void failLimitExceeded(Operation request, int errorCode, String queueDescription) {
+        // Add a header indicating retry should be attempted after some interval.
+        // Currently set to just one second, subject to change in the future
+        request.addResponseHeader(Operation.RETRY_AFTER_HEADER, "1");
+        fail(request, Operation.STATUS_CODE_UNAVAILABLE,
+                errorCode,
+                new CancellationException(format("queue limit exceeded (%s)", queueDescription)));
+    }
+
+    public static void failForwardedRequest(Operation op, Operation fo, Throwable fe) {
+        op.setStatusCode(fo.getStatusCode());
+        op.setBodyNoCloning(fo.getBodyRaw()).setContentType(MEDIA_TYPE_APPLICATION_JSON).fail(fe);
+    }
+
+    public static void failServiceNotFound(Operation inboundOp) {
+        failServiceNotFound(inboundOp,
+                ServiceErrorResponse.ERROR_CODE_INTERNAL_MASK);
+    }
+
+    public static void failServiceNotFound(Operation inboundOp, int errorCode,
+            String errorMsg) {
+        fail(inboundOp, Operation.STATUS_CODE_NOT_FOUND,
+                errorCode,
+                new ServiceNotFoundException(inboundOp.getUri().toString(), errorMsg));
+    }
+
+    public static void failServiceNotFound(Operation inboundOp, int errorCode) {
+        fail(inboundOp, Operation.STATUS_CODE_NOT_FOUND,
+                errorCode,
+                new ServiceNotFoundException(inboundOp.getUri().toString()));
+    }
+
+    static void failServiceMarkedDeleted(String documentSelfLink,
+            Operation serviceStartPost) {
+        fail(serviceStartPost, Operation.STATUS_CODE_CONFLICT,
+                ServiceErrorResponse.ERROR_CODE_STATE_MARKED_DELETED,
+                new IllegalStateException("Service marked deleted: "
+                        + documentSelfLink));
+    }
+
     // HTTP Header definitions
     public static final String REFERER_HEADER = "referer";
+    public static final String CONNECTION_HEADER = "connection";
     public static final String CONTENT_TYPE_HEADER = "content-type";
+    public static final String CONTENT_ENCODING_HEADER = "content-encoding";
+    public static final String CONTENT_LENGTH_HEADER = "content-length";
     public static final String CONTENT_RANGE_HEADER = "content-range";
     public static final String RANGE_HEADER = "range";
     public static final String RETRY_AFTER_HEADER = "retry-after";
     public static final String PRAGMA_HEADER = "pragma";
     public static final String SET_COOKIE_HEADER = "set-cookie";
+    public static final String COOKIE_HEADER = "cookie";
     public static final String LOCATION_HEADER = "location";
     public static final String USER_AGENT_HEADER = "user-agent";
+    public static final String HOST_HEADER = "host";
     public static final String ACCEPT_HEADER = "accept";
+    public static final String ACCEPT_ENCODING_HEADER = "accept-encoding";
+    public static final String AUTHORIZATION_HEADER = "authorization";
+    public static final String ACCEPT_LANGUAGE_HEADER = "accept-language";
+    public static final String TRANSFER_ENCODING_HEADER = "transfer-encoding";
+    public static final String CHUNKED_ENCODING = "chunked";
+    public static final String LAST_EVENT_ID_HEADER = "last-event-id";
+
+    // HTTP2 Header definitions
+    public static final String STREAM_ID_HEADER = "x-http2-stream-id";
+    public static final String STREAM_WEIGHT_HEADER = "x-http2-stream-weight";
+    public static final String HTTP2_SCHEME_HEADER = "x-http2-scheme";
 
     // Proprietary header definitions
     public static final String HEADER_NAME_PREFIX = "x-xenon-";
     public static final String CONTEXT_ID_HEADER = HEADER_NAME_PREFIX + "ctx-id";
-    public static final String REQUEST_CALLBACK_LOCATION_HEADER = HEADER_NAME_PREFIX
-            + "req-location";
-    public static final String RESPONSE_CALLBACK_STATUS_HEADER = HEADER_NAME_PREFIX
-            + "rsp-status";
     public static final String REQUEST_AUTH_TOKEN_HEADER = HEADER_NAME_PREFIX
             + "auth-token";
     public static final String REPLICATION_PHASE_HEADER = HEADER_NAME_PREFIX
             + "rpl-phase";
-    public static final String VMWARE_DCP_TRANSACTION_HEADER = HEADER_NAME_PREFIX
+    public static final String REPLICATION_QUORUM_HEADER = HEADER_NAME_PREFIX
+            + "rpl-quorum";
+    public static final String REPLICATION_PARENT_HEADER = HEADER_NAME_PREFIX + "rpl-parent";
+    public static final String REPLICATION_QUORUM_HEADER_VALUE_ALL = HEADER_NAME_PREFIX
+            + "all";
+    public static final String TRANSACTION_HEADER = HEADER_NAME_PREFIX
             + "tx-phase";
     public static final String TRANSACTION_ID_HEADER = HEADER_NAME_PREFIX + "tx-id";
+    public static final String TRANSACTION_REFLINK_HEADER = HEADER_NAME_PREFIX + "tx-reflink";
 
     /**
      * Infrastructure use only. Set when a service is first created due to a client request. Since
@@ -374,19 +523,39 @@ public class Operation implements Cloneable {
     public static final String PRAGMA_DIRECTIVE_REPLICATED = "xn-rpl";
 
     /**
-     * Infrastructure use only. Set when the consensus protocol determines that a service instance,
-     * on the owner node, must synchronize its state with peers. Associated with a PUT action.
+     * Infrastructure use only. Set when the Synchronization task makes a POST request
+     * to trigger synchronization of a service instance. This post request is processed
+     * by the OWNER of the service instance.
      */
-    public static final String PRAGMA_DIRECTIVE_SYNCH = "xn-synch";
+    public static final String PRAGMA_DIRECTIVE_SYNCH_OWNER = "xn-synch-owner";
 
     /**
-     * Advanced use. Prevents the request from getting queued, if a service is not yet available.
+     * Infrastructure use only. Set when the owner node of a service instance
+     * computes the best state as part of synchronization and broadcasts the
+     * best state to all peer nodes.
      */
-    public static final String PRAGMA_DIRECTIVE_NO_QUEUING = "xn-no-queuing";
+    public static final String PRAGMA_DIRECTIVE_SYNCH_PEER = "xn-synch-peer";
 
     /**
-     * Advanced use. Instructs the runtime to queue a request, for a service to become available
-     * independent of the service options.
+     * Infrastructure use only. Set when all versions, not just the latest, need
+     * to be synchronized.
+     */
+    public static final String PRAGMA_DIRECTIVE_SYNCH_ALL_VERSIONS = "xn-synch-all-ver";
+
+    /**
+     * Infrastructure use only. Set when all versions, not just the latest, need
+     * to be synchronized.
+     */
+    public static final String PRAGMA_DIRECTIVE_SYNCH_HISTORICAL_VERSIONS = "xn-synch-hist-ver";
+
+    /**
+     * Infrastructure use only. Set on a synchPeer request when a specific historical
+     * version needs to be synchronized.
+     */
+    public static final String PRAGMA_DIRECTIVE_SYNCH_VERSION = "xn-synch-ver";
+
+    /**
+     * Advanced use. Instructs the runtime to queue a request, for a service to become available.
      */
     public static final String PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY = "xn-queue";
 
@@ -406,11 +575,6 @@ public class Operation implements Cloneable {
      * due to state updates occurring when the subscriber was not available.
      */
     public static final String PRAGMA_DIRECTIVE_SKIPPED_NOTIFICATIONS = "xn-nt-skipped";
-
-    /**
-     * Infrastructure use only. Experimental. Forces the use of HTTP2 streams.
-     */
-    public static final String PRAGMA_DIRECTIVE_USE_HTTP2 = "xn-use-http2";
 
     /**
      *  Infrastructure use only. Does a strict update version check and if the service exists or
@@ -441,12 +605,47 @@ public class Operation implements Cloneable {
     public static final String PRAGMA_DIRECTIVE_NO_INDEX_UPDATE = "xn-no-index-update";
 
     /**
+     * Infrastructure use only. Instructs AuthorizationContextService to treat this as a request to
+     * clear the authz cache
+     */
+    public static final String PRAGMA_DIRECTIVE_CLEAR_AUTH_CACHE = "xn-clear-auth-cache";
+
+    /**
      * Infrastructure use only. Debugging only. Indicates this operation was converted from POST to PUT
-     * due to {@link ServiceOption.IDEMPOTENT_POST}
+     * due to {@link com.vmware.xenon.common.Service.ServiceOption#IDEMPOTENT_POST}
      */
     public static final String PRAGMA_DIRECTIVE_POST_TO_PUT = "xn-post-to-put";
 
-    public static final String TX_TRY_COMMIT = "try-commit";
+    /**
+     * Infrastructure use only. Instructs AuthenticationService to treat this as a request to
+     * authenticate and retrieve the auth token
+     */
+    public static final String PRAGMA_DIRECTIVE_AUTHENTICATE = "xn-authn";
+
+    /**
+     * Infrastructure use only. Instructs AuthenticationService to treat this as a request to
+     * verify the auth token
+     */
+    public static final String PRAGMA_DIRECTIVE_VERIFY_TOKEN = "xn-verify-token";
+
+    /**
+     * Infrastructure use only. Instructs AuthenticationService to treat this as a request to
+     * logout and invalidate the auth token
+     */
+    public static final String PRAGMA_DIRECTIVE_AUTHN_INVALIDATE = "xn-authn-invalidate";
+
+    /**
+     * Set when a MigrationTaskService invokes operations against the destination cluster.
+     */
+    public static final String PRAGMA_DIRECTIVE_FROM_MIGRATION_TASK = "xn-from-migration";
+
+    /**
+     * Infrastructure use only. Indicate document state was not modified by the update request.
+     * When this pragma is set in handler methods, rest of the pipeline will not update the
+     * indexed/cached state.
+     */
+    public static final String PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED = "xn-state-not-modified";
+
     public static final String TX_ENSURE_COMMIT = "ensure-commit";
     public static final String TX_COMMIT = "commit";
     public static final String TX_ABORT = "abort";
@@ -455,6 +654,7 @@ public class Operation implements Cloneable {
     public static final String MEDIA_TYPE_APPLICATION_JSON = "application/json";
     public static final String MEDIA_TYPE_TEXT_YAML = "text/x-yaml";
     public static final String MEDIA_TYPE_APPLICATION_OCTET_STREAM = "application/octet-stream";
+    public static final String MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM = "application/kryo-octet-stream";
     public static final String MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED = "application/x-www-form-urlencoded";
     public static final String MEDIA_TYPE_TEXT_HTML = "text/html";
     public static final String MEDIA_TYPE_TEXT_PLAIN = "text/plain";
@@ -462,6 +662,9 @@ public class Operation implements Cloneable {
     public static final String MEDIA_TYPE_APPLICATION_JAVASCRIPT = "application/javascript";
     public static final String MEDIA_TYPE_IMAGE_SVG_XML = "image/svg+xml";
     public static final String MEDIA_TYPE_APPLICATION_FONT_WOFF2 = "application/font-woff2";
+    public static final String MEDIA_TYPE_TEXT_EVENT_STREAM = "text/event-stream";
+
+    public static final String CONTENT_ENCODING_GZIP = "gzip";
 
     public static final int STATUS_CODE_SERVER_FAILURE_THRESHOLD = HttpURLConnection.HTTP_INTERNAL_ERROR;
     public static final int STATUS_CODE_FAILURE_THRESHOLD = HttpURLConnection.HTTP_BAD_REQUEST;
@@ -475,26 +678,31 @@ public class Operation implements Cloneable {
     public static final int STATUS_CODE_MOVED_PERM = HttpURLConnection.HTTP_MOVED_PERM;
     public static final int STATUS_CODE_MOVED_TEMP = HttpURLConnection.HTTP_MOVED_TEMP;
     public static final int STATUS_CODE_OK = HttpURLConnection.HTTP_OK;
+    public static final int STATUS_CODE_CREATED = HttpURLConnection.HTTP_CREATED;
     public static final int STATUS_CODE_ACCEPTED = HttpURLConnection.HTTP_ACCEPTED;
     public static final int STATUS_CODE_BAD_REQUEST = HttpURLConnection.HTTP_BAD_REQUEST;
     public static final int STATUS_CODE_BAD_METHOD = HttpURLConnection.HTTP_BAD_METHOD;
+    public static final int STATUS_CODE_INTERNAL_ERROR = HttpURLConnection.HTTP_INTERNAL_ERROR;
 
     public static final String MEDIA_TYPE_EVERYTHING_WILDCARDS = "*/*";
     public static final String EMPTY_JSON_BODY = "{}";
     public static final String HEADER_FIELD_VALUE_SEPARATOR = ":";
     public static final String CR_LF = "\r\n";
 
-    private static AtomicLong idCounter = new AtomicLong();
-    private static AtomicReferenceFieldUpdater<Operation, CompletionHandler> completionUpdater = AtomicReferenceFieldUpdater
-            .newUpdater(Operation.class, CompletionHandler.class,
-                    "completion");
+    private static final char DIRECTIVE_PRAGMA_VALUE_SEPARATOR_CHAR_CONST = ';';
+    private static final char HEADER_FIELD_VALUE_SEPARATOR_CHAR_CONST = ':';
+
+    private static final AtomicLong idCounter = new AtomicLong();
+    private static final AtomicReferenceFieldUpdater<Operation, CompletionHandler> completionUpdater = AtomicReferenceFieldUpdater
+            .newUpdater(Operation.class, CompletionHandler.class, "completion");
 
     private URI uri;
-    private URI referer;
+    private Object referer;
     private final long id = idCounter.incrementAndGet();
-    private int statusCode = HttpURLConnection.HTTP_OK;
+    private int statusCode = Operation.STATUS_CODE_OK;
     private Action action;
     private ServiceDocument linkedState;
+    private byte[] linkedSerializedState;
     private volatile CompletionHandler completion;
     private String contextId;
     private String transactionId;
@@ -506,11 +714,14 @@ public class Operation implements Cloneable {
     private RemoteContext remoteCtx;
     private AuthorizationContext authorizationCtx;
     private InstrumentationContext instrumentationCtx;
-    private Map<String, String> cookies;
     private short retryCount;
     private short retriesRemaining;
 
-    public EnumSet<OperationOption> options = EnumSet.noneOf(OperationOption.class);
+    private EnumSet<OperationOption> options = EnumSet.of(OperationOption.KEEP_ALIVE);
+
+    private volatile Consumer<ServerSentEvent> serverSentEventHandler;
+
+    private volatile Consumer<Operation> headersReceivedHandler;
 
     public static Operation create(SerializedOperation ctx, ServiceHost host) {
         Operation op = new Operation();
@@ -519,23 +730,27 @@ public class Operation implements Cloneable {
         op.expirationMicrosUtc = ctx.documentExpirationTimeMicros;
         op.setContextId(ctx.id.toString());
         op.referer = ctx.referer;
-        op.uri = UriUtils.buildUri(host, ctx.path, ctx.query);
+        op.uri = UriUtils.buildUri(host, ctx.path, ctx.query, ctx.userInfo);
         op.transactionId = ctx.transactionId;
         return op;
+    }
+
+    public Operation() {
+        // Set operation context from thread local.
+        // The thread local is populated by the service host when it handles an operation,
+        // which means that derivative operations will automatically inherit this context.
+        // It is set as early as possible since there is a possibility that it is
+        // overridden by the service implementation (i.e. when it impersonates).
+        OperationContext opCtx = OperationContext.getOperationContextNoCloning();
+        this.authorizationCtx = opCtx.authContext;
+        this.transactionId = opCtx.transactionId;
+        this.contextId = opCtx.contextId;
     }
 
     static Operation createOperation(Action action, URI uri) {
         Operation op = new Operation();
         op.uri = uri;
         op.action = action;
-
-        // Set authorization context from thread local.
-        // The thread local is populated by the service host when it handles an operation,
-        // which means that derivative operations will automatically inherit this context.
-        // It is set as early as possible since there is a possibility that it is
-        // overridden by the service implementation (i.e. when it impersonates).
-        op.authorizationCtx = OperationContext.getAuthorizationContext();
-
         return op;
     }
 
@@ -618,7 +833,33 @@ public class Operation implements Cloneable {
     @Override
     public String toString() {
         SerializedOperation sop = SerializedOperation.create(this);
+        if (sop.jsonBody != null && sop.jsonBody.length() > TO_STRING_SERIALIZED_BODY_LIMIT) {
+            // Avoiding logging the entire body, which could be huge, and overwhelm the logs.
+            // Keep just an arbitrary prefix, serving as a hint
+            sop.jsonBody = sop.jsonBody.substring(0, TO_STRING_SERIALIZED_BODY_LIMIT);
+        }
         return Utils.toJsonHtml(sop);
+    }
+
+    /**
+     * Returns a string summary of the operation appropriate for logging
+     */
+    public String toLogString() {
+        StringBuilder sb = Utils.getBuilder();
+        sb.append(this.action.toString()).append(" ")
+                .append(this.getUri()).append(" ")
+                .append(this.id).append(" ")
+                .append(this.getRefererAsString()).append(" ");
+        if (this.contextId != null) {
+            sb.append("[ctxId] ").append(this.contextId);
+        }
+        if (this.transactionId != null) {
+            sb.append("[txId] ").append(this.transactionId);
+        }
+        if (this.authorizationCtx != null && this.authorizationCtx.claims != null) {
+            sb.append("[subject] ").append(this.authorizationCtx.claims.getSubject());
+        }
+        return sb.toString();
     }
 
     @Override
@@ -627,29 +868,21 @@ public class Operation implements Cloneable {
         try {
             clone = (Operation) super.clone();
         } catch (CloneNotSupportedException e) {
-            clone = new Operation();
+            throw new AssertionError(e);
         }
 
+        // Clone mutable fields
+        // body is always cloned on set, so no need to re-clone
         clone.options = EnumSet.copyOf(this.options);
-        clone.action = this.action;
-        clone.completion = this.completion;
-        clone.expirationMicrosUtc = this.expirationMicrosUtc;
-        clone.referer = this.referer;
-        clone.uri = this.uri;
-        clone.contentLength = this.contentLength;
-        clone.contentType = this.contentType;
-        clone.retriesRemaining = this.retriesRemaining;
-        clone.retryCount = this.retryCount;
-
-        if (this.cookies != null) {
-            clone.cookies = new HashMap<>(this.cookies);
-        }
 
         if (this.remoteCtx != null) {
             clone.remoteCtx = new RemoteContext();
+            if (this.remoteCtx.cookies != null) {
+                clone.remoteCtx.cookies = new HashMap<>(this.remoteCtx.cookies);
+            }
             // do not clone socket context
             clone.remoteCtx.socketCtx = null;
-            if (!this.remoteCtx.requestHeaders.isEmpty()) {
+            if (this.remoteCtx.requestHeaders != null && !this.remoteCtx.requestHeaders.isEmpty()) {
                 clone.remoteCtx.requestHeaders = new HashMap<>(this.remoteCtx.requestHeaders);
             }
             clone.remoteCtx.peerPrincipal = this.remoteCtx.peerPrincipal;
@@ -658,33 +891,37 @@ public class Operation implements Cloneable {
                         this.remoteCtx.peerCertificateChain,
                         this.remoteCtx.peerCertificateChain.length);
             }
+            clone.remoteCtx.connectionTag = this.remoteCtx.connectionTag;
         }
 
-        // Direct copy of authorization context; it is immutable
-        clone.authorizationCtx = this.authorizationCtx;
-        clone.transactionId = this.transactionId;
-        clone.contextId = this.contextId;
-
-        // body is always cloned on set, so no need to re-clone
-        clone.body = this.body;
         return clone;
     }
 
     private void allocateRemoteContext() {
-        if (this.remoteCtx != null) {
-            return;
+        if (this.remoteCtx == null) {
+            this.remoteCtx = new RemoteContext();
         }
-        this.remoteCtx = new RemoteContext();
+    }
+
+    private void allocateRequestHeaders() {
+        if (this.remoteCtx.requestHeaders == null) {
+            this.remoteCtx.requestHeaders = new HashMap<>();
+        }
+    }
+
+    private void allocateResponseHeaders() {
+        if (this.remoteCtx.responseHeaders == null) {
+            this.remoteCtx.responseHeaders = new HashMap<>();
+        }
     }
 
     public boolean isRemote() {
-        return this.remoteCtx != null && this.remoteCtx.socketCtx != null;
+        return this.options.contains(OperationOption.REMOTE) ||
+                (this.remoteCtx != null && this.remoteCtx.socketCtx != null);
     }
 
     public Operation forceRemote() {
-        allocateRemoteContext();
-        this.remoteCtx.socketCtx = new SocketContext();
-        return this;
+        return toggleOption(OperationOption.REMOTE, true);
     }
 
     public AuthorizationContext getAuthorizationContext() {
@@ -694,13 +931,9 @@ public class Operation implements Cloneable {
     /**
      * Sets (overwrites) the authorization context of this operation.
      *
-     * The visibility of this method is intentionally package-local. It is intended to
-     * only be called by functions in this package, so that we can apply whitelisting
-     * to limit the set of services that is able to set it.
-     *
-     * @param ctx the authorization context to set.
+     * Infrastructure use only.
      */
-    Operation setAuthorizationContext(AuthorizationContext ctx) {
+    public Operation setAuthorizationContext(AuthorizationContext ctx) {
         this.authorizationCtx = ctx;
         return this;
     }
@@ -729,7 +962,7 @@ public class Operation implements Cloneable {
 
     public Operation setBody(Object body) {
         if (body != null) {
-            if (isCloningDisabled()) {
+            if (hasOption(OperationOption.CLONING_DISABLED)) {
                 this.body = body;
             } else {
                 this.body = Utils.clone(body);
@@ -756,6 +989,18 @@ public class Operation implements Cloneable {
         return this;
     }
 
+    public ServiceErrorResponse getErrorResponseBody() {
+        if (!hasBody()) {
+            return null;
+        }
+        ServiceErrorResponse rsp = getBody(ServiceErrorResponse.class);
+        if (rsp.message == null && rsp.statusCode == 0) {
+            // very likely not a error response body
+            return null;
+        }
+        return rsp;
+    }
+
     /**
      * Deserializes the body associated with the operation, given the type.
      *
@@ -764,7 +1009,7 @@ public class Operation implements Cloneable {
      * occurs only for local operations, not operations that have a serialized
      * body already attached (in the form of a JSON string).
      *
-     * If idempotent behavior is desired, use {@link getBodyRaw}
+     * If idempotent behavior is desired, use {@link #getBodyRaw}
      */
     @SuppressWarnings("unchecked")
     public <T> T getBody(Class<T> type) {
@@ -773,10 +1018,16 @@ public class Operation implements Cloneable {
         }
 
         if (this.body != null && !(this.body instanceof String)) {
+            if (this.contentType != null && Utils.isContentTypeKryoBinary(this.contentType)
+                    && this.body instanceof byte[]) {
+                byte[] bytes = (byte[])this.body;
+                this.body = KryoSerializers.deserializeDocument(bytes, 0, bytes.length);
+                this.serializedBody = Utils.toJson(this.body);
+                return (T) this.body;
+            }
 
-            if (this.isRemote()
-                    && (this.contentType == null || !this.contentType
-                            .contains(MEDIA_TYPE_APPLICATION_JSON))) {
+            if (this.contentType == null
+                    || !this.contentType.contains(MEDIA_TYPE_APPLICATION_JSON)) {
                 throw new IllegalStateException("content type is not JSON: " + this.contentType);
             }
 
@@ -798,7 +1049,8 @@ public class Operation implements Cloneable {
                 try {
                     this.body = Utils.fromJson(this.body, type);
                 } catch (com.google.gson.JsonSyntaxException e) {
-                    throw new IllegalArgumentException("Unparseable JSON body: " + e.getMessage());
+                    throw new IllegalArgumentException("Unparseable JSON body: " + e.getMessage(),
+                            e);
                 }
             } else {
                 throw new IllegalArgumentException(
@@ -833,12 +1085,17 @@ public class Operation implements Cloneable {
         return this;
     }
 
-    public void setCookies(Map<String, String> cookies) {
-        this.cookies = cookies;
+    public Operation setCookies(Map<String, String> cookies) {
+        allocateRemoteContext();
+        this.remoteCtx.cookies = cookies;
+        return this;
     }
 
     public Map<String, String> getCookies() {
-        return this.cookies;
+        if (this.remoteCtx == null) {
+            return null;
+        }
+        return this.remoteCtx.cookies;
     }
 
     public int getRetriesRemaining() {
@@ -847,6 +1104,10 @@ public class Operation implements Cloneable {
 
     public int getRetryCount() {
         return this.retryCount;
+    }
+
+    public int incrementRetryCount() {
+        return ++this.retryCount;
     }
 
     public Operation setRetryCount(int retryCount) {
@@ -864,6 +1125,76 @@ public class Operation implements Cloneable {
     public Operation setCompletion(CompletionHandler completion) {
         this.completion = completion;
         return this;
+    }
+
+    /**
+     * Takes two discrete callback handlers for completion.
+     *
+     * For completion that does not share code between success and failure paths, this should be the
+     * preferred alternative.
+     *
+     * @param successHandler called at successful operation completion
+     * @param failureHandler called at failure operation completion
+     * @return operation
+     */
+    public Operation setCompletion(Consumer<Operation> successHandler,
+            CompletionHandler failureHandler) {
+        this.completion = (op, e) -> {
+            if (e != null) {
+                failureHandler.handle(op, e);
+                return;
+            }
+            successHandler.accept(op);
+        };
+        return this;
+    }
+
+    /**
+     * Sets the handler to be invoked upon receiving {@link ServerSentEvent}.
+     * @param serverSentEventHandler called when {@link ServerSentEvent} is received
+     * @return operation
+     */
+    public Operation setServerSentEventHandler(Consumer<ServerSentEvent> serverSentEventHandler) {
+        this.serverSentEventHandler = serverSentEventHandler;
+        return this;
+    }
+
+    /**
+     * Inserts a handler in LIFO style.
+     * @see #nestHeadersReceivedHandler(Consumer)
+     * @see #nestCompletion(CompletionHandler)
+     * @param serverSentEventHandler
+     * @return
+     */
+    public Operation nestServerSentEventHandler(Consumer<ServerSentEvent> serverSentEventHandler) {
+        if (this.serverSentEventHandler != null) {
+            serverSentEventHandler = serverSentEventHandler.andThen(this.serverSentEventHandler);
+        }
+        return this.setServerSentEventHandler(serverSentEventHandler);
+    }
+
+    /**
+     * Sets the handler to be invoked upon receiving the headers.
+     * @param handler called after the headers are received.
+     * @return operation
+     */
+    public Operation setHeadersReceivedHandler(Consumer<Operation> handler) {
+        this.headersReceivedHandler = handler;
+        return this;
+    }
+
+    /**
+     * Inserts a handler in LIFO style.
+     * @see #nestServerSentEventHandler(Consumer)
+     * @see #nestCompletion(CompletionHandler)
+     * @param handler
+     * @return
+     */
+    public Operation nestHeadersReceivedHandler(Consumer<Operation> handler) {
+        if (this.headersReceivedHandler != null) {
+            handler = handler.andThen(this.headersReceivedHandler);
+        }
+        return this.setHeadersReceivedHandler(handler);
     }
 
     public CompletionHandler getCompletion() {
@@ -894,13 +1225,52 @@ public class Operation implements Cloneable {
         return this.linkedState;
     }
 
+    /**
+     * Infrastructure use only
+     */
+    byte[] getLinkedSerializedState() {
+        return this.linkedSerializedState;
+    }
+
+    boolean hasLinkedSerializedState() {
+        return this.linkedSerializedState != null;
+    }
+
     public Operation setReferer(URI uri) {
         this.referer = uri;
         return this;
     }
 
+    public Operation setReferer(String uri) {
+        this.referer = uri;
+        return this;
+    }
+
+    public Operation transferRefererFrom(Operation op) {
+        this.referer = op.referer;
+        return this;
+    }
+
+    public boolean hasReferer() {
+        return this.referer != null;
+    }
+
     public URI getReferer() {
-        return this.referer;
+        if (this.referer instanceof String) {
+            try {
+                this.referer = new URI((String) this.referer);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+        return (URI) this.referer;
+    }
+
+    public String getRefererAsString() {
+        if (this.referer == null) {
+            return null;
+        }
+        return this.referer.toString();
     }
 
     public Operation setAction(Action action) {
@@ -930,6 +1300,10 @@ public class Operation implements Cloneable {
         return this.expirationMicrosUtc;
     }
 
+    /**
+     * Sets the expiration using the supplied absolute time value, that should be in microseconds
+     * since epoch
+     */
     public Operation setExpiration(long futureMicrosUtc) {
         this.expirationMicrosUtc = futureMicrosUtc;
         return this;
@@ -947,19 +1321,83 @@ public class Operation implements Cloneable {
         fail(e, null);
     }
 
+    /**
+     * Sends a &quot;server sent event&quot;. See <a href=https://www.w3.org/TR/eventsource/>SSE specification</a>}
+     * @param event The event to send.
+     */
+    public void sendServerSentEvent(ServerSentEvent event) {
+        if (this.serverSentEventHandler == null) {
+            return;
+        }
+
+        // Keep track of current operation context
+        OperationContext originalContext = OperationContext.getOperationContext();
+        try {
+            OperationContext.setFrom(this);
+            this.serverSentEventHandler.accept(event);
+        } catch (Exception outer) {
+            Utils.logWarning("Uncaught failure inside serverSentEventHandler: %s", Utils.toString(outer));
+        } finally {
+            // Restore original context
+            OperationContext.setFrom(originalContext);
+        }
+    }
+
+    /**
+     * Sends the headers to the channel.
+     * This effectively enables streaming.
+     */
+    public void sendHeaders() {
+        if (this.headersReceivedHandler == null) {
+            return;
+        }
+
+        // Keep track of current operation context
+        OperationContext originalContext = OperationContext.getOperationContext();
+        try {
+            OperationContext.setFrom(this);
+            this.headersReceivedHandler.accept(this);
+        } catch (Exception outer) {
+            Utils.logWarning("Uncaught failure inside headersReceivedHandler: %s", Utils.toString(outer));
+        } finally {
+            // Restore original context
+            OperationContext.setFrom(originalContext);
+        }
+    }
+
+    /**
+     * Send the appropriate headers and prepare the connection for streaming.
+     */
+    public void startEventStream() {
+        setContentType(MEDIA_TYPE_TEXT_EVENT_STREAM);
+        addResponseHeader(Operation.TRANSFER_ENCODING_HEADER, Operation.CHUNKED_ENCODING);
+        sendHeaders();
+    }
+
     public void fail(int statusCode) {
         setStatusCode(statusCode);
         switch (statusCode) {
         case STATUS_CODE_FORBIDDEN:
             fail(new IllegalAccessError("forbidden"));
             break;
+        case STATUS_CODE_TIMEOUT:
+            fail(new TimeoutException());
+            break;
         default:
-            fail(new Exception("request failed, no additional details provided"));
+            fail(new Exception("request failed with " + statusCode + ", no additional details provided"));
             break;
         }
     }
 
+    public void fail(int statusCode, Throwable e, Object failureBody) {
+        this.statusCode = statusCode;
+        fail(e, failureBody);
+    }
+
     public void fail(Throwable e, Object failureBody) {
+        // force "application/json" for error response
+        this.contentType = Operation.MEDIA_TYPE_APPLICATION_JSON;
+
         if (this.statusCode < STATUS_CODE_FAILURE_THRESHOLD) {
             this.statusCode = STATUS_CODE_SERVER_FAILURE_THRESHOLD;
         }
@@ -981,7 +1419,7 @@ public class Operation implements Cloneable {
                     if (rsp.message != null) {
                         hasErrorResponseBody = true;
                     }
-                } catch (Throwable ex) {
+                } catch (Exception ex) {
                     // the body is not JSON, ignore
                 }
             } else {
@@ -1000,13 +1438,12 @@ public class Operation implements Cloneable {
             ServiceErrorResponse rsp;
             if (Utils.isValidationError(e)) {
                 this.statusCode = STATUS_CODE_BAD_REQUEST;
-                rsp = Utils.toValidationErrorResponse(e);
+                rsp = Utils.toValidationErrorResponse(e, this);
             } else {
                 rsp = Utils.toServiceErrorResponse(e);
             }
             rsp.statusCode = this.statusCode;
-            setBodyNoCloning(rsp).setContentType(
-                    Operation.MEDIA_TYPE_APPLICATION_JSON);
+            setBodyNoCloning(rsp).setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
         }
 
         completeOrFail(e);
@@ -1025,53 +1462,116 @@ public class Operation implements Cloneable {
             return;
         }
 
-        // Keep track of current authorization context so that code AFTER "op.complete()"
-        // or "op.fail()" retains its authorization context, and is not overwritten by
-        // the one associated with "op" (which might be different.
-        AuthorizationContext originalContext = OperationContext.getAuthorizationContext();
-        OperationContext.setAuthorizationContext(this.getAuthorizationContext());
-
+        // Keep track of current operation context so that code AFTER "op.complete()"
+        // or "op.fail()" retains its operation context, and is not overwritten by
+        // the one associated with "op" (which might be different).
+        OperationContext originalContext = OperationContext.getOperationContext();
         try {
-            OperationContext.setContextId(this.contextId);
+            OperationContext.setFrom(this);
             c.handle(this, e);
-        } catch (Throwable outer) {
+        } catch (Exception outer) {
             Utils.logWarning("Uncaught failure inside completion: %s", Utils.toString(outer));
         }
 
         // Restore original context
-        OperationContext.setAuthorizationContext(originalContext);
+        OperationContext.setFrom(originalContext);
     }
 
     public boolean hasBody() {
         return this.body != null;
     }
 
+    /**
+     * Add CompletionHandler in LIFO style.
+     *
+     * This is symmetric to {@link #appendCompletion(CompletionHandler)}.
+     * <pre>
+     * {@code
+     *   op.setCompletion(ORG);
+     *   op.nestCompletion(A);
+     *   op.nestCompletion(B);
+     *   // complete() will trigger: B -> A -> ORG
+     * }
+     * </pre>
+     */
     public Operation nestCompletion(CompletionHandler h) {
         CompletionHandler existing = this.completion;
-
-        setCompletion((o, e) -> {
-            setCompletion(existing);
-            setStatusCode(o.getStatusCode());
+        this.completion = (o, e) -> {
+            this.statusCode = o.statusCode;
+            this.completion = existing;
             h.handle(o, e);
-        });
+        };
         return this;
+    }
+
+    /**
+     * Add CompletionHandler in LIFO style, with support for cloned operations.
+     *
+     * This is a workaround for https://www.pivotaltracker.com/story/show/151798288
+     * which has some complications for a root cause fix.
+     *
+     * This is symmetric to {@link #appendCompletion(CompletionHandler)}.
+     * <pre>
+     * {@code
+     *   op.setCompletion(ORG);
+     *   op.nestCompletion(A);
+     *   op.nestCompletion(B);
+     *   // complete() will trigger: B -> A -> ORG
+     * }
+     * </pre>
+     */
+    public Operation nestCompletionCloneSafe(CompletionHandler h) {
+        final CompletionHandler existing = this.completion;
+        this.completion = (o, e) -> {
+            this.statusCode = o.statusCode;
+            o.completion = existing;
+            h.handle(o, e);
+        };
+        return this;
+
     }
 
     public void nestCompletion(Consumer<Operation> successHandler) {
         CompletionHandler existing = this.completion;
-
-        setCompletion((o, e) -> {
-            setCompletion(existing);
+        this.completion = (o, e) -> {
+            this.statusCode = o.statusCode;
+            this.completion = existing;
             if (e != null) {
-                o.fail(e);
+                fail(e);
                 return;
             }
             try {
                 successHandler.accept(o);
-            } catch (Throwable ex) {
-                o.fail(ex);
+            } catch (Exception ex) {
+                fail(ex);
             }
-        });
+        };
+    }
+
+    /**
+     * Add CompletionHandler in FIFO style.
+     *
+     * This is symmetric to {@link #nestCompletion(CompletionHandler)}.
+     * <pre>
+     * {@code
+     *   op.setCompletion(ORG);
+     *   op.addCompletion(A);
+     *   op.addCompletion(B);
+     *   // complete() will trigger: ORG -> A -> B
+     * }
+     * </pre>
+     */
+    public Operation appendCompletion(CompletionHandler h) {
+        CompletionHandler existing = this.completion;
+        if (existing == null) {
+            this.completion = h;
+        } else {
+            this.completion = (o, e) -> {
+                o.nestCompletion(h);
+                existing.handle(o, e);
+            };
+        }
+        return this;
     }
 
     Operation addHeader(String headerLine, boolean isResponse) {
@@ -1079,8 +1579,8 @@ public class Operation implements Cloneable {
             throw new IllegalArgumentException("headerLine is required");
         }
 
-        int idx = headerLine.indexOf(HEADER_FIELD_VALUE_SEPARATOR);
-        if (idx == -1 || idx < 3) {
+        int idx = headerLine.indexOf(HEADER_FIELD_VALUE_SEPARATOR_CHAR_CONST);
+        if (idx < 3) {
             throw new IllegalArgumentException("headerLine does not appear valid");
         }
 
@@ -1095,40 +1595,62 @@ public class Operation implements Cloneable {
     }
 
     public Operation addRequestHeader(String name, String value) {
+        return addRequestHeader(name, value, true);
+    }
+
+    private Operation addRequestHeader(String name, String value, boolean normalize) {
         allocateRemoteContext();
-        value = value.replace(CR_LF, "").trim();
-        this.remoteCtx.requestHeaders.put(name.toLowerCase(), value);
+        allocateRequestHeaders();
+        if (normalize) {
+            value = removeString(value, CR_LF).trim();
+            name = name.toLowerCase();
+        }
+        this.remoteCtx.requestHeaders.put(name, value);
         return this;
     }
 
     public Operation addResponseHeader(String name, String value) {
         allocateRemoteContext();
-        value = value.replace(CR_LF, "");
+        allocateResponseHeaders();
+        value = removeString(value, CR_LF).trim();
         this.remoteCtx.responseHeaders.put(name.toLowerCase(), value);
         return this;
     }
 
     public Operation addResponseCookie(String key, String value) {
-        StringBuilder buf = new StringBuilder()
-                .append(key)
-                .append('=')
-                .append(value);
-        addResponseHeader(SET_COOKIE_HEADER, buf.toString());
+        addResponseHeader(SET_COOKIE_HEADER, key + '=' + value);
         return this;
     }
 
-    public Operation addPragmaDirective(String directive) {
-        allocateRemoteContext();
-        directive = directive.toLowerCase();
-        String existingDirectives = getRequestHeader(PRAGMA_HEADER);
-        if (existingDirectives != null) {
-            if (!existingDirectives.contains(directive)) {
-                directive = existingDirectives + ";" + directive;
+    private String removeString(String value, String delete) {
+        int i = 0;
+        while ((i = value.indexOf(delete, i)) != -1) {
+            if (i == 0) {
+                value = value.substring(i + delete.length());
+            } else if (i + delete.length() == value.length()) {
+                value = value.substring(0, i);
             } else {
-                directive = existingDirectives;
+                value = value.substring(0, i) + value.substring(i + delete.length());
             }
         }
-        addRequestHeader(PRAGMA_HEADER, directive);
+        return value;
+    }
+
+    /**
+     * Add a directive. Lower case strings must be used.
+     */
+    public Operation addPragmaDirective(String directive) {
+        String existingDirectives = getRequestHeader(PRAGMA_HEADER, false);
+        if (existingDirectives != null) {
+            if (indexOfPragmaDirective(existingDirectives, directive) != -1) {
+                return this;
+            }
+
+            directive = existingDirectives + DIRECTIVE_PRAGMA_VALUE_SEPARATOR_CHAR_CONST
+                    + directive;
+        }
+        directive = removeString(directive, CR_LF).trim();
+        addRequestHeader(PRAGMA_HEADER, directive, false);
         return this;
     }
 
@@ -1136,60 +1658,132 @@ public class Operation implements Cloneable {
      * Checks if a directive is present. Lower case strings must be used.
      */
     public boolean hasPragmaDirective(String directive) {
-        String existingDirectives = getRequestHeader(PRAGMA_HEADER);
-        if (existingDirectives != null
-                && existingDirectives.contains(directive)) {
-            return true;
+        String existingDirectives = getRequestHeaderAsIs(PRAGMA_HEADER);
+        return existingDirectives != null
+                && indexOfPragmaDirective(existingDirectives, directive) != -1;
+    }
+
+    /**
+     * Checks if a directive is present. Lower case strings must be used.
+     */
+    public boolean hasAnyPragmaDirective(List<String> directives) {
+        String existingDirectives = getRequestHeaderAsIs(PRAGMA_HEADER);
+        if (existingDirectives == null) {
+            return false;
+        }
+
+        for (String directive : directives) {
+            if (indexOfPragmaDirective(existingDirectives, directive) != -1) {
+                return true;
+            }
         }
         return false;
     }
 
     /**
-     * Removes a directive. Lower case strings must be used
+     * Removes a directive. Lower case strings must be used.
      */
     public Operation removePragmaDirective(String directive) {
-        allocateRemoteContext();
-        String existingDirectives = getRequestHeader(PRAGMA_HEADER);
+        String existingDirectives = getRequestHeaderAsIs(PRAGMA_HEADER);
         if (existingDirectives != null) {
-            directive = existingDirectives.replace(directive, "");
+            int i = indexOfPragmaDirective(existingDirectives, directive);
+            if (i == -1) {
+                return this;
+            }
+
+            if (i == 0) {
+                existingDirectives = existingDirectives.substring(i + directive.length());
+            } else {
+                existingDirectives = existingDirectives.substring(0, i - 1) + existingDirectives
+                        .substring(i + directive.length());
+            }
+
+            addRequestHeader(PRAGMA_HEADER, existingDirectives, false);
         }
-        addRequestHeader(PRAGMA_HEADER, directive);
         return this;
     }
 
+    int indexOfPragmaDirective(String existingDirectives, String directive) {
+        int i = 0;
+        while ((i = existingDirectives.indexOf(directive, i)) != -1) {
+            // make sure sure we fully match the directive
+            if (i + directive.length() == existingDirectives.length()
+                    || existingDirectives.charAt(i + directive.length())
+                    == DIRECTIVE_PRAGMA_VALUE_SEPARATOR_CHAR_CONST) {
+                return i;
+            }
+
+            i++;
+        }
+
+        return -1;
+    }
+
     public boolean isKeepAlive() {
-        return this.remoteCtx == null ? false : this.remoteCtx.isKeepAlive;
+        return this.remoteCtx != null && hasOption(OperationOption.KEEP_ALIVE);
     }
 
     public Operation setKeepAlive(boolean isKeepAlive) {
         allocateRemoteContext();
-        this.remoteCtx.isKeepAlive = isKeepAlive;
+        toggleOption(OperationOption.KEEP_ALIVE, isKeepAlive);
         return this;
     }
 
-    void setHandlerInvokeTime(long nowMicrosUtc) {
-        allocateInstrumentationContext();
-        this.instrumentationCtx.handleInvokeTimeMicrosUtc = nowMicrosUtc;
+    /**
+     * Sets a tag used to pool out bound connections together. The service request client uses this
+     * tag as a hint, in addition with the operation URI host name and port, to determine connection
+     * re-use for requests
+     */
+    public Operation setConnectionTag(String tag) {
+        allocateRemoteContext();
+        this.remoteCtx.connectionTag = tag;
+        return this;
     }
 
-    void setEnqueueTime(long nowMicrosUtc) {
-        allocateInstrumentationContext();
-        this.instrumentationCtx.enqueueTimeMicrosUtc = nowMicrosUtc;
+    public String getConnectionTag() {
+        return this.remoteCtx == null ? null : this.remoteCtx.connectionTag;
     }
 
-    void setHandlerCompletionTime(long nowMicrosUtc) {
-        allocateInstrumentationContext();
-        this.instrumentationCtx.handlerCompletionTime = nowMicrosUtc;
+    public Operation toggleOption(OperationOption option, boolean enable) {
+        if (enable) {
+            this.options.add(option);
+        } else {
+            this.options.remove(option);
+        }
+        return this;
     }
 
-    void setDocumentStoreCompletionTime(long nowMicrosUtc) {
-        allocateInstrumentationContext();
-        this.instrumentationCtx.documentStoreCompletionTimeMicrosUtc = nowMicrosUtc;
+    public boolean hasOption(OperationOption option) {
+        return this.options.contains(option);
     }
 
-    void setCompletionTime(long nowMicrosUtc) {
+    public EnumSet<OperationOption> getOptions() {
+        return EnumSet.copyOf(this.options);
+    }
+
+    void setHandlerInvokeTime(long nowMicros) {
         allocateInstrumentationContext();
-        this.instrumentationCtx.operationCompletionTimeMicrosUtc = nowMicrosUtc;
+        this.instrumentationCtx.handleInvokeTimeMicros = nowMicros;
+    }
+
+    void setEnqueueTime(long nowMicros) {
+        allocateInstrumentationContext();
+        this.instrumentationCtx.enqueueTimeMicros = nowMicros;
+    }
+
+    void setHandlerCompletionTime(long nowMicros) {
+        allocateInstrumentationContext();
+        this.instrumentationCtx.handlerCompletionTimeMicros = nowMicros;
+    }
+
+    void setDocumentStoreCompletionTime(long nowMicros) {
+        allocateInstrumentationContext();
+        this.instrumentationCtx.documentStoreCompletionTimeMicros = nowMicros;
+    }
+
+    void setCompletionTime(long nowMicros) {
+        allocateInstrumentationContext();
+        this.instrumentationCtx.operationCompletionTimeMicros = nowMicros;
     }
 
     private void allocateInstrumentationContext() {
@@ -1203,59 +1797,136 @@ public class Operation implements Cloneable {
         return this.instrumentationCtx;
     }
 
+    /**
+     * Toggles logging of failures.
+     * The default is to log failures on all operations if no completion is supplied, or
+     * if the operation is a service start operation. To disable the default failure
+     * logs invoke this method passing true for the argument.
+     */
+    public Operation disableFailureLogging(boolean disable) {
+        toggleOption(OperationOption.FAILURE_LOGGING_DISABLED, disable);
+        return this;
+    }
+
+    public boolean isFailureLoggingDisabled() {
+        return hasOption(OperationOption.FAILURE_LOGGING_DISABLED);
+    }
+
     public Operation setReplicationDisabled(boolean disable) {
-        if (disable) {
-            this.options.add(OperationOption.REPLICATION_DISABLED);
-        } else {
-            this.options.remove(OperationOption.REPLICATION_DISABLED);
-        }
+        toggleOption(OperationOption.REPLICATION_DISABLED, disable);
         return this;
     }
 
     public boolean isReplicationDisabled() {
-        return this.options.contains(OperationOption.REPLICATION_DISABLED);
+        return hasOption(OperationOption.REPLICATION_DISABLED);
     }
 
+    /**
+     * Prefer using {@link #getRequestHeader(String)} for retrieving entries
+     * and {@link #addRequestHeader(String, String)} for adding entries.
+     */
     public Map<String, String> getRequestHeaders() {
-        if (this.remoteCtx == null) {
-            return new HashMap<>();
-        }
+        allocateRemoteContext();
+        allocateRequestHeaders();
         return this.remoteCtx.requestHeaders;
     }
 
+    /**
+     * Prefer using {@link #getResponseHeader(String)} for retrieving entries
+     * and {@link #addResponseHeader(String, String)} for adding entries.
+     */
     public Map<String, String> getResponseHeaders() {
-        if (this.remoteCtx == null) {
-            return new HashMap<>();
-        }
+        allocateRemoteContext();
+        allocateResponseHeaders();
         return this.remoteCtx.responseHeaders;
     }
 
+    public boolean hasResponseHeaders() {
+        return this.remoteCtx != null && this.remoteCtx.responseHeaders != null
+                && !this.remoteCtx.responseHeaders.isEmpty();
+    }
+
+    public boolean hasRequestHeaders() {
+        return this.remoteCtx != null && this.remoteCtx.requestHeaders != null
+                && !this.remoteCtx.requestHeaders.isEmpty();
+    }
+
     public String getRequestHeader(String headerName) {
-        if (this.remoteCtx == null) {
+        return getRequestHeader(headerName, true);
+    }
+
+    /**
+     * Retrieves header from request headers, skipping normalization
+     */
+    public String getRequestHeaderAsIs(String headerName) {
+        return getRequestHeader(headerName, false);
+    }
+
+    /**
+     * Retrieves and removes header from request headers, skipping normalization
+     */
+    public String getAndRemoveRequestHeaderAsIs(String headerName) {
+        if (!hasRequestHeaders()) {
             return null;
         }
-        if (this.remoteCtx.requestHeaders == null) {
+        return this.remoteCtx.requestHeaders.remove(headerName);
+    }
+
+    private String getRequestHeader(String headerName, boolean normalize) {
+        if (!hasRequestHeaders()) {
             return null;
         }
-        String value = this.remoteCtx.requestHeaders.get(headerName.toLowerCase());
-        if (value != null) {
-            value = value.trim().replace(CR_LF, "");
+        String value = this.remoteCtx.requestHeaders.get(headerName);
+        if (!normalize) {
+            return value;
         }
-        return value;
+
+        if (value == null) {
+            value = this.remoteCtx.requestHeaders.get(headerName.toLowerCase());
+            if (value == null) {
+                return null;
+            }
+        }
+        return removeString(value.trim(), CR_LF);
     }
 
     public String getResponseHeader(String headerName) {
-        if (this.remoteCtx == null) {
+        return getResponseHeader(headerName, true);
+    }
+
+    /**
+     * Retrieves header from response headers, skipping normalization
+     */
+    public String getResponseHeaderAsIs(String headerName) {
+        return getResponseHeader(headerName, false);
+    }
+
+    /**
+     * Retrieves and removes header from response headers, skipping normalization
+     */
+    public String getAndRemoveResponseHeaderAsIs(String headerName) {
+        if (!hasResponseHeaders()) {
             return null;
         }
-        if (this.remoteCtx.responseHeaders == null) {
+        return this.remoteCtx.responseHeaders.remove(headerName);
+    }
+
+    private String getResponseHeader(String headerName, boolean normalize) {
+        if (!hasResponseHeaders()) {
             return null;
         }
-        String value = this.remoteCtx.responseHeaders.get(headerName.toLowerCase());
-        if (value != null) {
-            value = value.trim().replace(CR_LF, "");
+        String value = this.remoteCtx.responseHeaders.get(headerName);
+        if (!normalize) {
+            return value;
         }
-        return value;
+
+        if (value == null) {
+            value = this.remoteCtx.responseHeaders.get(headerName.toLowerCase());
+            if (value == null) {
+                return null;
+            }
+        }
+        return removeString(value.trim(), CR_LF);
     }
 
     public Principal getPeerPrincipal() {
@@ -1283,41 +1954,20 @@ public class Operation implements Cloneable {
     }
 
     /**
-     * Value indicating the service target is replicated and might not yet be available. Set this to
-     * true to enable availability registration for a service that might not be locally present yet.
-     * It prevents the operation failing with 404 (not found)
-     *
-     * @param enable - true or false
-     * @return
-     */
-    public Operation setTargetReplicated(boolean enable) {
-        if (enable) {
-            this.options.add(OperationOption.REPLICATED_TARGET);
-        } else {
-            this.options.remove(OperationOption.REPLICATED_TARGET);
-        }
-        return this;
-    }
-
-    /**
      * Value indicating whether the target service is replicated and might not yet be available
      * locally
      *
      * @return
      */
     public boolean isTargetReplicated() {
-        return this.options.contains(OperationOption.REPLICATED_TARGET);
+        return hasOption(OperationOption.REPLICATED_TARGET);
     }
 
     /**
      * Infrastructure use only
      */
     public Operation setFromReplication(boolean isFromReplication) {
-        if (isFromReplication) {
-            this.options.add(OperationOption.REPLICATED);
-        } else {
-            this.options.remove(OperationOption.REPLICATED);
-        }
+        toggleOption(OperationOption.REPLICATED, isFromReplication);
         return this;
     }
 
@@ -1327,7 +1977,24 @@ public class Operation implements Cloneable {
      * Value indicating whether this operation was created to apply locally a remote update
      */
     public boolean isFromReplication() {
-        return this.options.contains(OperationOption.REPLICATED);
+        return hasOption(OperationOption.REPLICATED);
+    }
+
+    /**
+     * Infrastructure use only
+     */
+    public Operation setConnectionSharing(boolean enable) {
+        toggleOption(OperationOption.CONNECTION_SHARING, enable);
+        return this;
+    }
+
+    /**
+     * Infrastructure use only.
+     *
+     * Value indicating whether this operation is sharing a connection
+     */
+    public boolean isConnectionSharing() {
+        return hasOption(OperationOption.CONNECTION_SHARING);
     }
 
     /**
@@ -1336,43 +2003,7 @@ public class Operation implements Cloneable {
      * Value indicating whether this operation was forwarded from a peer node
      */
     public boolean isForwarded() {
-        return this.hasPragmaDirective(PRAGMA_DIRECTIVE_FORWARDED);
-    }
-
-    public String getRequestCallbackLocation() {
-        if (this.remoteCtx == null) {
-            return null;
-        }
-        return this.remoteCtx.requestHeaders
-                .get(REQUEST_CALLBACK_LOCATION_HEADER);
-    }
-
-    public String getResponseCallbackStatus() {
-        if (this.remoteCtx == null) {
-            return null;
-        }
-        return this.remoteCtx.requestHeaders
-                .get(RESPONSE_CALLBACK_STATUS_HEADER);
-    }
-
-    public Operation removeRequestCallbackLocation() {
-        allocateRemoteContext();
-        this.remoteCtx.requestHeaders.remove(REQUEST_CALLBACK_LOCATION_HEADER);
-        return this;
-    }
-
-    public Operation setRequestCallbackLocation(URI location) {
-        allocateRemoteContext();
-        this.remoteCtx.requestHeaders.put(REQUEST_CALLBACK_LOCATION_HEADER,
-                location == null ? null : location.toString());
-        return this;
-    }
-
-    public Operation setResponseCallbackStatus(int status) {
-        allocateRemoteContext();
-        this.remoteCtx.requestHeaders.put(RESPONSE_CALLBACK_STATUS_HEADER,
-                Integer.toString(status));
-        return this;
+        return this.hasOption(OperationOption.FORWARDED);
     }
 
     /**
@@ -1380,15 +2011,13 @@ public class Operation implements Cloneable {
      * headers with the same name already present on this instance will be overwritten.
      */
     public Operation transferResponseHeadersFrom(Operation op) {
-        if (op.remoteCtx == null || op.remoteCtx.responseHeaders == null
-                || op.remoteCtx.responseHeaders.isEmpty()) {
+        if (!op.hasResponseHeaders()) {
             return this;
         }
 
         allocateRemoteContext();
-        for (Entry<String, String> e : op.getResponseHeaders().entrySet()) {
-            this.remoteCtx.responseHeaders.put(e.getKey(), e.getValue());
-        }
+        allocateResponseHeaders();
+        this.remoteCtx.responseHeaders.putAll(op.getResponseHeaders());
         return this;
     }
 
@@ -1397,58 +2026,36 @@ public class Operation implements Cloneable {
      * headers with the same name already present on this instance will be overwritten.
      */
     public Operation transferRequestHeadersFrom(Operation op) {
-        if (op.remoteCtx == null || op.remoteCtx.requestHeaders == null
-                || op.remoteCtx.requestHeaders.isEmpty()) {
+        if (!op.hasRequestHeaders()) {
             return this;
         }
 
         allocateRemoteContext();
-        for (Entry<String, String> e : op.getRequestHeaders().entrySet()) {
-            this.remoteCtx.requestHeaders.put(e.getKey(), e.getValue());
-        }
+        allocateRequestHeaders();
+        this.remoteCtx.requestHeaders.putAll(op.getRequestHeaders());
         return this;
     }
 
     public Operation transferResponseHeadersToRequestHeadersFrom(Operation op) {
-        if (op.remoteCtx == null || op.remoteCtx.responseHeaders == null
-                || op.remoteCtx.responseHeaders.isEmpty()) {
+        if (!op.hasResponseHeaders()) {
             return this;
         }
 
         allocateRemoteContext();
-        for (Entry<String, String> e : op.getResponseHeaders().entrySet()) {
-            this.remoteCtx.requestHeaders.put(e.getKey(), e.getValue());
-        }
+        allocateRequestHeaders();
+        this.remoteCtx.requestHeaders.putAll(op.getResponseHeaders());
         return this;
     }
 
     public Operation transferRequestHeadersToResponseHeadersFrom(Operation op) {
-        if (op.remoteCtx == null || op.remoteCtx.requestHeaders == null
-                || op.remoteCtx.requestHeaders.isEmpty()) {
+        if (!op.hasRequestHeaders()) {
             return this;
         }
 
         allocateRemoteContext();
-        for (Entry<String, String> e : op.getRequestHeaders().entrySet()) {
-            this.remoteCtx.responseHeaders.put(e.getKey(), e.getValue());
-        }
+        allocateResponseHeaders();
+        this.remoteCtx.responseHeaders.putAll(op.getRequestHeaders());
         return this;
-    }
-
-    /**
-     * Infrastructure use only.
-     *
-     * If cloning is disabled, setBody() will not
-     * clone the supplied argument. Requests received from external clients
-     * can avoid the overhead of cloning a response body by disabling cloning
-     */
-    public Operation setCloningDisabled(boolean disable) {
-        this.options.add(OperationOption.CLONING_DISABLED);
-        return this;
-    }
-
-    public boolean isCloningDisabled() {
-        return this.options.contains(OperationOption.CLONING_DISABLED);
     }
 
     public boolean isNotification() {
@@ -1456,28 +2063,51 @@ public class Operation implements Cloneable {
     }
 
     public Operation setNotificationDisabled(boolean disable) {
-        if (disable) {
-            this.options.add(OperationOption.NOTIFICATION_DISABLED);
-        } else {
-            this.options.remove(OperationOption.NOTIFICATION_DISABLED);
-        }
+        toggleOption(OperationOption.NOTIFICATION_DISABLED, disable);
         return this;
     }
 
     public boolean isNotificationDisabled() {
-        return this.options.contains(OperationOption.NOTIFICATION_DISABLED);
+        return hasOption(OperationOption.NOTIFICATION_DISABLED);
     }
 
-    boolean isForwardingDisabled() {
+    public boolean isForwardingDisabled() {
         return hasPragmaDirective(PRAGMA_DIRECTIVE_NO_FORWARDING);
     }
 
-    boolean isCommit() {
-        String phase = getRequestHeader(Operation.REPLICATION_PHASE_HEADER);
+    /**
+     * Infrastructure use only.
+     *
+     * Value indicating whether this operation is a commit phase replication request.
+     */
+    public boolean isCommit() {
+        String phase = getRequestHeader(Operation.REPLICATION_PHASE_HEADER, false);
         return Operation.REPLICATION_PHASE_COMMIT.equals(phase);
     }
 
-    boolean isSynchronize() {
-        return hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH);
+    /**
+     * Indicate whether this operation is a synchronization operation.
+     */
+    public boolean isSynchronize() {
+        return isSynchronizeOwner() || isSynchronizePeer();
+    }
+
+    public boolean isSynchronizeOwner() {
+        return hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER);
+    }
+
+    public boolean isSynchronizePeer() {
+        return hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER);
+    }
+
+    public boolean isUpdate() {
+        return this.getAction() == Action.PUT || this.getAction() == Action.PATCH;
+    }
+
+    /**
+     * Infrastructure use only
+     */
+    void linkSerializedState(byte[] data) {
+        this.linkedSerializedState = data;
     }
 }

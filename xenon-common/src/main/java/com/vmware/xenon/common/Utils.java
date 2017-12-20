@@ -13,12 +13,16 @@
 
 package com.vmware.xenon.common;
 
-import java.io.File;
+import static com.vmware.xenon.common.ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS;
+import static com.vmware.xenon.common.serialization.GsonSerializers.getJsonMapperFor;
+
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.io.UnsupportedEncodingException;
-import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Type;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -26,69 +30,81 @@ import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
+import java.util.Collection;
 import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
+import java.util.HashSet;
 import java.util.Map;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 import com.esotericsoftware.kryo.Kryo;
-import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.google.gson.reflect.TypeToken;
 
+import com.vmware.xenon.common.NodeSelectorService.SelectOwnerResponse;
+import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
+import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
-import com.vmware.xenon.common.logging.StackAwareLogRecord;
-import com.vmware.xenon.common.serialization.BufferThreadLocal;
+import com.vmware.xenon.common.serialization.GsonSerializers;
 import com.vmware.xenon.common.serialization.JsonMapper;
-import com.vmware.xenon.common.serialization.KryoSerializers.KryoForDocumentThreadLocal;
-import com.vmware.xenon.common.serialization.KryoSerializers.KryoForObjectThreadLocal;
+import com.vmware.xenon.common.serialization.KryoSerializers;
 import com.vmware.xenon.services.common.ServiceUriPaths;
-
-class DigestThreadLocal extends ThreadLocal<MessageDigest> {
-    @Override
-    protected MessageDigest initialValue() {
-        return Utils.createDigest();
-    }
-}
 
 /**
  * Runtime utility functions
  */
-public class Utils {
-    private static final int BUFFER_INITIAL_CAPACITY = 1 * 1024;
-    private static final String CHARSET_UTF_8 = "UTF-8";
+public final class Utils {
+
     public static final String PROPERTY_NAME_PREFIX = "xenon.";
-    public static final String CHARSET = CHARSET_UTF_8;
+    public static final Charset CHARSET_OBJECT = StandardCharsets.UTF_8;
+    public static final String CHARSET = "UTF-8";
     public static final String UI_DIRECTORY_NAME = "ui";
+    public static final String PROPERTY_NAME_TIME_COMPARISON = "timeComparisonEpsilonMicros";
 
-    private static final char[] HEX_CHARS = "0123456789abcdef".toCharArray();
-    private static final String HASH_NAME_SHA_1 = "SHA-1";
-    public static final String DEFAULT_CONTENT_HASH = HASH_NAME_SHA_1;
+    /**
+     * Number of IO threads is used for the HTTP selector event processing. Most of the
+     * work is done in the context of the service host executor so we just use a couple of threads.
+     * Performance work indicates any more threads do not help, rather, they hurt throughput
+     */
+    public static final int DEFAULT_IO_THREAD_COUNT = Math.min(2, Runtime.getRuntime()
+            .availableProcessors());
 
+    /**
+     * Number of threads used for the service host executor and shared across service instances.
+     * We add to the total count since the executor will also be used to process I/O selector
+     * events, which will consume threads. Using much more than the number of processors hurts
+     * operation processing throughput.
+     */
     public static final int DEFAULT_THREAD_COUNT = Math.max(4, Runtime.getRuntime()
             .availableProcessors());
+
+    /**
+     * See {@link #setTimeDriftThreshold(long)}
+     */
+    public static final long DEFAULT_TIME_DRIFT_THRESHOLD_MICROS = TimeUnit.SECONDS.toMicros(1);
 
     /**
      * {@link #isReachableByPing} launches a separate ping process to ascertain whether a given IP
@@ -97,37 +113,21 @@ public class Utils {
      */
     private static final long PING_LAUNCH_TOLERANCE_MS = 50;
 
-    private static final KryoForObjectThreadLocal kryoForObjectPerThread = new KryoForObjectThreadLocal();
-    private static final KryoForDocumentThreadLocal kryoForDocumentPerThread = new KryoForDocumentThreadLocal();
-    private static final DigestThreadLocal digestPerThread = new DigestThreadLocal();
-    private static final BufferThreadLocal bufferPerThread = new BufferThreadLocal();
+    private static final ThreadLocal<CharsetDecoder> decodersPerThread = ThreadLocal
+            .withInitial(CHARSET_OBJECT::newDecoder);
 
-    private static final JsonMapper JSON = new JsonMapper();
-    private static final ConcurrentMap<Class<?>, JsonMapper> CUSTOM_JSON = new ConcurrentHashMap<>();
+    private static final AtomicLong previousTimeValue = new AtomicLong();
+    private static long timeComparisonEpsilon = initializeTimeEpsilon();
+    private static long timeDriftThresholdMicros = DEFAULT_TIME_DRIFT_THRESHOLD_MICROS;
 
-    private static JsonMapper getJsonMapperFor(Type type) {
-        if (type instanceof Class) {
-            return getJsonMapperFor((Class<?>) type);
-        } else if (type instanceof ParameterizedType) {
-            Type rawType = ((ParameterizedType) type).getRawType();
-            return getJsonMapperFor(rawType);
-        } else {
-            return JSON;
-        }
-    }
 
-    private static JsonMapper getJsonMapperFor(Object instance) {
-        if (instance == null) {
-            return JSON;
-        }
-        return getJsonMapperFor(instance.getClass());
-    }
+    private static final ConcurrentMap<String, String> KINDS = new ConcurrentSkipListMap<>();
+    private static final ConcurrentMap<String, Class<?>> KIND_TO_TYPE = new ConcurrentSkipListMap<>();
 
-    private static JsonMapper getJsonMapperFor(Class<?> type) {
-        if (type.isArray() && type != byte[].class) {
-            type = type.getComponentType();
-        }
-        return CUSTOM_JSON.getOrDefault(type, JSON);
+
+    private static final StringBuilderThreadLocal builderPerThread = new StringBuilderThreadLocal();
+
+    private Utils() {
     }
 
     /**
@@ -146,30 +146,41 @@ public class Utils {
      */
     public static void registerCustomJsonMapper(Class<?> clazz,
             JsonMapper mapper) {
-        CUSTOM_JSON.putIfAbsent(clazz, mapper);
+        GsonSerializers.registerCustomJsonMapper(clazz, mapper);
+    }
+
+    /**
+     * Registers a thread local variable that supplies {@link Kryo} instances used to serialize
+     * documents or objects. The KRYO instance supplied must be identical across all nodes in
+     * a node group and behave exactly the same way regardless of service start order.
+     *
+     * This method must be called before any service host is created inside the process, to avoid
+     * non deterministic behavior, where some serialization actions use the build in instances,
+     * while others use the user supplied ones
+     * @param kryoThreadLocal Thread local variable that supplies the KRYO instance
+     * @param isDocumentSerializer True if instance should by used for
+     * {@link Utils#toBytes(Object, byte[], int)} and
+     * {@link Utils#fromBytes(byte[], int, int)}
+     */
+    public static void registerCustomKryoSerializer(ThreadLocal<Kryo> kryoThreadLocal,
+            boolean isDocumentSerializer) {
+        KryoSerializers.register(kryoThreadLocal, isDocumentSerializer);
     }
 
     public static <T> T clone(T t) {
-        Kryo k = kryoForDocumentPerThread.get();
-        T clone = k.copy(t);
-        return clone;
+        return KryoSerializers.clone(t);
     }
 
     public static <T> T cloneObject(T t) {
-        Kryo k = kryoForObjectPerThread.get();
-        T clone = k.copy(t);
-        k.reset();
-        return clone;
+        return KryoSerializers.cloneObject(t);
     }
 
-    public static String computeSignature(ServiceDocument s,
-            ServiceDocumentDescription description) {
+    public static String computeSignature(ServiceDocument s, ServiceDocumentDescription description) {
         if (description == null) {
             throw new IllegalArgumentException("description is required");
         }
 
-        byte[] buffer = getBuffer(description.serializedStateSizeLimit);
-        int position = 0;
+        long hash = FNVHash.FNV_OFFSET_MINUS_MSB;
 
         for (PropertyDescription pd : description.propertyDescriptions.values()) {
             if (pd.indexingOptions != null) {
@@ -178,98 +189,145 @@ public class Utils {
                 }
             }
 
+            // Calculate hash of all non-excluded fields, to make sure the following:
+            // {a='1', b=null} != {a=null, b='1'}
             Object fieldValue = ReflectionUtils.getPropertyValue(pd, s);
-            if (pd.typeName == TypeName.COLLECTION || pd.typeName == TypeName.MAP
-                    || pd.typeName == TypeName.PODO) {
-                String content = Utils.toJson(fieldValue);
-                position = Utils.toBytes(content, buffer, position);
-            } else if (fieldValue != null) {
-                position = Utils.toBytes(fieldValue, buffer, position);
+            if (fieldValue == null) {
+                hash = FNVHash.compute(-1, hash);
+                continue;
+            }
+
+            switch (pd.typeName) {
+            case BYTES:
+                // special case for bytes to avoid base64 encoding
+                byte[] bytes = (byte[]) fieldValue;
+                hash = FNVHash.compute(bytes, 0, bytes.length, hash);
+                break;
+            default:
+                hash = GsonSerializers.hashJson(fieldValue, hash);
             }
         }
 
-        return computeHash(buffer, 0, position);
+        return Long.toHexString(hash);
     }
 
-    private static void appendJson(Object obj, Appendable buf) {
-        JsonMapper mapper = getJsonMapperFor(obj);
-        mapper.toJson(obj, buf);
-    }
-
+    /**
+     * See {@link KryoSerializers#getBuffer(int)}
+     */
     public static byte[] getBuffer(int capacity) {
-
-        byte[] buffer = bufferPerThread.get();
-        if (buffer.length < capacity) {
-            buffer = new byte[capacity];
-            bufferPerThread.set(buffer);
-        }
-
-        if (buffer.length > capacity * 10) {
-            buffer = new byte[capacity];
-            bufferPerThread.set(buffer);
-        }
-        return buffer;
+        return KryoSerializers.getBuffer(capacity);
     }
 
+
+    /**
+     * See {@link KryoSerializers#serializeObject(Object, byte[], int)}
+     */
     public static int toBytes(Object o, byte[] buffer, int position) {
-        Kryo k = kryoForObjectPerThread.get();
-        Output out = new Output(buffer);
-        out.setPosition(position);
-        k.writeClassAndObject(out, o);
-        return out.position();
+        return KryoSerializers.serializeObject(o, buffer, position);
     }
 
-    public static int toBytes(ServiceDocument o, byte[] buffer, int position) {
-        Kryo k = kryoForDocumentPerThread.get();
-        Output out = new Output(buffer);
-        out.setPosition(position);
-        k.writeClassAndObject(out, o);
-        return out.position();
-    }
-
+    /**
+     * See {@link KryoSerializers#deserializeObject(byte[], int, int)}
+     */
     public static Object fromBytes(byte[] bytes) {
-        return fromBytes(bytes, 0, bytes.length);
+        return KryoSerializers.deserializeObject(bytes, 0, bytes.length);
     }
 
-    public static Object fromBytes(byte[] bytes, int offset, int length) {
-        Kryo k = kryoForObjectPerThread.get();
-        Input in = new Input(bytes, offset, length);
-        return k.readClassAndObject(in);
+    /**
+     * See {@link KryoSerializers#deserializeObject(byte[], int, int)}
+     */
+    public static Object fromBytes(byte[] bytes, int position, int length) {
+        return KryoSerializers.deserializeObject(bytes, position, length);
     }
 
-    public static Object fromDocumentBytes(byte[] bytes, int offset, int length) {
-        Kryo k = kryoForDocumentPerThread.get();
-        Input in = new Input(bytes, offset, length);
-        return k.readClassAndObject(in);
+    /**
+     * Deserializes bytes into ServiceDocument.
+     * See {@link KryoSerializers#deserializeDocument(byte[], int, int)}
+     */
+    public static ServiceDocument fromQueryBinaryDocument(String link, Object binaryData) {
+        ServiceDocument serviceDocument = (ServiceDocument) KryoSerializers
+                .deserializeDocument((ByteBuffer) binaryData);
+        if (serviceDocument.documentSelfLink == null) {
+            serviceDocument.documentSelfLink = link;
+        }
+        if (serviceDocument.documentKind == null) {
+            serviceDocument.documentKind = Utils.buildKind(serviceDocument.getClass());
+        }
+        return serviceDocument;
     }
 
     public static void performMaintenance() {
 
     }
 
-    public static String computeHash(String content) {
-        byte[] source = content.getBytes(Charset.forName(CHARSET_UTF_8));
-        return computeHash(source, 0, source.length);
-    }
-
-    private static String computeHash(byte[] content, int offset, int length) {
-        MessageDigest digest = digestPerThread.get();
-        digest.update(content, offset, length);
-        byte[] hash = digest.digest();
-        return Utils.toHexString(hash);
+    public static String computeHash(CharSequence content) {
+        return Long.toHexString(FNVHash.compute(content));
     }
 
     public static String toJson(Object body) {
         if (body instanceof String) {
             return (String) body;
         }
-        StringBuilder content = new StringBuilder(BUFFER_INITIAL_CAPACITY);
-        appendJson(body, content);
+        StringBuilder content = getBuilder();
+        JsonMapper mapper = getJsonMapperFor(body);
+        mapper.toJson(body, content);
         return content.toString();
     }
 
     public static String toJsonHtml(Object body) {
-        return getJsonMapperFor(body).toJsonHtml(body);
+        if (body instanceof String) {
+            return (String) body;
+        }
+        StringBuilder content = getBuilder();
+        JsonMapper mapper = getJsonMapperFor(body);
+        mapper.toJsonHtml(body, content);
+        return content.toString();
+    }
+
+    /**
+     * Outputs a JSON representation of the given object using useHTMLFormatting to create pretty-printed,
+     * HTML-friendly JSON or compact JSON. If hideSensitiveFields is set the JSON will not include fields
+     * with the annotation {@link PropertyUsageOption#SENSITIVE}.
+     * If hideSensitiveFields is set and the Object is a string with JSON, sensitive fields cannot be discovered will
+     * throw an Exception.
+     *
+     * @deprecated Use {@link #toJson(Set, Object)} instead
+     */
+    @Deprecated
+    public static String toJson(boolean hideSensitiveFields, boolean useHtmlFormatting, Object body)
+            throws IllegalArgumentException {
+        Set<JsonMapper.JsonOptions> options = new HashSet<>();
+        if (hideSensitiveFields) {
+            options.add(JsonMapper.JsonOptions.EXCLUDE_SENSITIVE);
+        }
+        if (!useHtmlFormatting) {
+            options.add(JsonMapper.JsonOptions.COMPACT);
+        }
+
+        return toJson(options, body);
+    }
+
+    /**
+     * Outputs {@code body} to a JSON String format based on the provided JSON {@code options}
+     *
+     * @param options See {@link com.vmware.xenon.common.serialization.JsonMapper.JsonOptions} for
+     *                supported JSON output options. This cannot be null.
+     * @param body the object to serialize to JSON
+     * @return the JSON String
+     */
+    public static String toJson(Set<JsonMapper.JsonOptions> options, Object body) {
+        if (body instanceof String) {
+            if (options.contains(JsonMapper.JsonOptions.EXCLUDE_SENSITIVE)) {
+                throw new IllegalArgumentException(
+                        "Body is already a string, sensitive fields cannot be discovered");
+            }
+            return (String) body;
+        }
+        StringBuilder content = getBuilder();
+        JsonMapper mapper = getJsonMapperFor(body);
+
+        mapper.toJson(options, body, content);
+        return content.toString();
     }
 
     public static <T> T fromJson(String json, Class<T> clazz) {
@@ -285,17 +343,21 @@ public class Utils {
     }
 
     public static <T> T getJsonMapValue(Object json, String key, Class<T> valueClazz) {
-        Map<String, JsonElement> runtimeMap = Utils.fromJson(json,
-                new TypeToken<Map<String, JsonElement>>() {
-                }.getType());
-        return Utils.fromJson(runtimeMap.get(key), valueClazz);
+        JsonElement je = Utils.fromJson(json, JsonElement.class);
+        je = je.getAsJsonObject().get(key);
+        if (je == null) {
+            return null;
+        }
+        return Utils.fromJson(je, valueClazz);
     }
 
     public static <T> T getJsonMapValue(Object json, String key, Type valueType) {
-        Map<String, JsonElement> runtimeMap = Utils.fromJson(json,
-                new TypeToken<Map<String, JsonElement>>() {
-                }.getType());
-        return Utils.fromJson(runtimeMap.get(key), valueType);
+        JsonElement je = Utils.fromJson(json, JsonElement.class);
+        je = je.getAsJsonObject().get(key);
+        if (je == null) {
+            return null;
+        }
+        return Utils.fromJson(je, valueType);
     }
 
     public static String toString(Throwable t) {
@@ -318,54 +380,43 @@ public class Utils {
         return writer.toString();
     }
 
-    public static String getCurrentFileDirectory() {
-        try {
-            return new File(".").getCanonicalPath();
-        } catch (IOException e) {
-            Logger.getAnonymousLogger().warning(Utils.toString(e));
-            return null;
-        }
-    }
-
     public static void log(Class<?> type, String classOrUri, Level level, String fmt,
             Object... args) {
         Logger lg = Logger.getLogger(type.getName());
-        log(lg, 3, classOrUri, level, fmt, args);
+        log(lg, 3, classOrUri, level, () -> String.format(fmt, args));
+    }
+
+    public static void log(Class<?> type, String classOrUri, Level level,
+            Supplier<String> messageSupplier) {
+        Logger lg = Logger.getLogger(type.getName());
+        log(lg, 3, classOrUri, level, messageSupplier);
     }
 
     public static void log(Logger lg, Integer nestingLevel, String classOrUri, Level level,
-            String fmt,
-            Object... args) {
+            String fmt, Object... args) {
+        log(lg, nestingLevel, classOrUri, level, () -> String.format(fmt, args));
+    }
+
+    public static void log(Logger lg, Integer nestingLevel, String classOrUri, Level level,
+            Supplier<String> messageSupplier) {
+        if (!lg.isLoggable(level)) {
+            return;
+        }
         if (nestingLevel == null) {
             nestingLevel = 2;
         }
-        Level l = lg.getLevel();
-        Logger parent = lg.getParent();
-        while (l == null && parent != null) {
-            l = parent.getLevel();
-            if (l == null) {
-                parent = parent.getParent();
-            }
+
+        String message = messageSupplier.get();
+        LogRecord lr = new LogRecord(level, message);
+
+        StackTraceElement frame = StackFrameExtractor.getStackFrameAt(nestingLevel);
+        if (frame != null) {
+            lr.setSourceMethodName(frame.getMethodName());
         }
 
-        if (l == null) {
-            //Set default level
-            l = level;
-        }
-        if (l.intValue() > level.intValue()) {
-            return;
-        }
-
-        StackAwareLogRecord lr = new StackAwareLogRecord(level, String.format(fmt, args));
-        Exception e = new Exception();
-        StackTraceElement[] stacks = e.getStackTrace();
-        if (stacks.length > nestingLevel) {
-            StackTraceElement stack = stacks[nestingLevel];
-            lr.setStackElement(stack);
-            lr.setSourceMethodName(stack.getMethodName());
-        }
         lr.setSourceClassName(classOrUri);
         lr.setLoggerName(lg.getName());
+
         lg.log(lr);
     }
 
@@ -373,62 +424,61 @@ public class Utils {
         Logger.getAnonymousLogger().warning(String.format(fmt, args));
     }
 
-    private static AtomicLong prevTime = new AtomicLong();
-    private static long timeComparisonEpsilonMicros = TimeUnit.SECONDS.toMicros(120);
-
-    /**
-     * Return wall clock time, in microseconds since Unix Epoch (1/1/1970 UTC midnight). This
-     * functions guarantees time always moves forward, but it does not guarantee it does so in fixed
-     * intervals.
-     *
-     * @return
-     */
-    public static long getNowMicrosUtc() {
-        long now = System.currentTimeMillis() * 1000;
-        long time = prevTime.getAndIncrement();
-
-        // Only set time if current time is greater than our stored time.
-        if (now > time) {
-            // This CAS can fail; getAndIncrement() ensures no value is returned twice.
-            prevTime.compareAndSet(time + 1, now);
-            return prevTime.getAndIncrement();
-        }
-
-        return time;
+    public static String toDocumentKind(Class<?> type) {
+        return type.getCanonicalName().replace('.', ':');
     }
 
+    /**
+     * Obtain the canonical name for a class from the entry in the documentKind field
+     */
+    public static String fromDocumentKind(String kind) {
+        return kind.replace(':', '.');
+    }
+
+    /**
+     * Registers mapping between a type and document kind string the runtime
+     * will use for all services with that state type
+     */
+    public static String registerKind(Class<?> type, String kind) {
+        KIND_TO_TYPE.put(kind, type);
+        return KINDS.put(type.getName(), kind);
+    }
+
+    /**
+     * Obtain the class for the specified kind. Only classes registered via
+     * {@code Utils#registerKind(Class, String)} will be returned
+     */
+    public static Class<?> getTypeFromKind(String kind) {
+        return KIND_TO_TYPE.get(kind);
+    }
+
+    /**
+     * Builds a kind string from a type. It uses a cache to lookup the type to kind
+     * mapping. The mapping can be overridden with {@code Utils#registerKind(Class, String)}
+     */
     public static String buildKind(Class<?> type) {
-        return type.getCanonicalName().replace(".", ":");
+        return KINDS.computeIfAbsent(type.getName(), name -> toDocumentKind(type));
     }
 
     public static ServiceErrorResponse toServiceErrorResponse(Throwable e) {
         return ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST);
     }
 
-    public static String toServiceErrorResponseJson(Throwable e) {
-        return Utils.toJson(toServiceErrorResponse(e));
-    }
-
-    public static ServiceErrorResponse toValidationErrorResponse(Throwable t) {
+    public static ServiceErrorResponse toValidationErrorResponse(Throwable t, Operation op) {
         ServiceErrorResponse rsp = new ServiceErrorResponse();
-        rsp.message = t.getLocalizedMessage();
+
+        if (t instanceof LocalizableValidationException) {
+            String localizedMessage = LocalizationUtil.resolveMessage((LocalizableValidationException) t, op);
+            rsp.message = localizedMessage;
+        } else {
+            rsp.message = t.getLocalizedMessage();
+        }
         return rsp;
     }
 
     public static boolean isValidationError(Throwable e) {
-        return e instanceof IllegalArgumentException;
-    }
-
-    public static String toHexString(byte[] data) {
-        //http://stackoverflow.com/a/9855338
-        char[] sb = new char[data.length * 2];
-        for (int i = 0; i < data.length; i++) {
-            int v = data[i] & 0xFF;
-            sb[2 * i] = HEX_CHARS[v >>> 4];
-            sb[2 * i + 1] = HEX_CHARS[v & 0x0F];
-        }
-
-        return new String(sb);
+        return (e instanceof IllegalArgumentException)
+                || (e instanceof LocalizableValidationException);
     }
 
     /**
@@ -491,18 +541,14 @@ public class Utils {
         return jo;
     }
 
-    public static void setTimeComparisonEpsilonMicros(long micros) {
-        timeComparisonEpsilonMicros = micros;
-    }
-
-    public static long getTimeComparisonEpsilonMicros() {
-        return timeComparisonEpsilonMicros;
-    }
-
     public static String validateServiceOption(EnumSet<ServiceOption> options,
             ServiceOption option) {
-        EnumSet<ServiceOption> reqs = null;
-        EnumSet<ServiceOption> antiReqs = null;
+        if (!options.contains(option)) {
+            return null;
+        }
+
+        EnumSet<ServiceOption> reqs = EnumSet.noneOf(ServiceOption.class);
+        EnumSet<ServiceOption> antiReqs = EnumSet.noneOf(ServiceOption.class);
         switch (option) {
         case CONCURRENT_UPDATE_HANDLING:
             antiReqs = EnumSet.of(ServiceOption.OWNER_SELECTION,
@@ -519,6 +565,7 @@ public class Utils {
             antiReqs = EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.REPLICATION);
             break;
         case PERIODIC_MAINTENANCE:
+            antiReqs = EnumSet.of(ServiceOption.IMMUTABLE);
             break;
         case PERSISTENCE:
             break;
@@ -528,6 +575,8 @@ public class Utils {
             break;
         case IDEMPOTENT_POST:
             break;
+        case CORE:
+            break;
         case FACTORY:
             break;
         case FACTORY_ITEM:
@@ -535,6 +584,7 @@ public class Utils {
         case HTML_USER_INTERFACE:
             break;
         case INSTRUMENTATION:
+            antiReqs = EnumSet.of(ServiceOption.IMMUTABLE);
             break;
         case LIFO_QUEUE:
             break;
@@ -542,19 +592,26 @@ public class Utils {
             break;
         case UTILITY:
             break;
+        case IMMUTABLE:
+            reqs = EnumSet.of(ServiceOption.PERSISTENCE);
+            antiReqs = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE,
+                    ServiceOption.INSTRUMENTATION);
+            break;
+        case TRANSACTION_PENDING:
+            break;
+        case STATELESS:
+            antiReqs = EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.REPLICATION,
+                    ServiceOption.OWNER_SELECTION, ServiceOption.STRICT_UPDATE_CHECKING);
+            break;
         default:
             break;
         }
 
-        if (!options.contains(option)) {
+        if (reqs.isEmpty() && antiReqs.isEmpty()) {
             return null;
         }
 
-        if (reqs == null && antiReqs == null) {
-            return null;
-        }
-
-        if (reqs != null) {
+        if (!reqs.isEmpty()) {
             EnumSet<ServiceOption> missingReqs = EnumSet.noneOf(ServiceOption.class);
             for (ServiceOption r : reqs) {
                 if (!options.contains(r)) {
@@ -584,21 +641,73 @@ public class Utils {
         return null;
     }
 
-    public static String getOsName(SystemHostInfo systemInfo) {
-        return systemInfo.properties.get(SystemHostInfo.PROPERTY_NAME_OS_NAME);
+    /**
+     * Infrastructure use only
+     */
+    static boolean validateServiceOptions(ServiceHost host, Service service, Operation post) {
+        for (ServiceOption o : service.getOptions()) {
+            String error = Utils.validateServiceOption(service.getOptions(), o);
+            if (error != null) {
+                host.log(Level.WARNING, "%s", error);
+                post.fail(new IllegalArgumentException(error));
+                return false;
+            }
+        }
+
+        if (service.getMaintenanceIntervalMicros() > 0 &&
+                service.getMaintenanceIntervalMicros() < host.getMaintenanceCheckIntervalMicros()) {
+            host.setMaintenanceCheckIntervalMicros(service.getMaintenanceIntervalMicros());
+        }
+        return true;
     }
 
-    public static OsFamily determineOsFamily(String osName) {
-        osName = osName == null ? "" : osName.toLowerCase(Locale.ENGLISH);
-        if (osName.contains("mac")) {
-            return OsFamily.MACOS;
-        } else if (osName.contains("win")) {
-            return OsFamily.WINDOWS;
-        } else if (osName.contains("nux")) {
-            return OsFamily.LINUX;
-        } else {
-            return OsFamily.OTHER;
-        }
+    static void checkAndUpdateDocumentOwnership(ServiceHost host, Service service,
+            long expirationTimeMicrosUtc, CompletionHandler ch) {
+        Operation selectOwnerOp = Operation.createPost(null)
+                .setExpiration(expirationTimeMicrosUtc);
+        CompletionHandler c = (o, e) -> {
+            if (e != null) {
+                ch.handle(selectOwnerOp, e);
+                return;
+            }
+
+            SelectOwnerResponse rsp = o.getBody(SelectOwnerResponse.class);
+            service.toggleOption(ServiceOption.DOCUMENT_OWNER, rsp.isLocalHostOwner);
+            ch.handle(selectOwnerOp, null);
+        };
+        selectOwnerOp.setCompletion(c);
+        host.selectOwner(service.getPeerNodeSelectorPath(), service.getSelfLink(), selectOwnerOp);
+    }
+
+    public static void setFactoryAvailabilityIfOwner(ServiceHost host, String factoryLink,
+            String factoryNodeSelectorPath, boolean isAvailable) {
+        Operation selectOwnerOp = Operation.createPost(null)
+                .setExpiration(Utils.fromNowMicrosUtc(host.getOperationTimeoutMicros()))
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        host.log(Level.WARNING,
+                                "Owner selection for %s failed: %s; cannot set factory availability",
+                                factoryLink, e.getMessage());
+                        return;
+                    }
+
+                    SelectOwnerResponse rsp = o.getBody(SelectOwnerResponse.class);
+                    if (rsp.isLocalHostOwner) {
+                        ServiceStats.ServiceStat body = new ServiceStats.ServiceStat();
+                        body.name = Service.STAT_NAME_AVAILABLE;
+                        body.latestValue = isAvailable ? Service.STAT_VALUE_TRUE : Service.STAT_VALUE_FALSE;
+
+                        Operation op = Operation.createPost(
+                                UriUtils.buildAvailableUri(host, factoryLink))
+                                .setBody(body)
+                                .setReferer(host.getUri())
+                                .setConnectionSharing(true)
+                                .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION);
+                        host.sendRequest(op);
+                    }
+                });
+
+        host.selectOwner(factoryNodeSelectorPath, factoryLink, selectOwnerOp);
     }
 
     /**
@@ -625,7 +734,7 @@ public class Utils {
                     "-n", "1",
                     "-w", Long.toString(timeoutMs),
                     getNormalizedHostAddress(systemInfo, addr))
-                            .start();
+                    .start();
             boolean completed = process.waitFor(
                     PING_LAUNCH_TOLERANCE_MS + timeoutMs,
                     TimeUnit.MILLISECONDS);
@@ -643,8 +752,9 @@ public class Utils {
      * Specifically, Java formats link-local IPv6 addresses in Linux-friendly manner:
      * {@code <address>%<interface_name>} e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%eth0}. However,
      * Windows requires a different format for such addresses: {@code <address>%<numeric_scope_id>}
-     * e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%34}. This method {@link #isWindowsHost detects if
-     * the caller is a Windows host} and will adjust the host address accordingly.
+     * e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%34}. The method
+     * {@link SystemHostInfo#determineOsFamily(String)}  detects if
+     * the OS on the host} and will adjust the host address accordingly.
      *
      * Otherwise, this will delegate to the original method.
      */
@@ -666,16 +776,44 @@ public class Utils {
         return addrStr;
     }
 
-    public static byte[] encodeBody(Operation op) throws Throwable {
-        byte[] data = null;
-        String contentType = op.getContentType();
+    /**
+     * Infrastructure use. Serializes linked state associated with source operation
+     * and sets the result as the body of the target operation
+     */
+    public static void encodeAndTransferLinkedStateToBody(Operation source, Operation target,
+            boolean useBinary) {
+        if (useBinary && source.getAction() != Action.POST) {
+            try {
+                byte[] encodedBody = Utils.encodeBody(source, source.getLinkedState(),
+                        Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM, true);
+                source.linkSerializedState(encodedBody);
+            } catch (Exception e2) {
+                Utils.logWarning("Failure binary serializing, will fallback to JSON: %s",
+                        Utils.toString(e2));
+            }
+        }
 
-        if (!op.hasBody()) {
+        if (!source.hasLinkedSerializedState()) {
+            target.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
+            target.setBodyNoCloning(Utils.toJson(source.getLinkedState()));
+        } else {
+            target.setContentType(Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM);
+            target.setBodyNoCloning(source.getLinkedSerializedState());
+        }
+    }
+
+    public static byte[] encodeBody(Operation op, boolean isRequest) throws Exception {
+        return encodeBody(op, op.getBodyRaw(), op.getContentType(), isRequest);
+    }
+
+    public static byte[] encodeBody(Operation op, Object body, String contentType, boolean isRequest)
+            throws Exception {
+        if (body == null) {
             op.setContentLength(0);
             return null;
         }
 
-        Object body = op.getBodyRaw();
+        byte[] data = null;
         if (body instanceof String) {
             data = ((String) body).getBytes(Utils.CHARSET);
             op.setContentLength(data.length);
@@ -687,75 +825,147 @@ public class Utils {
             if (op.getContentLength() == 0 || op.getContentLength() > data.length) {
                 op.setContentLength(data.length);
             }
+        } else if (Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM.equals(contentType)) {
+            Output o = KryoSerializers.serializeAsDocument(
+                    body,
+                    ServiceClient.MAX_BINARY_SERIALIZED_BODY_LIMIT);
+            // incur a memory copy since the byte array can be used across many threads in the
+            // I/O path
+            data = o.toBytes();
+            op.setContentLength(data.length);
         }
 
         if (data == null) {
-            if (contentType == null
-                    || contentType.contains(Operation.MEDIA_TYPE_APPLICATION_JSON)) {
-                String encodedBody;
-                if (op.getAction() == Action.GET) {
-                    encodedBody = Utils.toJsonHtml(body);
-                } else {
-                    encodedBody = Utils.toJson(body);
-                    if (contentType == null) {
-                        op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
+            String encodedBody;
+            encodedBody = Utils.toJson(body);
+            if (op.getAction() != Action.GET && contentType == null) {
+                op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
+            }
+            data = encodedBody.getBytes(Utils.CHARSET);
+            op.setContentLength(data.length);
+        }
+
+        // For requests, if encoding is specified as gzip, then compress body
+        // For responses, if request accepts gzip body, then compress body and add response header
+        boolean gzip = false;
+        if (isRequest) {
+            String encoding = op.getRequestHeader(Operation.CONTENT_ENCODING_HEADER);
+            gzip = Operation.CONTENT_ENCODING_GZIP.equals(encoding);
+        } else {
+            String encoding = op.getRequestHeader(Operation.ACCEPT_ENCODING_HEADER);
+            // encoding can be of form br;q=1.0, gzip;q=0.8, *;q=0.1
+            // see https://tools.ietf.org/html/rfc7231#section-5.3.4
+            if (encoding != null) {
+                String[] encodings = encoding.split(",");
+                for (String enc : encodings) {
+                    int idx = enc.indexOf(';');
+                    if (idx > 0) {
+                        enc = enc.substring(0, idx);
+                    }
+                    if (Operation.CONTENT_ENCODING_GZIP.equals(enc.trim())) {
+                        gzip = true;
+                        break;
                     }
                 }
-                data = encodedBody.getBytes(Utils.CHARSET);
-                op.setContentLength(data.length);
-            } else {
-                throw new IllegalArgumentException("Unrecognized content type: " + contentType);
+            }
+        }
+        if (gzip) {
+            data = compressGZip(data);
+            op.setContentLength(data.length);
+            if (!isRequest) {
+                op.addResponseHeader(Operation.CONTENT_ENCODING_HEADER, Operation.CONTENT_ENCODING_GZIP);
             }
         }
 
         return data;
     }
 
-    public static void decodeBody(Operation op, ByteBuffer buffer) {
+   /**
+     * Compresses byte[] to gzip byte[]
+     */
+    private static byte[] compressGZip(byte[] input) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (GZIPOutputStream zos = new GZIPOutputStream(out)) {
+            zos.write(input, 0, input.length);
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * Decodes the byte buffer, using the content type as a hint. It sets the operation body
+     * to the decoded instance. It does not complete the operation.
+     */
+    public static void decodeBody(Operation op, ByteBuffer buffer, boolean isRequest)
+            throws Exception {
+        String contentEncodingHeader = null;
+        if (!isRequest) {
+            contentEncodingHeader = op.getResponseHeaderAsIs(Operation.CONTENT_ENCODING_HEADER);
+        } else if (!op.isFromReplication()) {
+            contentEncodingHeader = op.getRequestHeaderAsIs(Operation.CONTENT_ENCODING_HEADER);
+        }
+
+        boolean compressed = false;
+        if (contentEncodingHeader != null) {
+            compressed = Operation.CONTENT_ENCODING_GZIP.equals(contentEncodingHeader);
+        }
+
+        decodeBody(op, buffer, isRequest, compressed);
+    }
+
+    /**
+     * See {@link #decodeBody(Operation, ByteBuffer, boolean)}
+     */
+    public static void decodeBody(
+            Operation op, ByteBuffer buffer, boolean isRequest, boolean compressed)
+            throws Exception {
         if (op.getContentLength() == 0) {
-            op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON).complete();
+            op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
+            return;
+        }
+        if (compressed) {
+            buffer = decompressGZip(buffer);
+            // Since newly created buffer is not yet read, calling "remaining()" returns the size of the buffer.
+            op.setContentLength(buffer.remaining());
+
+            if (isRequest) {
+                op.getRequestHeaders().remove(Operation.CONTENT_ENCODING_HEADER);
+            } else {
+                op.getResponseHeaders().remove(Operation.CONTENT_ENCODING_HEADER);
+            }
+        }
+
+        String contentType = op.getContentType();
+        Object body = decodeIfText(buffer, contentType);
+        if (body != null) {
+            op.setBodyNoCloning(body);
             return;
         }
 
-        try {
-            String contentType = op.getContentType();
-            Object body = decodeIfText(buffer, contentType);
-            if (body == null) {
-                // unrecognized or binary body, use the raw bytes
-                byte[] data = new byte[(int) op.getContentLength()];
-                buffer.get(data);
-                body = data;
-            }
-            op.setBodyNoCloning(body).complete();
-        } catch (Throwable e) {
-            op.fail(e);
-        }
-    }
+        // unrecognized or binary body, use the raw bytes
+        byte[] data = new byte[(int) op.getContentLength()];
+        buffer.get(data);
+        op.setBodyNoCloning(data);
 
-    public static MessageDigest createDigest() {
-        try {
-            return MessageDigest.getInstance(DEFAULT_CONTENT_HASH);
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
+        boolean isKryoBinary = isContentTypeKryoBinary(contentType);
+        if (isKryoBinary && op.isFromReplication()) {
+            // optimization to avoid having to serialize state again, during indexing
+            op.linkSerializedState(data);
         }
     }
 
     public static String decodeIfText(ByteBuffer buffer, String contentType)
             throws CharacterCodingException {
-        String body = null;
         if (contentType == null) {
             return null;
         }
 
-        if (contentType.contains(Operation.MEDIA_TYPE_APPLICATION_JSON)
-                || contentType.contains("text")
-                || contentType.contains("css")
-                || contentType.contains("script")
-                || contentType.contains("html")
-                || contentType.contains("xml")) {
-            body = Charset.forName(Utils.CHARSET).newDecoder().decode(buffer).toString();
+        String body = null;
+        if (isContentTypeText(contentType)) {
+            CharsetDecoder decoder = decodersPerThread.get().reset();
+            body = decoder.decode(buffer).toString();
         } else if (contentType.contains(Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED)) {
-            body = Charset.forName(Utils.CHARSET).newDecoder().decode(buffer).toString();
+            CharsetDecoder decoder = decodersPerThread.get().reset();
+            body = decoder.decode(buffer).toString();
             try {
                 body = URLDecoder.decode(body, Utils.CHARSET);
             } catch (UnsupportedEncodingException e) {
@@ -766,6 +976,56 @@ public class Utils {
         return body;
     }
 
+    private static ByteBuffer decompressGZip(ByteBuffer bb) throws Exception {
+        GZIPInputStream zis = new GZIPInputStream(new ByteBufferInputStream(bb));
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        try {
+            byte[] buffer = Utils.getBuffer(1024);
+            int len;
+            while ((len = zis.read(buffer)) > 0) {
+                out.write(buffer, 0, len);
+            }
+        } finally {
+            zis.close();
+            out.close();
+        }
+        return ByteBuffer.wrap(out.toByteArray());
+    }
+
+    /**
+     * Compresses text to gzip byte buffer.
+     */
+    public static ByteBuffer compressGZip(String text) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (GZIPOutputStream zos = new GZIPOutputStream(out)) {
+            byte[] bytes = text.getBytes(CHARSET);
+            zos.write(bytes, 0, bytes.length);
+        }
+
+        return ByteBuffer.wrap(out.toByteArray());
+    }
+
+    public static boolean isContentTypeKryoBinary(String contentType) {
+        return contentType.length() == Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM.length()
+                && contentType.charAt(12) == 'k'
+                && contentType.charAt(13) == 'r'
+                && contentType.charAt(14) == 'y'
+                && contentType.charAt(15) == 'o';
+    }
+
+    private static boolean isContentTypeText(String contentType) {
+        return Operation.MEDIA_TYPE_APPLICATION_JSON.equals(contentType)
+                || contentType.contains(Operation.MEDIA_TYPE_APPLICATION_JSON)
+                || contentType.contains("text")
+                || contentType.contains("css")
+                || contentType.contains("script")
+                || contentType.contains("html")
+                || contentType.contains("xml")
+                || contentType.contains("yaml")
+                || contentType.contains("yml");
+    }
+
     /**
      * Compute ui resource path for this service.
      * <p>
@@ -774,7 +1034,7 @@ public class Utils {
      * will be calculated using service path Eg. for ExampleService
      * default path will be ui/com/vmware/xenon/services/common/ExampleService
      *
-     * @param type service class for which UI path has to be extracted
+     * @param s service class for which UI path has to be extracted
      * @return UI resource path object
      */
     public static Path getServiceUiResourcePath(Service s) {
@@ -797,45 +1057,27 @@ public class Utils {
     }
 
     /**
-     * Atomically returns a map element for the specifying key. A new instance of value is created if it is
-     * missing. This may be efficiently used for creating map of maps/sets.
-     * <p/>
-     * This method is thread-safe.
+     * Merges {@code patch} object into the {@code source} object by replacing or updating all {@code source}
+     *  fields with non-null {@code patch} fields. Only fields with specified merge policy are merged.
      *
-     * @param map  Map to take value from.
-     * @param key  Key to use.
-     * @param ctor Value constructor. This constructor may be invoked multiple times for the same value, but
-     *             only one value is returned.
-     * @param <K>  Map key type.
-     * @param <V>  Map value type.
-     * @return new or existing element value.
-     */
-    public static <K, V> V atomicGetOrCreate(ConcurrentMap<K, V> map, K key, Callable<V> ctor) {
-        V value = map.get(key);
-        if (value == null) {
-            try {
-                value = ctor.call();
-            } catch (Exception e) {
-                throw new RuntimeException("Element constructor should now throw an exception", e);
-            }
-            V existing = map.putIfAbsent(key, value);
-            if (existing != null) {
-                return existing;
-            }
-        }
-        return value;
-    }
-
-    /**
-     * Merges {@code patch} object into the {@code source} object by replacing all {@code source} fields with non-null
-     * {@code patch} fields. Only fields with specified merge policy are merged.
+     * NOTE:
+     * When {@code patch.documentExpirationTimeMicros} is 0, {@code source.documentExpirationTimeMicros}
+     * will NOT be updated.
+     * If you need to always update the source, you need explicitly set it.
+     * <pre>
+     * {@code
+     *   Utils.mergeWithState(getStateDescription(), source, patchState);
+     *   source.documentExpirationTimeMicros = patchState.documentExpirationTimeMicros;
+     * }
+     * </pre>
      *
      * @param desc Service document description.
      * @param source Source object.
      * @param patch  Patch object.
      * @param <T>    Object type.
-     * @return {@code true} in case there was at least one update. Updates of fields to same values are not considered
-     *      as updates).
+     * @return {@code true} in case there was at least one update. For objects that are not collections
+     *  or maps, updates of fields to same values are not considered as updates. New elements are always
+     *  added to collections/maps. Elements may replace existing entries based on the collection type
      * @see ServiceDocumentDescription.PropertyUsageOption
      */
     public static <T extends ServiceDocument> boolean mergeWithState(
@@ -851,9 +1093,21 @@ public class Utils {
                     prop.usageOptions.contains(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)) {
                 Object o = ReflectionUtils.getPropertyValue(prop, patch);
                 if (o != null) {
-                    if (!o.equals(ReflectionUtils.getPropertyValue(prop, source))) {
-                        ReflectionUtils.setPropertyValue(prop, source, o);
-                        modified = true;
+
+                    // when patch.documentExpirationTimeMicros is 0, do not override source.documentExpirationTimeMicros
+                    if (FIELD_NAME_EXPIRATION_TIME_MICROS.equals(prop.accessor.getName())
+                            && Long.valueOf(0).equals(o)) {
+                        continue;
+                    }
+
+                    if ((prop.typeName == TypeName.COLLECTION && !o.getClass().isArray())
+                            || prop.typeName == TypeName.MAP) {
+                        modified |= ReflectionUtils.setOrUpdatePropertyValue(prop, source, o);
+                    } else {
+                        if (!o.equals(ReflectionUtils.getPropertyValue(prop, source))) {
+                            ReflectionUtils.setPropertyValue(prop, source, o);
+                            modified = true;
+                        }
                     }
                 }
             }
@@ -862,84 +1116,441 @@ public class Utils {
     }
 
     /**
-     * Merges a list of @ServiceDocumentQueryResult that were already <b>sorted</b> on <i>documentLink</i>.
-     * The merge will be done in linear time.
-     *
-     * @param dataSources A list of @ServiceDocumentQueryResult <b>sorted</b> on <i>documentLink</i>.
-     * @param isAscOrder  Whether the document links are sorted in ascending order.
-     * @return The merging result.
+     * Update the state of collections that are part of the service state
+     * @param currentState The current state
+     * @param op Operation with the patch request
+     * @return
+     * @throws IllegalAccessException
+     * @throws NoSuchFieldException
      */
-    public static ServiceDocumentQueryResult mergeQueryResults(
-            List<ServiceDocumentQueryResult> dataSources,
-            boolean isAscOrder) {
+    public static <T extends ServiceDocument> boolean mergeWithState(T currentState, Operation op)
+            throws NoSuchFieldException, IllegalAccessException {
+        ServiceStateCollectionUpdateRequest collectionUpdateRequest =
+                op.getBody(ServiceStateCollectionUpdateRequest.class);
+        if (ServiceStateCollectionUpdateRequest.KIND.equals(collectionUpdateRequest.kind)) {
+            Utils.updateCollections(currentState, collectionUpdateRequest);
+            return true;
+        }
 
-        // To hold the merge result.
-        ServiceDocumentQueryResult result = new ServiceDocumentQueryResult();
-        result.documents = new HashMap<>();
-        result.documentCount = 0L;
+        ServiceStateMapUpdateRequest mapUpdateRequest =
+                op.getBody(ServiceStateMapUpdateRequest.class);
+        if (ServiceStateMapUpdateRequest.KIND.equals(mapUpdateRequest.kind)) {
+            Utils.updateMaps(currentState, mapUpdateRequest);
+            return true;
+        }
 
-        // For each list of documents to be merged, a pointer is maintained to indicate which element
-        // is to be merged. The initial values are 0s.
-        int[] indices = new int[dataSources.size()];
+        return false;
+    }
 
-        // Keep going until the last element in each list has been merged.
-        while (true) {
-            // Always pick the document link that is the smallest or largest depending on "isAscOrder" from
-            // all lists to be merged. "documentLinkPicked" is used to keep the winner.
-            String documentLinkPicked = null;
+    /**
+     * Contains flags describing the result of a state merging operation through the
+     * {@link Utils#mergeWithStateAdvanced} method.
+     */
+    public enum MergeResult {
+        SPECIAL_MERGE,   // whether the patch body represented a special update request
+                         // (if not set, the patch body is assumed to be a service state)
+        STATE_CHANGED    // whether the current state was changed as a result of the merge
+    }
 
-            // Ties could happen among the lists. That is, multiple elements could be picked in one iteration,
-            // and the lists where they locate need to be recorded so that their pointers could be adjusted accordingly.
-            List<Integer> sourcesPicked = new ArrayList<>();
+    private static final class StackFrameExtractor {
+        private static final Method getStackTraceElement;
 
-            // In each iteration, the current elements in all lists need to be compared to pick the winners.
-            for (int i = 0; i < dataSources.size(); i++) {
-                // If the current list still have elements left to be merged, then proceed.
-                if (indices[i] < dataSources.get(i).documentCount) {
-                    String documentLink = dataSources.get(i).documentLinks.get(indices[i]);
-                    if (documentLinkPicked == null) {
-                        // No document link has been picked in this iteration, so it is the winner at the current time.
-                        documentLinkPicked = documentLink;
-                        sourcesPicked.add(i);
+        static {
+            Method m = null;
+            try {
+                m = Throwable.class.getDeclaredMethod("getStackTraceElement", int.class);
+                m.setAccessible(true);
+            } catch (Exception ignore) {
+
+            }
+
+            getStackTraceElement = m;
+        }
+
+        static StackTraceElement getStackFrameAt(int i) {
+            Exception exception = new Exception();
+            if (getStackTraceElement == null) {
+                StackTraceElement[] stackTrace = exception.getStackTrace();
+                if (stackTrace.length > i + 1) {
+                    return exception.getStackTrace()[i + 1];
+                } else {
+                    return null;
+                }
+            }
+
+            try {
+                return (StackTraceElement) getStackTraceElement.invoke(exception, i + 1);
+            } catch (Exception e) {
+                StackTraceElement[] stackTrace = exception.getStackTrace();
+                if (stackTrace.length > i + 1) {
+                    return exception.getStackTrace()[i + 1];
+                } else {
+                    return null;
+                }
+            }
+        }
+    }
+
+    /**
+     * Merges the given patch body into the provided current service state. It first checks for
+     * patch bodies representing special update requests (such as
+     * {@link ServiceStateCollectionUpdateRequest} or others in the future) and if not, assumes
+     * the patch body is a new service state and merges it into the current state according to
+     * the provided {@link ServiceDocumentDescription} (see
+     * {@link Utils#mergeWithState(ServiceDocumentDescription, ServiceDocument, ServiceDocument)}).
+     *
+     * @param desc Metadata about the service document state
+     * @param currentState The current service state
+     * @param type Service state type
+     * @param op Operation with the patch request
+     * @return an EnumSet with information whether the operation represented an update request and
+     *         whether the merge changed the current state
+     * @throws IllegalAccessException
+     * @throws NoSuchFieldException
+     */
+    public static <T extends ServiceDocument> EnumSet<MergeResult> mergeWithStateAdvanced(
+            ServiceDocumentDescription desc, T currentState, Class<T> type, Operation op)
+            throws NoSuchFieldException, IllegalAccessException {
+        EnumSet<MergeResult> result = EnumSet.noneOf(MergeResult.class);
+
+        // first check for a ServiceStateCollectionUpdateRequest patch body
+        ServiceStateCollectionUpdateRequest requestBody =
+                op.getBody(ServiceStateCollectionUpdateRequest.class);
+        if (ServiceStateCollectionUpdateRequest.KIND.equals(requestBody.kind)) {
+            result.add(MergeResult.SPECIAL_MERGE);
+            if (Utils.updateCollections(currentState, requestBody)) {
+                result.add(MergeResult.STATE_CHANGED);
+            }
+            return result;
+        }
+
+        // check for a ServiceStateMapUpdateRequest patch body
+        ServiceStateMapUpdateRequest mapUpdateRequest =
+                op.getBody(ServiceStateMapUpdateRequest.class);
+        if (ServiceStateMapUpdateRequest.KIND.equals(mapUpdateRequest.kind)) {
+            result.add(MergeResult.SPECIAL_MERGE);
+            if (Utils.updateMaps(currentState, mapUpdateRequest)) {
+                result.add(MergeResult.STATE_CHANGED);
+            }
+            return result;
+        }
+
+        // if not a special update request patch body, assume it is a new service state
+        T patchState = op.getBody(type);
+        if (Utils.mergeWithState(desc, currentState, patchState)) {
+            result.add(MergeResult.STATE_CHANGED);
+        }
+        return result;
+    }
+
+    /**
+     * Validates {@code state} object by checking for null value fields.
+     *
+     * @param desc Service document description.
+     * @param state Source object.
+     * @param <T>    Object type.
+     * @see ServiceDocumentDescription.PropertyUsageOption
+     */
+    public static <T extends ServiceDocument> void validateState(
+            ServiceDocumentDescription desc, T state) {
+        for (PropertyDescription prop : desc.propertyDescriptions.values()) {
+            if (prop.usageOptions != null &&
+                    prop.usageOptions.contains(PropertyUsageOption.REQUIRED)) {
+                Object o = ReflectionUtils.getPropertyValue(prop, state);
+                if (o == null) {
+                    if (prop.usageOptions.contains(PropertyUsageOption.ID)) {
+                        ReflectionUtils.setPropertyValue(prop, state, UUID.randomUUID().toString());
                     } else {
-                        if (isAscOrder && documentLink.compareTo(documentLinkPicked) < 0
-                                || !isAscOrder && documentLink.compareTo(documentLinkPicked) > 0) {
-                            // If this document link is smaller or bigger (depending on isAscOrder),
-                            // then replace the original winner.
-                            documentLinkPicked = documentLink;
-                            sourcesPicked.clear();
-                            sourcesPicked.add(i);
-                        } else if (documentLink.equals(documentLinkPicked)) {
-                            // If it is a tie, we will need to record this element too so that
-                            // it won't be processed in the next iteration.
-                            sourcesPicked.add(i);
+                        throw new IllegalArgumentException(
+                                prop.accessor.getName() + " is a required field.");
+                    }
+                }
+            }
+        }
+    }
+
+    private static long initializeTimeEpsilon() {
+        return Long.getLong(Utils.PROPERTY_NAME_PREFIX + PROPERTY_NAME_TIME_COMPARISON,
+                ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS);
+    }
+
+    /**
+     * Adds the supplied argument to the value from {@link #getSystemNowMicrosUtc()} and returns
+     * an absolute expiration time in the future
+     */
+    public static long fromNowMicrosUtc(long deltaMicros) {
+        return getSystemNowMicrosUtc() + deltaMicros;
+    }
+
+    /**
+     * Expects an absolute time, in microseconds since Epoch and returns true if the value represents
+     * a time before the current system time
+     */
+    public static boolean beforeNow(long microsUtc) {
+        return getSystemNowMicrosUtc() >= microsUtc;
+    }
+
+    /**
+     * Returns the current time in microseconds, since Unix Epoch. This method can return the
+     * same value on consecutive calls. See {@link #getNowMicrosUtc()} for an alternative but
+     * with potential for drift from wall clock time
+     */
+    public static long getSystemNowMicrosUtc() {
+        return System.currentTimeMillis() * 1000;
+    }
+
+    /**
+     * Return wall clock time, in microseconds since Unix Epoch (1/1/1970 UTC midnight). This
+     * functions guarantees time always moves forward, but it does not guarantee it does so in fixed
+     * intervals.
+     *
+     * @return
+     */
+    public static long getNowMicrosUtc() {
+        long now = System.currentTimeMillis() * 1000;
+        long time = previousTimeValue.getAndIncrement();
+
+        // Only set time if current time is greater than our stored time.
+        if (now > time) {
+            // This CAS can fail; getAndIncrement() ensures no value is returned twice.
+            previousTimeValue.compareAndSet(time + 1, now);
+            return previousTimeValue.getAndIncrement();
+        } else if (time - now > timeDriftThresholdMicros) {
+            throw new IllegalStateException("Time drift is " + (time - now));
+        }
+
+        return time;
+    }
+
+    /**
+     * Infrastructure use only, do *not* use outside tests.
+     * Set the upper bound between wall clock time as reported by {@link System#currentTimeMillis()}
+     * and the time reported by {@link #getNowMicrosUtc()} (when both converted to micros).
+     * The current time value will be reset to latest wall clock time so this call must be avoided
+     * at all costs in a production system (it might make {@link #getNowMicrosUtc()} return a
+     * smaller value than previous calls
+     */
+    public static void setTimeDriftThreshold(long micros) {
+        timeDriftThresholdMicros = micros;
+        previousTimeValue.set(TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis()));
+    }
+
+    /**
+     * Resets comparison value from default or global property
+     */
+    public static void resetTimeComparisonEpsilonMicros() {
+        timeComparisonEpsilon = initializeTimeEpsilon();
+    }
+
+    /**
+     * Sets the time interval, in microseconds, for replicated document time comparisons.
+     */
+    public static void setTimeComparisonEpsilonMicros(long micros) {
+        timeComparisonEpsilon = micros;
+    }
+
+    /**
+     * Gets the time comparison interval, or epsilon.
+     * See {@link #setTimeComparisonEpsilonMicros}
+     * @return
+     */
+    public static long getTimeComparisonEpsilonMicros() {
+        return timeComparisonEpsilon;
+    }
+
+    /**
+    * Compares a time value with current time. Both time values are in micros since epoch.
+    * Since we can not assume the time came from the same node, we use the concept of a
+    * time epsilon: any two time values within epsilon are considered too close to
+    * globally order in respect to each other and this method will return true.
+    */
+    public static boolean isWithinTimeComparisonEpsilon(long timeMicros) {
+        return Math.abs(timeMicros - Utils.getSystemNowMicrosUtc()) < timeComparisonEpsilon;
+    }
+
+    /**
+     * Return a non-null, zero-length thread-local instance.
+     * Infrastructure use only.
+     * @return
+     */
+    public static StringBuilder getBuilder() {
+        return builderPerThread.get();
+    }
+
+    /**
+     * Adds/removes elements from specified collections; if both are specified elements are removed
+     * before new elements added
+     *
+     * @param currentState currentState of the service
+     * @param patchBody request of processing collections
+     * @return {@code true} if the currentState has changed as a result of the call
+     * @throws NoSuchFieldException
+     * @throws IllegalAccessException
+     */
+    public static <T extends ServiceDocument> boolean updateCollections(T currentState,
+            ServiceStateCollectionUpdateRequest patchBody)
+            throws NoSuchFieldException, IllegalAccessException {
+        boolean hasChanged = false;
+        if (patchBody.itemsToRemove != null) {
+            for (Entry<String, Collection<Object>> collectionItem :
+                    patchBody.itemsToRemove.entrySet()) {
+                hasChanged |= processCollection(collectionItem.getValue(), collectionItem.getKey(),
+                        currentState, CollectionOperation.REMOVE);
+            }
+        }
+        if (patchBody.itemsToAdd != null) {
+            for (Entry<String, Collection<Object>> collectionItem :
+                    patchBody.itemsToAdd.entrySet()) {
+                hasChanged |= processCollection(collectionItem.getValue(), collectionItem.getKey(),
+                        currentState, CollectionOperation.ADD);
+            }
+        }
+        return hasChanged;
+    }
+
+    /**
+     * Adds/removes elements from specified maps; if both are specified elements are removed
+     * before new elements added
+     *
+     * @param currentState currentState of the service
+     * @param patchBody request of processing maps
+     * @return {@code true} if the currentState has changed as a result of the call
+     * @throws NoSuchFieldException
+     * @throws IllegalAccessException
+     */
+    public static <T extends ServiceDocument> boolean updateMaps(T currentState,
+            ServiceStateMapUpdateRequest patchBody)
+            throws NoSuchFieldException, IllegalAccessException {
+        boolean hasChanged = false;
+        if (patchBody.keysToRemove != null) {
+            for (Entry<String, Collection<Object>> mapItem : patchBody.keysToRemove.entrySet()) {
+                hasChanged |= processMapKeyRemoval(mapItem.getValue(), mapItem.getKey(),
+                        currentState);
+            }
+        }
+        if (patchBody.entriesToAdd != null) {
+            for (Entry<String, Map<Object, Object>> mapItem : patchBody.entriesToAdd.entrySet()) {
+                hasChanged |= processMapEntryAddition(mapItem.getValue(), mapItem.getKey(),
+                        currentState);
+            }
+        }
+        return hasChanged;
+    }
+
+    private enum CollectionOperation {
+        ADD, REMOVE
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T extends ServiceDocument> boolean processCollection(
+            Collection<Object> inputCollection, String collectionName,
+            T currentState, CollectionOperation operation)
+            throws NoSuchFieldException, IllegalAccessException {
+        boolean hasChanged = false;
+        if (inputCollection != null && !inputCollection.isEmpty()) {
+            Class<? extends ServiceDocument> clazz = currentState.getClass();
+            Field field = clazz.getField(collectionName);
+            if (field != null && Collection.class.isAssignableFrom(field.getType())) {
+                @SuppressWarnings("rawtypes")
+                Collection collObj = (Collection) field.get(currentState);
+                switch (operation) {
+                case ADD:
+                    if (collObj == null) {
+                        hasChanged = ReflectionUtils.setOrInstantiateCollectionField(currentState,
+                                field, inputCollection);
+                    } else {
+                        hasChanged = collObj.addAll(inputCollection);
+                    }
+                    break;
+                case REMOVE:
+                    if (collObj != null) {
+                        hasChanged = collObj.removeAll(inputCollection);
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+        return hasChanged;
+    }
+
+    private static <T extends ServiceDocument> boolean processMapKeyRemoval(
+            Collection<Object> keysToRemove, String mapName, T currentState)
+            throws NoSuchFieldException, IllegalAccessException {
+        boolean hasChanged = false;
+        if (keysToRemove != null && !keysToRemove.isEmpty()) {
+            Class<? extends ServiceDocument> clazz = currentState.getClass();
+            Field field = clazz.getField(mapName);
+            if (field != null && Map.class.isAssignableFrom(field.getType())) {
+                @SuppressWarnings("rawtypes")
+                Map mapObj = (Map) field.get(currentState);
+                if (mapObj != null) {
+                    for (Object key : keysToRemove) {
+                        hasChanged |= mapObj.remove(key) != null;
+                    }
+                }
+            }
+        }
+        return hasChanged;
+    }
+
+    private static <T extends ServiceDocument> boolean processMapEntryAddition(
+            Map<Object, Object> entriesToAdd, String mapName, T currentState)
+            throws NoSuchFieldException, IllegalAccessException {
+        boolean hasChanged = false;
+        if (entriesToAdd != null && !entriesToAdd.isEmpty()) {
+            Class<? extends ServiceDocument> clazz = currentState.getClass();
+            Field field = clazz.getField(mapName);
+            if (field != null && Map.class.isAssignableFrom(field.getType())) {
+                @SuppressWarnings("rawtypes")
+                Map mapObj = (Map) field.get(currentState);
+                if (mapObj == null) {
+                    field.set(currentState, entriesToAdd);
+                    hasChanged = true;
+                } else {
+                    for (Entry<Object, Object> entry : entriesToAdd.entrySet()) {
+                        @SuppressWarnings("unchecked")
+                        Object oldValue = mapObj.put(entry.getKey(), entry.getValue());
+                        if (oldValue == null) {
+                            hasChanged |= entry.getValue() != null;
+                        } else {
+                            hasChanged |= !oldValue.equals(entry.getValue());
                         }
                     }
                 }
             }
-
-            if (documentLinkPicked != null) {
-                // Save the winner to the result.
-                result.documentLinks.add(documentLinkPicked);
-                ServiceDocumentQueryResult partialResult = dataSources.get(sourcesPicked.get(0));
-                if (partialResult.documents != null) {
-                    result.documents.put(documentLinkPicked,
-                            partialResult.documents.get(documentLinkPicked));
-                }
-                result.documentCount++;
-
-                // Move the pointer of the lists where the winners locate.
-                for (int i : sourcesPicked) {
-                    indices[i]++;
-                }
-            } else {
-                // No document was picked, that means all lists had been processed,
-                // and the merging work is done.
-                break;
-            }
         }
-
-        return result;
+        return hasChanged;
     }
 
+    /**
+     * Generate a v1 UUID: Use the supplied id as the identifier for the
+     * location (in space), and the value from {@link Utils#getNowMicrosUtc()} as the
+     * point in time. As long as the location id (for example, the local host ID) is
+     * unique within the node group, the UUID should be unique within the node group as
+     * well.
+     */
+    public static String buildUUID(String id) {
+        return Utils.getBuilder()
+                .append(id)
+                .append(Long.toHexString(Utils.getNowMicrosUtc()))
+                .toString();
+    }
+
+    /**
+     * Construct common data in {@link ServiceConfiguration}.
+     */
+    public static <T extends ServiceConfiguration> T buildServiceConfig(T config, Service service) {
+        ServiceDocumentDescription desc = service.getHost().buildDocumentDescription(service);
+
+        config.options = service.getOptions();
+        config.maintenanceIntervalMicros = service.getMaintenanceIntervalMicros();
+        config.versionRetentionLimit = desc.versionRetentionLimit;
+        config.versionRetentionFloor = desc.versionRetentionFloor;
+        config.peerNodeSelectorPath = service.getPeerNodeSelectorPath();
+        config.documentIndexPath = service.getDocumentIndexPath();
+
+        return config;
+    }
 }

@@ -19,11 +19,61 @@ import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.EnumSet;
+import java.util.Map;
 import java.util.UUID;
 
 import org.junit.Test;
 
+import com.vmware.xenon.common.Service.ServiceOption;
+import com.vmware.xenon.services.common.ServiceUriPaths;
+
 public class TestUriUtils {
+
+    @Test
+    public void validDocumentId() throws Throwable {
+        assertTrue(UriUtils.isValidDocumentId(UriUtils.URI_LEGAL_CHARS, "/foo"));
+        assertTrue(isValidUri(UriUtils.URI_LEGAL_CHARS));
+
+        String testId = "/t/e/s/t";
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "/foo/t/e/s/t";
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "/foo/test";
+        assertTrue(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "/test";
+        assertTrue(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "{{test}}";
+        assertEquals(UriUtils.isValidDocumentId(testId, "/foo"),
+                isValidUri(testId));
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "test:123123";
+        assertEquals(UriUtils.isValidDocumentId(testId, "/foo"),
+                isValidUri(testId));
+        testId = "123:123123";
+        assertTrue(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = UriUtils.URI_LEGAL_CHARS;
+        assertEquals(UriUtils.isValidDocumentId(testId, "/foo"),
+                isValidUri(testId));
+
+        testId = "/foo/";
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+    }
+
+    private boolean isValidUri(String uri) {
+        try {
+            new URI(uri);
+        } catch (URISyntaxException e) {
+            return false;
+        }
+        return true;
+    }
 
     @Test
     public void normalizePath() throws Throwable {
@@ -52,6 +102,24 @@ public class TestUriUtils {
     }
 
     @Test
+    public void extendQueryPageLinkWithQuery() throws Throwable {
+        final String basicPageLink = "/core/query-page/1469733619696001";
+        URI u = new URI("http://localhost:8000" + basicPageLink);
+        URI forwarderUri = UriUtils.buildForwardToPeerUri(u, UUID.randomUUID().toString(),
+                ServiceUriPaths.DEFAULT_NODE_SELECTOR, EnumSet.noneOf(ServiceOption.class));
+        String pageLink = forwarderUri.getPath() + UriUtils.URI_QUERY_CHAR
+                + forwarderUri.getQuery();
+        String query = UriUtils.buildUriQuery(UriUtils.URI_PARAM_ODATA_LIMIT, "5");
+
+        String basicLinkWithQuery = UriUtils.extendQueryPageLinkWithQuery(basicPageLink, query);
+        assertEquals(basicPageLink + "?" + query, basicLinkWithQuery);
+
+        String pageLinkWithQuery = UriUtils.extendQueryPageLinkWithQuery(pageLink, query);
+        assertTrue(
+                pageLinkWithQuery.contains(UriUtils.FORWARDING_URI_PARAM_NAME_QUERY + "=" + query));
+    }
+
+    @Test
     public void extendUriWithQuery() throws URISyntaxException {
         String query = "key1=value1&key2=value2";
         String basePath = UriUtils.buildUriPath("some", UUID.randomUUID().toString());
@@ -70,6 +138,10 @@ public class TestUriUtils {
         assertEquals(basePath, u.getPath());
         assertEquals(8000, u.getPort());
         assertEquals(u.getQuery(), query);
+
+        u = UriUtils.extendUriWithQuery(new URI("http://localhost/path?param1=value1"), "key1", "value1", "key2", "value2");
+        assertEquals("/path", u.getPath());
+        assertEquals(u.getQuery(), "param1=value1&key1=value1&key2=value2");
     }
 
     @Test
@@ -239,6 +311,32 @@ public class TestUriUtils {
     }
 
     @Test
+    public void testConvertUriPathCharsFromLink() {
+        assertEquals("core-examples",
+                UriUtils.convertPathCharsFromLink("///core/examples///"));
+        assertEquals("core-examples",
+                UriUtils.convertPathCharsFromLink("///core/examples?expand&count=100"));
+        assertEquals("core-local-query-tasks",
+                UriUtils.convertPathCharsFromLink("///core/local-query-tasks"));
+        assertEquals(null,
+                UriUtils.convertPathCharsFromLink("@*#(@&@#"));
+    }
+
+    @Test
+    public void testTrimPathSlashes() {
+        assertEquals("a", UriUtils.trimPathSlashes("//a//"));
+        assertEquals("a", UriUtils.trimPathSlashes("///a"));
+        assertEquals("a", UriUtils.trimPathSlashes("a///"));
+        assertEquals("a", UriUtils.trimPathSlashes("/a/"));
+        assertEquals("a", UriUtils.trimPathSlashes("a"));
+        assertEquals("a/b", UriUtils.trimPathSlashes("/a/b/"));
+        assertEquals("a/b", UriUtils.trimPathSlashes("////a/b/////"));
+        assertEquals("a/b", UriUtils.trimPathSlashes("////a/b"));
+        assertEquals("a/b", UriUtils.trimPathSlashes("a/b/////"));
+        assertEquals("a/b", UriUtils.trimPathSlashes("a/b"));
+    }
+
+    @Test
     public void isChildPath() {
         assertFalse(UriUtils.isChildPath(null, "/a/b"));
         assertFalse(UriUtils.isChildPath("/a/b/c", null));
@@ -269,5 +367,58 @@ public class TestUriUtils {
         assertFalse(UriUtils.hasODataExpandParamValue(u));
         u = UriUtils.buildUri("http://example.com:8000?");
         assertFalse(UriUtils.hasODataExpandParamValue(u));
+    }
+
+    @Test
+    public void testSimplePathParamParsing() {
+        String template = "/vmware/offices/{location}/sites/{site}";
+        URI u = UriUtils.buildUri("http://example.com:8000/vmware/offices/pa/sites/prom-e");
+        Map<String, String> pathParams = UriUtils.parseUriPathSegments(u, template);
+        assertEquals(2, pathParams.size());
+        assertTrue(pathParams.keySet().contains("location"));
+        assertTrue(pathParams.keySet().contains("site"));
+        assertTrue(pathParams.get("location").equals("pa"));
+        assertTrue(pathParams.get("site").equals("prom-e"));
+    }
+
+
+    @Test
+    public void testParseUriQueryParams() {
+        URI u = UriUtils.buildUri("http://example.com:8000/?a=b&c=d&d&e=f=g&h=&=z");
+
+        Map<String, String> queryParams = UriUtils.parseUriQueryParams(u);
+
+        assertEquals(5, queryParams.size());
+        assertTrue(queryParams.get("a").equals("b"));
+        assertTrue(queryParams.get("c").equals("d"));
+        assertTrue(queryParams.get("d").equals(""));
+        assertTrue(queryParams.get("e").equals("f=g"));
+        assertTrue(queryParams.get("h").equals(""));
+    }
+
+    @Test
+    public void buildDocumentQueryUri() throws Throwable {
+        ServiceHost host = ServiceHost.create();
+        URI uri = UriUtils.buildDocumentQueryUri(host, "/my-index-service", "my-service", false, false, EnumSet.of(ServiceOption.NONE));
+        assertEquals("/my-index-service", uri.getPath());
+    }
+
+    @Test
+    public void testHasQueryParams() {
+        URI navigationUri = UriUtils.buildUri("http://example.com:8000/?path=abc&peer=pqr");
+        URI randomUri = UriUtils.buildUri("http://example.com:8000/?a=c&x=y");
+
+        assertTrue(UriUtils.hasNavigationQueryParams(navigationUri));
+        assertFalse(UriUtils.hasNavigationQueryParams(randomUri));
+
+        URI odataQueryUri = UriUtils.buildUri("http://example.com:8000/?$filter=abc&$count=true");
+        assertTrue(UriUtils.hasODataQueryParams(odataQueryUri));
+
+        URI fakeOdataQueryUri = UriUtils.buildUri("http://example.com:8000/?$filtered=abc&$counter=true&$expanding");
+
+        assertFalse(UriUtils.hasODataQueryParams(fakeOdataQueryUri));
+        assertFalse(UriUtils.hasODataQueryParams(randomUri));
+
+
     }
 }

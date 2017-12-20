@@ -37,10 +37,12 @@ public class MinimalTestService extends StatefulService {
     public static final String CUSTOM_CONTENT_TYPE = "application/vnd.vmware.horizon.manager.error+json;charset=UTF-8";
 
     public static final String STRING_MARKER_FAIL_REQUEST = "fail request";
+    public static final String STRING_MARKER_FAIL_REQUEST_WITH_CORRUPTED_JSON_RSP = "fail request with corrupted JSON response error body";
     public static final String STRING_MARKER_RETRY_REQUEST = "fail request with error that causes retry";
     public static final String STRING_MARKER_TIMEOUT_REQUEST = "do not complete this request";
     public static final String STRING_MARKER_HAS_CONTEXT_ID = "check context id";
     public static final String STRING_MARKER_USE_DIFFERENT_CONTENT_TYPE = "change content type on response";
+    public static final String STRING_MARKER_URI_HAS_QUERY_AND_FRAGMENT = "check uri has query and fragment";
     public static final String STRING_MARKER_DELAY_COMPLETION = "do a tight loop";
     public static final String STRING_MARKER_FAIL_WITH_PLAIN_TEXT_RESPONSE = "fail with plain text content type";
     public static final String STRING_MARKER_FAIL_WITH_CUSTOM_CONTENT_TYPE_RESPONSE = "fail with "
@@ -55,6 +57,28 @@ public class MinimalTestService extends StatefulService {
 
     public static final String STAT_NAME_MAINTENANCE_SUCCESS_COUNT = "maintSuccessCount";
     public static final String STAT_NAME_MAINTENANCE_FAILURE_COUNT = "maintFailureCount";
+
+    public static final long DEFAULT_VERSION_RETENTION_LIMIT = 1000 * 1000;
+    public static final long DEFAULT_VERSION_RETENTION_FLOOR = 1000 * 100;
+
+    private static long VERSION_RETENTION_LIMIT = DEFAULT_VERSION_RETENTION_LIMIT;
+    private static long VERSION_RETENTION_FLOOR = DEFAULT_VERSION_RETENTION_FLOOR;
+
+    public static void setVersionRetentionLimit(long versionRetentionLimit) {
+        VERSION_RETENTION_LIMIT = versionRetentionLimit;
+    }
+
+    public static long getVersionRetentionLimit() {
+        return VERSION_RETENTION_LIMIT;
+    }
+
+    public static void setVersionRetentionFloor(long versionRetentionFloor) {
+        VERSION_RETENTION_FLOOR = versionRetentionFloor;
+    }
+
+    public static long getVersionRetentionFloor() {
+        return VERSION_RETENTION_FLOOR;
+    }
 
     public static class MinimalTestServiceErrorResponse extends ServiceErrorResponse {
 
@@ -72,6 +96,8 @@ public class MinimalTestService extends StatefulService {
     }
 
     public boolean delayMaintenance;
+
+    public boolean isStateModifiedPostCompletion;
 
     public MinimalTestService() {
         super(MinimalTestServiceState.class);
@@ -97,8 +123,9 @@ public class MinimalTestService extends StatefulService {
     public void handleStart(Operation post) {
         HANDLE_START_COUNT.incrementAndGet();
 
+        MinimalTestServiceState s = null;
         if (post.hasBody()) {
-            MinimalTestServiceState s = post.getBody(MinimalTestServiceState.class);
+            s = post.getBody(MinimalTestServiceState.class);
             if (s.id == null) {
                 post.fail(new IllegalArgumentException(ERROR_MESSAGE_ID_IS_REQUIRED),
                         MinimalTestServiceErrorResponse.create(ERROR_MESSAGE_ID_IS_REQUIRED));
@@ -109,13 +136,26 @@ public class MinimalTestService extends StatefulService {
                 // we want to induce a timeout, so do NOT complete
                 return;
             }
+            // these fields are set by the parent factory and the runtime before indexing. We set them here
+            // eagerly so the state modification test below passes
+            s.documentSelfLink = getSelfLink();
+            s.documentKind = Utils.buildKind(s.getClass());
         }
         post.complete();
+
+        if (!post.hasBody()) {
+            return;
+        }
+        MinimalTestServiceState initialState = (MinimalTestServiceState) post.getBodyRaw();
+        // verify state has not been modified post completion
+        if (initialState.documentSelfLink == null || initialState.id == null) {
+            this.isStateModifiedPostCompletion = true;
+        }
     }
 
-    public boolean gotStopped;
-
     public boolean gotDeleted;
+
+    public boolean gotStopped;
 
     @Override
     public void handleStop(Operation delete) {
@@ -147,6 +187,16 @@ public class MinimalTestService extends StatefulService {
         if (patchBody.id == null) {
             patch.fail(new IllegalArgumentException(ERROR_MESSAGE_ID_IS_REQUIRED),
                     MinimalTestServiceErrorResponse.create(ERROR_MESSAGE_ID_IS_REQUIRED));
+            return;
+        }
+
+        if (patchBody.id.equals(STRING_MARKER_URI_HAS_QUERY_AND_FRAGMENT)) {
+            if (patch.getUri().getQuery() == null || patch.getUri().getQuery().isEmpty()
+                    || patch.getUri().getFragment() == null) {
+                patch.fail(new IllegalStateException("Expected uri to have query and fragment"));
+                return;
+            }
+            patch.complete();
             return;
         }
 
@@ -198,6 +248,18 @@ public class MinimalTestService extends StatefulService {
             return;
         }
 
+        if (STRING_MARKER_FAIL_REQUEST_WITH_CORRUPTED_JSON_RSP.equals(patchBody.id)) {
+            ServiceErrorResponse rsp = ServiceErrorResponse.create(
+                    new IllegalStateException("forced error"),
+                    Operation.STATUS_CODE_BAD_REQUEST);
+            patch.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
+            String jsonBody = Utils.toJson(rsp);
+            // corrupt body, on purpose
+            jsonBody = "corrupted body prefix-" + jsonBody;
+            patch.setBody(jsonBody).fail(Operation.STATUS_CODE_BAD_REQUEST);
+            return;
+        }
+
         if (patchBody.id.equals(STRING_MARKER_USE_DIFFERENT_CONTENT_TYPE)) {
             patch.setContentType(Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED).complete();
             return;
@@ -227,6 +289,9 @@ public class MinimalTestService extends StatefulService {
             } else {
                 currentState.id = patchBody.id;
             }
+            if (patchBody.documentExpirationTimeMicros > 0) {
+                currentState.documentExpirationTimeMicros = patchBody.documentExpirationTimeMicros;
+            }
         } else {
             setState(patch, patchBody);
         }
@@ -251,14 +316,13 @@ public class MinimalTestService extends StatefulService {
             return;
         }
 
-
         final MinimalTestServiceState state = getState(get);
         if (params.containsKey(MinimalTestService.QUERY_DELAY_COMPLETION)) {
             long delay = Integer.parseInt(params.get(MinimalTestService.QUERY_DELAY_COMPLETION));
             getHost().schedule(
                     () -> {
                         get.setBody(state).complete();
-                    } ,
+                    },
                     delay, TimeUnit.SECONDS);
             return;
         }
@@ -267,10 +331,10 @@ public class MinimalTestService extends StatefulService {
     }
 
     /**
-    * If we receive a get with the "headers" query, we serialize the incoming
-    * headers and return this. This allows us to test that the right headers
-    * were sent.
-    */
+     * If we receive a get with the "headers" query, we serialize the incoming
+     * headers and return this. This allows us to test that the right headers
+     * were sent.
+     */
     private void respondWithHeaders(Operation get) {
         StringBuilder sb = new StringBuilder();
         Map<String, String> headers = get.getRequestHeaders();
@@ -362,7 +426,8 @@ public class MinimalTestService extends StatefulService {
         // this service is a target of throughput tests so we set the limit high to avoid grooming
         // during the tests. Tests can use the example service to verify throughput while grooming
         // is active
-        template.documentDescription.versionRetentionLimit = 1000 * 1000;
+        template.documentDescription.versionRetentionLimit = VERSION_RETENTION_LIMIT;
+        template.documentDescription.versionRetentionFloor = VERSION_RETENTION_FLOOR;
         return template;
     }
 }

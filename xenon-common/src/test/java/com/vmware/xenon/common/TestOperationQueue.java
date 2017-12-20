@@ -24,10 +24,6 @@ import java.util.UUID;
 import org.junit.Before;
 import org.junit.Test;
 
-import com.vmware.xenon.common.CommandLineArgumentParser;
-import com.vmware.xenon.common.Operation;
-import com.vmware.xenon.common.OperationQueue;
-
 public class TestOperationQueue {
 
     public int count = 10000;
@@ -70,6 +66,8 @@ public class TestOperationQueue {
         }
 
         assertTrue(!q.isEmpty());
+
+        assertTrue(q.size() == this.count);
 
         // verify operations beyond limit are not queued
         assertTrue(false == q.offer(Operation.createGet(null)));
@@ -133,6 +131,24 @@ public class TestOperationQueue {
 
         q.clear();
         assertTrue(q.isEmpty());
+    }
+
+    @Test
+    public void transferAll() {
+        OperationQueue q = OperationQueue.createFifo(this.count);
+        final String pragma = UUID.randomUUID().toString();
+        for (int i = 0; i < this.count; i++) {
+            Operation op = Operation.createPost(null).addPragmaDirective(pragma);
+            q.offer(op);
+        }
+
+        Collection<Operation> ops = new ArrayList<>(this.count);
+        q.transferAll(ops);
+        assertTrue(ops.size() == this.count);
+        assertTrue(q.isEmpty());
+        for (Operation op : ops) {
+            assertEquals(pragma, op.getRequestHeader(Operation.PRAGMA_HEADER));
+        }
     }
 
 }

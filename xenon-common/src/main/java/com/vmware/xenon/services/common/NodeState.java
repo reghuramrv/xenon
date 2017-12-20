@@ -15,13 +15,26 @@ package com.vmware.xenon.services.common;
 
 import java.net.URI;
 import java.util.EnumSet;
+import java.util.Map;
 
+import com.vmware.xenon.common.FNVHash;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.Utils;
 
 public class NodeState extends ServiceDocument {
-    public static final String PROPERTY_NAME_MEMBERSHIP_QUORUM = Utils.PROPERTY_NAME_PREFIX
-            + "NodeState.membershipQuorum";
+
+    /**
+     * Key of a custom property associated with a node, set in {@link #customProperties}.
+     * The location value is used as an opaque tag and affects consensus updates.
+     * If {@link #locationQuorum} is set, the location values are used to enforce how
+     * many nodes from different locations must participate in each update. If its not
+     * specified, and locations are set in each node, then quorum can be satisfied from
+     * within a single location
+     */
+    public static final String PROPERTY_NAME_LOCATION = Utils.PROPERTY_NAME_PREFIX
+            + "NodeState.location";
+
+    private transient  long nodeIdHash;
 
     public enum NodeStatus {
         /**
@@ -84,9 +97,30 @@ public class NodeState extends ServiceDocument {
      */
     public int membershipQuorum;
 
+    /**
+     * Minimum number of locations required for consensus operations and
+     * synchronization. If set, this value adds an additional constraint
+     * on which nodes must participate in each update.
+     * See {@link #PROPERTY_NAME_LOCATION}
+     */
+    public int locationQuorum;
+
+    /**
+     * Bag of additional properties, like {@link #PROPERTY_NAME_LOCATION}
+     */
+    public Map<String, String> customProperties;
+
     public static boolean isUnAvailable(NodeState ns) {
-        return ns.status == NodeStatus.UNAVAILABLE || ns.status == NodeStatus.REPLACED
-                || ns.options.contains(NodeOption.OBSERVER);
+        return isUnAvailable(ns, NodeOption.OBSERVER);
+    }
+
+    public static boolean isUnAvailable(NodeState ns, NodeOption excludeNodeOption) {
+        boolean unAvailable = ns.status == NodeStatus.UNAVAILABLE ||
+                ns.status == NodeStatus.REPLACED;
+        if (excludeNodeOption != null) {
+            unAvailable |= ns.options.contains(excludeNodeOption);
+        }
+        return unAvailable;
     }
 
     public static boolean isAvailable(NodeState m, String hostId, boolean excludeThisHost) {
@@ -99,4 +133,14 @@ public class NodeState extends ServiceDocument {
         return true;
     }
 
+    long getNodeIdHash() {
+        // just like String::hashCode
+        long h = this.nodeIdHash;
+        if (h == 0) {
+            h = FNVHash.compute(this.id);
+            this.nodeIdHash = h;
+        }
+
+        return h;
+    }
 }

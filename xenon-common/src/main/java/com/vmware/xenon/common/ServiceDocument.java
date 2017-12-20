@@ -21,6 +21,7 @@ import java.lang.annotation.Target;
 import java.util.EnumSet;
 
 import com.vmware.xenon.common.Service.Action;
+import com.vmware.xenon.common.ServiceDocumentDescription.DocumentIndexingOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 
@@ -97,6 +98,12 @@ public class ServiceDocument {
     @Target(ElementType.TYPE)
     public @interface IndexingParameters {
         /**
+         * Document indexing options.
+         * @return
+         */
+        DocumentIndexingOption[] indexing() default {};
+
+        /**
          * Max size of a serialized document
          * @return
          */
@@ -107,14 +114,22 @@ public class ServiceDocument {
          * @return
          */
         int versionRetention() default ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT;
+
+        /**
+         * Min versions to keep for a document.
+         */
+        int versionRetentionFloor() default ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT / 2;
     }
 
     /**
      * Annotations for ServiceDocumentDescription
      */
     @Retention(RetentionPolicy.RUNTIME)
-    @Target(ElementType.FIELD)
+    @Target({ElementType.FIELD, ElementType.TYPE})
     public @interface Documentation {
+        // sets property name
+        String name() default "";
+
         // sets propertyDocumentation
         String description() default "";
 
@@ -139,6 +154,7 @@ public class ServiceDocument {
      * Field names ending with this suffix will be indexed as URI paths
      */
     public static final String FIELD_NAME_SUFFIX_LINK = "Link";
+    public static final String FIELD_NAME_SUFFIX_LINKS = "Links";
 
     /**
      * Field names ending in Address will be indexed as StringFields.
@@ -241,16 +257,14 @@ public class ServiceDocument {
         target.documentKind = this.documentKind;
         target.documentSelfLink = this.documentSelfLink;
         target.documentUpdateTimeMicros = this.documentUpdateTimeMicros;
+        target.documentUpdateAction = this.documentUpdateAction;
         target.documentExpirationTimeMicros = this.documentExpirationTimeMicros;
         target.documentAuthPrincipalLink = this.documentAuthPrincipalLink;
         target.documentTransactionId = this.documentTransactionId;
     }
 
     public static boolean isDeleted(ServiceDocument document) {
-        if (document == null) {
-            return false;
-        }
-        return Action.DELETE.toString().equals(document.documentUpdateAction);
+        return document != null && Action.DELETE.toString().equals(document.documentUpdateAction);
     }
 
     /**
@@ -270,22 +284,29 @@ public class ServiceDocument {
 
         boolean preferred = false;
         EnumSet<DocumentRelationship> results = EnumSet.noneOf(DocumentRelationship.class);
+        long timeDifference;
 
         if (stateB == null) {
             results.add(DocumentRelationship.PREFERRED);
             return results;
         }
 
-        if (stateA.documentVersion > stateB.documentVersion) {
+        long epochA = stateA.documentEpoch != null ? stateA.documentEpoch : 0;
+        long epochB = stateB.documentEpoch != null ? stateB.documentEpoch : 0;
+
+        if (epochA > epochB ||
+                (epochA == epochB && stateA.documentVersion > stateB.documentVersion)) {
             results.add(DocumentRelationship.NEWER_VERSION);
             preferred = true;
-        } else if (stateA.documentVersion == stateB.documentVersion) {
+        } else if (epochA == epochB &&
+                stateA.documentVersion == stateB.documentVersion) {
             results.add(DocumentRelationship.EQUAL_VERSION);
         }
 
-        if (stateA.documentUpdateTimeMicros == stateB.documentUpdateTimeMicros) {
+        timeDifference = stateA.documentUpdateTimeMicros - stateB.documentUpdateTimeMicros;
+        if (timeDifference == 0) {
             results.add(DocumentRelationship.EQUAL_TIME);
-        } else if (stateA.documentUpdateTimeMicros > stateB.documentUpdateTimeMicros) {
+        } else if (timeDifference > 0) {
             results.add(DocumentRelationship.NEWER_UPDATE_TIME);
         }
 
@@ -295,15 +316,14 @@ public class ServiceDocument {
         // vectors and other schemes are relatively easy to implement using our existing tracking
         // data
         if (results.contains(DocumentRelationship.EQUAL_VERSION)) {
-            if (results.contains(DocumentRelationship.NEWER_UPDATE_TIME)) {
-                preferred = true;
-            } else if (Math.abs(stateA.documentUpdateTimeMicros
-                    - stateB.documentUpdateTimeMicros) < timeEpsilon) {
+            if (Math.abs(timeDifference) < timeEpsilon) {
                 // documents changed within time epsilon so we can not safely determine which one
                 // is newer.
                 if (!ServiceDocument.equals(desc, stateA, stateB)) {
                     results.add(DocumentRelationship.IN_CONFLICT);
                 }
+            } else if (results.contains(DocumentRelationship.NEWER_UPDATE_TIME)) {
+                preferred = true;
             }
         }
 
@@ -326,18 +346,17 @@ public class ServiceDocument {
      */
     public static boolean equals(ServiceDocumentDescription description,
             ServiceDocument currentDocument, ServiceDocument newDocument) {
+        if (currentDocument == null || newDocument == null) {
+            throw new IllegalArgumentException(
+                    "Null Service documents cannot be checked for equality.");
+        }
         try {
-            if (currentDocument == null || newDocument == null) {
-                throw new IllegalArgumentException(
-                        "Null Service documents cannot be checked for equality.");
-            }
-
             String currentSignature = Utils.computeSignature(currentDocument, description);
             String newSignature = Utils.computeSignature(newDocument, description);
             return currentSignature.equals(newSignature);
-        } catch (Throwable throwable) {
-            if (throwable instanceof IllegalArgumentException) {
-                throw (IllegalArgumentException) throwable;
+        } catch (Exception e) {
+            if (e instanceof IllegalArgumentException) {
+                throw (IllegalArgumentException) e;
             }
             return false;
         }
@@ -473,4 +492,7 @@ public class ServiceDocument {
         return name.endsWith(FIELD_NAME_SUFFIX_LINK);
     }
 
+    public static boolean isLinks(String name) {
+        return name.endsWith(FIELD_NAME_SUFFIX_LINKS);
+    }
 }

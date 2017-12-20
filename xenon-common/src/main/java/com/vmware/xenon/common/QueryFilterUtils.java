@@ -20,7 +20,11 @@ import com.vmware.xenon.services.common.QueryFilter;
 /**
  * Query filter utility functions
  */
-public class QueryFilterUtils {
+public final class QueryFilterUtils {
+
+    private QueryFilterUtils() {
+
+    }
 
     /**
      * Infrastructure use only.
@@ -33,6 +37,9 @@ public class QueryFilterUtils {
      */
     public static ServiceDocument getServiceState(Operation op, ServiceHost host) {
         Service s = host.findService(op.getUri().getPath());
+        if (s == null) {
+            return null;
+        }
         Class<? extends ServiceDocument> type = s.getStateType();
         if (type == null) {
             return null;
@@ -50,9 +57,13 @@ public class QueryFilterUtils {
     public static boolean evaluate(QueryFilter filter, ServiceDocument state, ServiceHost host) {
         ServiceDocumentDescription sdd = host.buildDocumentDescription(state.documentSelfLink);
         if (sdd == null) {
-            host.log(Level.WARNING, "Service %s not found", state.documentSelfLink);
+            host.log(Level.WARNING, "Description not found for %s", state.documentSelfLink);
             return false;
         }
+        return evaluate(filter, state, sdd);
+    }
+
+    public static boolean evaluate(QueryFilter filter, ServiceDocument state, ServiceDocumentDescription sdd) {
         return filter.evaluate(state, sdd);
     }
 }

@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.ConsoleHandler;
 import java.util.logging.Logger;
 
-public class CommandLineArgumentParser {
+public final class CommandLineArgumentParser {
     private static final Logger LOGGER = Logger.getLogger(CommandLineArgumentParser.class
             .getSimpleName());
     private static final AtomicBoolean IS_LOGGING_CONFIGURED = new AtomicBoolean(false);
@@ -33,6 +33,10 @@ public class CommandLineArgumentParser {
 
     public static final String ARGUMENT_PREFIX = "--";
     public static final String ARGUMENT_ASSIGNMENT = "=";
+
+    private CommandLineArgumentParser() {
+
+    }
 
     public static void parse(Object objectToBind, String[] args) {
         Map<String, String> argumentValuePairs;
@@ -101,16 +105,14 @@ public class CommandLineArgumentParser {
                     LOGGER.severe(String.format("Unsupported type %s for field %s", field.getType()
                             .toString(), field.getName()));
                 }
-            } catch (Throwable e) {
-                if (e instanceof NoSuchFieldException) {
-                    LOGGER.fine(String.format("Field not present for arg %s in type %s",
-                            parsedArgument.getKey(),
-                            objectToBind.getClass().getSimpleName()));
-                } else {
-                    LOGGER.severe(String.format("Error setting field for arg %s:%s",
-                            parsedArgument.getValue(),
-                            e.toString()));
-                }
+            } catch (NoSuchFieldException e) {
+                LOGGER.fine(String.format("Field not present for arg %s in type %s",
+                        parsedArgument.getKey(),
+                        objectToBind.getClass().getSimpleName()));
+            } catch (Exception e) {
+                LOGGER.severe(String.format("Error setting field for arg %s:%s",
+                        parsedArgument.getValue(),
+                        e.toString()));
             }
         }
     }

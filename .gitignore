@@ -4,6 +4,7 @@
 *.swp
 .settings/*
 /bin
+*/bin
 target
 .classpath
 .project
@@ -14,12 +15,19 @@ target
 tmp/
 *.git.properties
 *.espressostorage
+*~
 
 # maven-release-plugin artifacts
 /release.properties
 pom.xml.releaseBackup
 
-# go artifacts
-xenon-client/src/main/resources/*
-xenon-client/src/main/go/_vendor/src/*
-xenon-common/src/main/go/_vendor/src/*
+# PMD maven plug in artifacts
+*.pmd
+*.pmdruleset.xml
+
+# netbeans
+nbactions.xml
+
+# vagrant
+vagrant/
+.vagrant/

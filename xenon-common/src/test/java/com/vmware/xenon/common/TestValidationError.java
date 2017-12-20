@@ -23,7 +23,7 @@ import org.junit.Test;
 
 import com.vmware.xenon.common.Service.Action;
 
-public class TestValidationError extends BasicReportTestCase {
+public class TestValidationError extends BasicTestCase {
     private static final String ERROR_MSG_NAME_REQUIRED = "name is required";
     private TestValidationServiceState state;
 
@@ -96,7 +96,7 @@ public class TestValidationError extends BasicReportTestCase {
 
     private void validateServiceValidationError(Operation response, String expectedMsg) {
         assertEquals(Operation.STATUS_CODE_BAD_REQUEST, response.getStatusCode());
-        ServiceErrorResponse error = response.getBody(ServiceErrorResponse.class);
+        ServiceErrorResponse error = response.getErrorResponseBody();
         assertEquals(Operation.STATUS_CODE_BAD_REQUEST, error.statusCode);
         assertEquals(expectedMsg, error.message);
         assertNull(error.stackTrace);
